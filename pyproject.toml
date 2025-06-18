@@ -1,12 +1,12 @@
 [project]
 name = "affine"
 version = "0.1.0"
-description = "A CLI tool for running evaluations on LLMs"
-authors = [{ name = "chutes", email = "founders@chutes.ai" }]
+description = "Anima Machina"
+authors = [{ name = "affine", email = "affine@affine.io" }]
 dependencies = [
     "openai",
     "rich",
-    "python-dotenv", # Corrected package name
+    "python-dotenv",
     "pydantic-settings",
     "bittensor",
     "async_lru",
