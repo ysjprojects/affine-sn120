@@ -2,9 +2,10 @@
 import sys
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import click
+from rich.console import Console
 
 from affine.utils import setup_logging, parse_env_kwargs
 from affine.runner import run_llm_batch
@@ -13,15 +14,17 @@ from affine.config import settings
 from affine.exceptions import AffineError
 from affine.results import get_results
 from affine.validator import run_validator
+from affine.config_utils import update_config, get_config, CONFIG_FILE
 
 logger = logging.getLogger("tool")
+console = Console()
 
 @click.group()
-def main():
+def cli():
     """A CLI tool for running evaluations on LLMs."""
     pass
 
-@main.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
+@cli.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.option("--models", "-m", "models", multiple=True, required=True, help="Model name(s) to run.")
 @click.option("--n", "-n", type=int, default=1, help="Number of questions to generate per model.")
 @click.option(
@@ -95,7 +98,7 @@ def run(ctx, models: tuple[str], n: int, out: Optional[str], env_class: str, con
         logger.info("Interrupted, exiting.")
         sys.exit(1)
 
-@main.command()
+@cli.command()
 @click.option("--models", "-m", "models", multiple=True, required=True, help="Model name(s) to load results for.")
 @click.option(
     "--env", "-e", "env_name",
@@ -109,7 +112,7 @@ def results(models: tuple[str], env_name: str):
     """
     get_results(models=list(models), env_name=env_name, display=True)
 
-@main.command()
+@cli.command()
 @click.option("--coldkey", type=str, required=True, help="Coldkey name for the wallet.")
 @click.option("--hotkey", type=str, required=True, help="Hotkey name for the wallet.")
 def validator(coldkey: str, hotkey: str):
@@ -128,5 +131,48 @@ def validator(coldkey: str, hotkey: str):
         logger.info("Interrupted, exiting.")
         sys.exit(1)
 
+@cli.command()
+@click.option('--api-key', prompt="Chutes API Key", help="Your Chutes API key.")
+def init(api_key: str):
+    """Initialize affine with your Chutes API key."""
+    update_config('chutes', 'api_key', api_key)
+    console.print(f"API key set in {CONFIG_FILE}")
+
+@click.group()
+def config():
+    """Manage affine configuration."""
+    pass
+
+@config.command()
+def show():
+    """Show the current configuration."""
+    config = get_config()
+    for section in config.sections():
+        print(f"[{section}]")
+        for key, value in config.items(section):
+            print(f"{key} = {value}")
+
+@config.command()
+@click.argument('key')
+def get(key: str):
+    """Get a configuration value."""
+    section, option = key.split('.')
+    config = get_config()
+    if section in config and option in config[section]:
+        console.print(config.get(section, option))
+    else:
+        console.print(f"Key {key} not found.", style="bold red")
+
+@config.command()
+@click.argument('key')
+@click.argument('value')
+def set(key: str, value: str):
+    """Set a configuration value."""
+    section, option = key.split('.')
+    update_config(section, option, value)
+    console.print(f"Set {key} to {value} in {CONFIG_FILE}")
+
+cli.add_command(config)
+
 if __name__ == "__main__":
-    main()
+    cli()

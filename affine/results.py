@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Type
 from rich.table import Table
 from rich.console import Console
-
 from affine.environments.base import BaseEnv
+from affine.config_utils import RESULTS_DIR
 
 console = Console()
 
@@ -45,7 +45,7 @@ def load_results(
     Loads all results for a given list of models and an environment.
     """
     results_by_model: Dict[str, List[Dict[str, Any]]] = {model: [] for model in models}
-    base_path = Path("results") / env_name
+    base_path = RESULTS_DIR / env_name
 
     for model in models:
         sanitized_model_name = re.sub(r"[^a-zA-Z0-9_-]", "_", model)
@@ -96,3 +96,24 @@ def get_results(
     # Format for SDK return value
     sdk_results = [results_data[model] for model in models]
     return sdk_results 
+
+def get_results_files(
+    models: List[str],
+    env_name: str,
+    latest: bool = False
+) -> List[Path]:
+    """Loads all results for a given list of models and an environment."""
+    results_files = []
+    base_path = RESULTS_DIR / env_name
+    if not base_path.exists():
+        return []
+
+    for model_name in models:
+        sanitized_model_name = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)
+        model_path = base_path / sanitized_model_name
+        if model_path.exists():
+            for result_file in model_path.glob("*.json"):
+                if result_file.name == "latest.json":
+                    continue
+                results_files.append(result_file)
+    return results_files 

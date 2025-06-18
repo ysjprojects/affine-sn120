@@ -11,6 +11,7 @@ from rich.logging import RichHandler
 
 from affine.config import settings
 from affine.logging_config import AppLogHandler
+from affine.config_utils import RESULTS_DIR
 
 console = Console()
 logger = logging.getLogger("affine")
@@ -78,34 +79,26 @@ def parse_env_kwargs(kwargs_tuple: tuple[str]) -> Dict[str, Any]:
 
 def get_output_path(model_name: str, env_name: str, custom_path: Optional[str] = None) -> Path:
     """
-    Determines the output path for the results file.
-    If a custom_path is provided, it's used directly.
-    Otherwise, a structured path `results/{env_name}/{model_name}/{timestamp}.json` is generated.
+    Determines the output path for results.
+    If a `custom_path` is provided, it's used directly.
+    Otherwise, a structured path `~/.affine/results/{env_name}/{model_name}/{timestamp}.json` is generated.
     """
     if custom_path:
         path = Path(custom_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # If custom_path is a directory, create a timestamped filename
+        if path.is_dir():
+            timestamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+            return path / f"{timestamp}.json"
         return path
 
+    sanitized_model_name = sanitize_model_name(model_name)
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    output_dir = RESULTS_DIR / env_name / sanitized_model_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{timestamp}.json"
+
+
+def sanitize_model_name(model_name: str) -> str:
     # Sanitize model name for use in a directory path
     sanitized_model_name = re.sub(r"[^a-zA-Z0-9_-]", "_", model_name)
-
-    # Get a sortable timestamp
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    # Create the structured directory path
-    output_dir = Path("results") / env_name / sanitized_model_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create the full path for the results file
-    output_filename = f"{timestamp}.json"
-    output_path = output_dir / output_filename
-
-    # Create or update the 'latest.json' symlink
-    symlink_path = output_dir / "latest.json"
-    if symlink_path.is_symlink():
-        symlink_path.unlink()
-    
-    symlink_path.symlink_to(output_filename)
-
-    return output_path 
+    return sanitized_model_name 

@@ -1,50 +1,61 @@
-# Affine Tool
+# Affine
 
-This is a command-line tool to batch-dispatch generated prompts to an LLM endpoint and save responses along with verification metrics to a JSON file.
+Affine.
 
 ## Installation
 
-To install the package, run the following command in your terminal. This command should be run from the root of the project directory (where `pyproject.toml` is located).
+To get started with Affine, you'll need to install it from source using `uv`, a fast Python package installer from Astral.
 
+First, install `uv`:
 ```bash
-pip install .
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-For development, you can install it in editable mode. This allows you to make changes to the code and have them reflected immediately without reinstalling.
+Next, clone the Affine repository and install it.
 
 ```bash
-pip install -e .
+git clone https://github.com/chutes/affine.git
+cd affine
+uv pip install -e .
 ```
 
-## Usage
+## Getting Started
 
-After installation, you can use the `affine` command from anywhere in your terminal:
+### Initialization
+
+Before you can use Affine, you need to configure it with your Chutes API key. Run the `init` command and follow the prompts:
 
 ```bash
-affine --model "unsloth/gemma-3-4b-it" --n 2 --out file.json -e MathSynthEnv
+af init
 ```
+This command creates a `~/.affine` directory on your local machine, which will store your configuration in `config.ini` and place all evaluation results in a `results/` subdirectory.
 
-### Options
+### Running Evaluations
 
-- `--model, -m`: (Required) Model name (e.g. `unsloth/gemma-3-4b-it`).
-- `--n, -n`: Number of questions to generate (default: 1).
-- `--out, -o`: (Required) Output file path (e.g. `results.json`).
-- `--env-class, -e`: (Required) Which Env to use. Currently supports `MathSynthEnv`.
-- `--log-level, -l`: Set logging level (`TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). Default is `INFO`.
-- `--debug`: Enable debug logging.
-- `--trace`: Enable trace logging (maximum verbosity).
-- `--quiet, -q`: Quiet mode, only show warnings and errors.
-
-## Environment Variables
-
-The tool requires the `CHUTES_API_KEY` environment variable to be set for authenticating with the LLM API.
+You can run an evaluation using the `run` command. You need to specify the model you want to test and the environment to use.
 
 ```bash
-export CHUTES_API_KEY="your-api-key"
+af run -m <model_name> -e <environment_name> -n <number_of_questions>
 ```
 
-You can also configure the following optional variables:
-- `LLM_API_URL`
-- `LLM_TIMEOUT`
-- `LLM_MAX_RETRIES`
-- `LLM_BACKOFF_BASE`
+For example, to run 10 questions against the `unsloth/gemma-3-4b-it` model using the `SAT1` environment:
+```bash
+af run -m unsloth/gemma-3-4b-it -e SAT1 -n 10
+```
+
+### Running a Validator
+
+Affine also includes a validator to check the integrity and correctness of your evaluation setup. To run the validator, you need to provide your wallet's coldkey and hotkey:
+
+```bash
+af validate --coldkey <your-coldkey> --hotkey <your-hotkey>
+```
+This will run a series of checks to ensure that your environment is correctly configured and that the evaluation process can run smoothly.
+
+## Configuration Management
+
+You can manage your configuration using the `af config` command:
+
+- `af config show`: Displays the current configuration.
+- `af config get <section>.<key>`: Retrieves a specific configuration value.
+- `af config set <section>.<key> <value>`: Sets or updates a configuration value.

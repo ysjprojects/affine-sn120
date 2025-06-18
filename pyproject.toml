@@ -1,26 +1,28 @@
 [project]
 name = "affine"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.10"
+description = "A CLI tool for running evaluations on LLMs"
+authors = [{ name = "chutes", email = "founders@chutes.ai" }]
 dependencies = [
-    "bittensor",
+    "openai",
+    "rich",
     "python-dotenv", # Corrected package name
+    "pydantic-settings",
+    "bittensor",
     "async_lru",
     "botocore",
     "aiobotocore",
     "ipykernel",
     "click",
     "aiohttp",
-    "rich",
-    "pydantic-settings", # Corrected package name
     "nest-asyncio",
     "ipywidgets>=8.1.7",
 ]
+readme = "README.md"
+requires-python = ">=3.8"
 
 [project.scripts]
-af = "affine.cli:main"
+af = "affine.cli:cli"
 
 [build-system]
 requires = ["setuptools>=61.0"]
