@@ -11,7 +11,7 @@ uv pip install -e .
 ```
 ---
 ```bash
-af init
+af init --api-key <your-chutes-api-key>
 ```
 ---
 ```bash
