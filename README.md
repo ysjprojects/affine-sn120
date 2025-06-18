@@ -5,7 +5,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 ---
 ```bash
-git clone https://github.com/chutes/affine.git
+git clone https://github.com/AffineFoundation/affine.git
 cd affine
 uv pip install -e .
 ```
