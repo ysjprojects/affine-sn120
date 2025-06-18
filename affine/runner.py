@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional, List, Tuple
 from pathlib import Path
+from datetime import datetime, timezone
 
 import aiohttp
 from rich.console import Console, Group
@@ -217,7 +218,7 @@ async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: Bas
         model_run_results = [r for r in all_results[model] if r is not None]
         valid_results = [r for r in model_run_results if r.error is None]
         correct_count = sum(1 for r in valid_results if r.metrics.get("correct"))
-        total_for_model = len(model_run_results)
+        total_for_model = len(valid_results)
         accuracy = correct_count / total_for_model if total_for_model > 0 else 0
         avg_latency = sum(r.latency_seconds for r in valid_results) / len(valid_results) if valid_results else 0
         
@@ -227,6 +228,7 @@ async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: Bas
         # Prepare data for JSON output
         final_output_data_by_model[model] = {
             "env": env.name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "batch_duration_seconds": round(batch_duration, 2),
             "llm_config": settings.llm.model_dump(exclude={'api_key'}),
             "num_questions": n,

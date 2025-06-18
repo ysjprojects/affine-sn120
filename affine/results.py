@@ -22,7 +22,7 @@ def get_summary_table(results_by_model: Dict[str, List[Dict[str, Any]]]) -> Tabl
     for model, results in results_by_model.items():
         valid_results = [r for r in results if r.get("error") is None]
         correct_count = sum(1 for r in valid_results if r.get("metrics", {}).get("correct"))
-        total_for_model = len(results)
+        total_for_model = len(valid_results)
         accuracy = correct_count / total_for_model if total_for_model > 0 else 0
         avg_latency = sum(r.get("latency_seconds", 0) for r in valid_results) / len(valid_results) if valid_results else 0
         

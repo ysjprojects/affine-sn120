@@ -89,50 +89,67 @@ class SAT1Env(BaseEnv):
         llm_client: Optional[LLMClient] = None
     ) -> Dict[str, Any]:
         # Locate the corresponding formula & assignment
+        logger.debug("Starting verification...")
         try:
             idx = self.questions.index(question)
+            logger.debug(f"Found question at index {idx}")
         except ValueError:
             logger.debug(f"Unknown question: {question}")
             return {"correct": False, "expected": None, "extraction": None}
 
         clauses = self.formulas[idx]
         expected = self.assignments[idx]
+        logger.debug(f"Loaded expected assignment: {expected}")
 
         # Guard against None responses that might slip through
         if response is None:
+            logger.debug("Response is None, marking as incorrect.")
             return {"correct": False, "expected": expected, "extraction": None, "reason": "No response from model"}
 
         resp = response.strip()
+        logger.debug(f"Verifying response: '{resp}'")
+        
         # If user claims UNSAT, that's always incorrect (we planted a solution)
         if re.search(r"\\bunsat\\b", resp, re.IGNORECASE):
+            logger.debug("Response claims UNSAT, which is incorrect as a solution was planted.")
             extraction = None
             correct = False
         else:
             # Extract assignments of the form x<number>=True/False or x<number>=1/0
             matches = re.findall(r"x(\d+)\s*=\s*(True|False|true|false|1|0)", resp)
+            logger.debug(f"Found {len(matches)} variable assignments in response.")
             extraction: Dict[int, bool] = {}
             for var_str, val_str in matches:
                 var_index = int(var_str)
                 val = val_str.lower() in ("true", "1")
                 extraction[var_index] = val
+            logger.debug(f"Extracted assignment: {extraction}")
 
             # Must assign every variable
             if set(extraction.keys()) != set(expected.keys()):
+                logger.debug(f"Extracted variables {set(extraction.keys())} do not match expected variables {set(expected.keys())}.")
                 correct = False
             else:
+                logger.debug("All variables assigned. Evaluating clauses...")
                 # Evaluate each clause under the extracted assignment
                 def clause_satisfied(cl: List[int]) -> bool:
                     for lit in cl:
                         v = abs(lit)
                         val = extraction[v]
-                        if (lit > 0 and val) or (lit < 0 and not val):
+                        satisfied = (lit > 0 and val) or (lit < 0 and not val)
+                        if satisfied:
                             return True
                     return False
-
-                correct = all(clause_satisfied(cl) for cl in clauses)
+                
+                clause_results = [clause_satisfied(cl) for cl in clauses]
+                correct = all(clause_results)
+                
+                if not correct:
+                    failed_clauses = [clauses[i] for i, satisfied in enumerate(clause_results) if not satisfied]
+                    logger.debug(f"Evaluation failed. {len(failed_clauses)}/{len(clauses)} clauses were not satisfied.")
+                    logger.debug(f"First failing clause: {failed_clauses[0]}")
 
         logger.debug(
-            f"Verification: expected={expected}, extracted={extraction if 'extraction' in locals() else None}, "
-            f"correct={correct}"
+            f"Verification result: correct={correct}"
         )
         return {"correct": correct, "expected": expected, "extraction": extraction if 'extraction' in locals() else None}
