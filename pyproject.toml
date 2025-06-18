@@ -1,0 +1,31 @@
+[project]
+name = "affine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bittensor",
+    "python-dotenv", # Corrected package name
+    "async_lru",
+    "botocore",
+    "aiobotocore",
+    "ipykernel",
+    "click",
+    "aiohttp",
+    "rich",
+    "pydantic-settings", # Corrected package name
+    "nest-asyncio",
+    "ipywidgets>=8.1.7",
+]
+
+[project.scripts]
+af = "affine.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["affine"]
+exclude = ["results"]
