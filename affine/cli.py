@@ -115,14 +115,20 @@ def results(models: tuple[str], env_name: str):
 @cli.command()
 @click.option("--coldkey", type=str, required=True, help="Coldkey name for the wallet.")
 @click.option("--hotkey", type=str, required=True, help="Hotkey name for the wallet.")
-def validator(coldkey: str, hotkey: str):
+@click.option("--debug", is_flag=True, help="Enable debug logging.")
+def validator(coldkey: str, hotkey: str, debug: bool):
     """
     Run the validator logic with the specified coldkey and hotkey.
     """
+    if debug:
+        settings.app.log_level = "DEBUG"
+    else:
+        settings.app.log_level = "INFO"
+
     setup_logging()
     logger.info(f"Starting validator with coldkey: {coldkey} and hotkey: {hotkey}")
     try:
-        asyncio.run(run_validator(coldkey, hotkey))
+        asyncio.run(run_validator(coldkey, hotkey, debug=debug))
     except AffineError as e:
         logger.error(f"A handled error occurred: {e}", exc_info=False)
         click.echo(f"Error: {e}", err=True)
