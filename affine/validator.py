@@ -36,7 +36,7 @@ async def collect_miner_stats(substrate, netuid: int, env_cfg: tuple):
     for uid in uids:
         hot = meta.hotkeys[uid]
         try:
-            blk, mdl = reveals[hot][0]
+            blk, mdl = reveals[hot][-1]
             prev = next((i for i,m in models.items() if m == mdl), None)
             if prev is None or blk < blocks[prev]:
                 if prev is not None:
@@ -66,6 +66,7 @@ async def collect_miner_stats(substrate, netuid: int, env_cfg: tuple):
     intervals, scores = {}, {}
     for uid in models:
         n, s = trials[uid], successes[uid]
+        n = n + 1
         p    = s/n if n else 0.5
         d    = 1 + z*z/n
         center = (p + z*z/(2*n)) / d

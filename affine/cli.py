@@ -35,8 +35,8 @@ def cli():
 @click.option(
     "--env-class", "-e",
     type=click.Choice(list(ENV_REGISTRY.keys()), case_sensitive=False),
-    required=True,
-    help="Which Env to use."
+    default=next(iter(ENV_REGISTRY.keys())),  # Set the first key as the default
+    help="Which Env to use (default: first available)."
 )
 @click.option("--concurrency", "-c", type=int, default=None, help=f"Number of concurrent LLM queries (default: {settings.app.concurrency}).")
 @click.option(
