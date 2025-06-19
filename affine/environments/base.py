@@ -1,11 +1,17 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
+from pydantic import BaseModel
 from affine.llm import LLMClient
 
 
-class BaseEnv(ABC):
+class BaseEnv(BaseModel, ABC):
     """Abstract environment: generates questions and verifies responses."""
+    name: str = "Base"
+
+    class Config:
+        arbitrary_types_allowed = True
+
     @abstractmethod
     async def generate_question(self, llm_client: Optional[LLMClient] = None) -> str:
         """Return a new prompt/question to send to the LLM."""

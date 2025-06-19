@@ -7,6 +7,8 @@ from typing import Optional, Dict, Any, List
 import click
 from rich.console import Console
 
+# Ensure environments are registered before they are used by Click decorators
+import affine.environments
 from affine.utils import setup_logging, parse_env_kwargs
 from affine.runner import run_llm_batch
 from affine.environments import ENV_REGISTRY
@@ -28,14 +30,14 @@ def cli():
 @click.option("--models", "-m", "models", multiple=True, required=True, help="Model name(s) to run.")
 @click.option("--n", "-n", type=int, default=1, help="Number of questions to generate per model.")
 @click.option(
-    "--out", "-o", 
+    "--out", "-o",
     default=None,
     help="Output file path (optional, defaults to structured path in /results)"
 )
 @click.option(
     "--env-class", "-e",
     type=click.Choice(list(ENV_REGISTRY.keys()), case_sensitive=False),
-    default=next(iter(ENV_REGISTRY.keys())),  # Set the first key as the default
+    default=lambda: next(iter(ENV_REGISTRY.keys())) if ENV_REGISTRY else None,
     help="Which Env to use (default: first available)."
 )
 @click.option("--concurrency", "-c", type=int, default=None, help=f"Number of concurrent LLM queries (default: {settings.app.concurrency}).")

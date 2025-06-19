@@ -2,6 +2,7 @@ import time
 import json
 import asyncio
 import logging
+import sys
 from typing import Any, Dict, Optional, List, Tuple
 from pathlib import Path
 from datetime import datetime, timezone
@@ -39,6 +40,28 @@ class JobResult(BaseModel):
     attempts: int
     metrics: Dict[str, Any]
     error: Optional[str] = None
+
+
+async def get_chutes_info(model: str, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
+    """Fetches additional information about a model from the Chutes.ai API."""
+    api_key = settings.llm.api_key
+    if not api_key:
+        logger.warning("No Chutes API key found in settings, skipping model info fetch.")
+        return None
+
+    url = f"https://api.chutes.ai/chutes/{model.replace('/', '_')}"
+    headers = {"Authorization": api_key}
+
+    try:
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                logger.warning(f"Failed to fetch info for model {model}: HTTP {response.status} - {await response.text()}")
+                return None
+    except Exception as e:
+        logger.error(f"Error fetching info for model {model}: {e}", exc_info=True)
+        return None
 
 
 async def _run_single_inference_job(
@@ -121,6 +144,7 @@ async def _run_single_inference_job(
 async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: BaseEnv):
     total_jobs = n * len(models)
     start_time = time.monotonic()
+    start_timestamp = datetime.now(timezone.utc).isoformat()
     
     # For now, let's use the first model name for the output file.
     output_path = get_output_path(models[0], env.name, out)
@@ -227,8 +251,15 @@ async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: Bas
 
         # Prepare data for JSON output
         final_output_data_by_model[model] = {
-            "env": env.name,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_args": {
+                "command": " ".join(sys.argv),
+                "models": models,
+                "n": n,
+                "out": out,
+            },
+            "env": env.model_dump(),
+            "start_timestamp": start_timestamp,
+            "end_timestamp": datetime.now(timezone.utc).isoformat(),
             "batch_duration_seconds": round(batch_duration, 2),
             "llm_config": settings.llm.model_dump(exclude={'api_key'}),
             "num_questions": n,
@@ -243,6 +274,18 @@ async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: Bas
             }
         }
     
+    # Fetch additional model info from Chutes.ai API in parallel
+    # Use a separate session as the auth header may be different
+    async with aiohttp.ClientSession() as session:
+        chutes_info_tasks = [get_chutes_info(model, session) for model in models]
+        chutes_info_results = await asyncio.gather(*chutes_info_tasks)
+
+    for model, chutes_info in zip(models, chutes_info_results):
+        if chutes_info:
+            del chutes_info['cords']
+            del chutes_info['readme']
+            final_output_data_by_model[model]["model_results"][model]["chutes_info"] = chutes_info
+
     # Generate and print the summary table
     summary_table = get_summary_table(results_for_table)
     console.print(summary_table)

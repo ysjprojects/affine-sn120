@@ -2,6 +2,9 @@ import re
 import random
 import logging
 from typing import Any, Dict, List, Optional
+from typing_extensions import Self
+
+from pydantic import model_validator, PrivateAttr
 
 from affine.llm import LLMClient
 from affine.environments.base import BaseEnv
@@ -14,24 +17,24 @@ class SAT1Env(BaseEnv):
     Difficulty can be controlled via constructor arguments.
     e.g. -- -e SAT1 -- --n 10 --k 3 --m 42
     """
-    name = "SAT1"
+    name: str = "SAT1"
+    n: int = 3 # number of variables
+    k: int = 2 # clause size
+    m: Optional[int] = None # number of clauses
+    
+    # Private attributes for internal state
+    _questions: List[str] = PrivateAttr(default_factory=list)
+    _formulas: List[List[List[int]]] = PrivateAttr(default_factory=list)
+    _assignments: List[Dict[int, bool]] = PrivateAttr(default_factory=list)
+    _idx: int = PrivateAttr(default=0)
 
-    def __init__(self, n: int = 3, k: int = 2, m: Optional[int] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.n = n # number of variables
-        self.k = k # clause size
-        
-        # Validate that k is not greater than n
+    @model_validator(mode='after')
+    def validate_env(self) -> Self:
         if self.k > self.n:
             raise ValueError(f"Clause size k ({self.k}) cannot be larger than the number of variables n ({self.n}).")
-            
-        # If m is not provided, use the ratio for hard 3-SAT problems
-        self.m = m if m is not None else int(4.26 * n) # number of clauses
-        
-        self._idx = 0
-        self.questions: List[str] = []
-        self.formulas: List[List[List[int]]] = []
-        self.assignments: List[Dict[int, bool]] = []
+        if self.m is None:
+            self.m = int(4.26 * self.n)
+        return self
 
     async def generate_question(self, llm_client: Optional[LLMClient] = None) -> str:
         # 1) Plant a random solution
@@ -55,8 +58,8 @@ class SAT1Env(BaseEnv):
             clauses.append(clause)
         
         # Store for later verification
-        self.formulas.append(clauses)
-        self.assignments.append(assignment)
+        self._formulas.append(clauses)
+        self._assignments.append(assignment)
         
         # Build a human-readable CNF string
         clause_strs = []
@@ -77,7 +80,7 @@ class SAT1Env(BaseEnv):
             "Provide your answer as comma-separated assignments like `x1=True, x2=False, ...`, "
             "or respond `UNSAT` if it has no solution."
         )
-        self.questions.append(q)
+        self._questions.append(q)
         logger.debug(f"Generated SAT question #{self._idx}: n={self.n}, m={self.m}, planted={assignment}")
         self._idx += 1
         return q
@@ -91,14 +94,14 @@ class SAT1Env(BaseEnv):
         # Locate the corresponding formula & assignment
         logger.debug("Starting verification...")
         try:
-            idx = self.questions.index(question)
+            idx = self._questions.index(question)
             logger.debug(f"Found question at index {idx}")
         except ValueError:
             logger.debug(f"Unknown question: {question}")
             return {"correct": False, "expected": None, "extraction": None}
 
-        clauses = self.formulas[idx]
-        expected = self.assignments[idx]
+        clauses = self._formulas[idx]
+        expected = self._assignments[idx]
         logger.debug(f"Loaded expected assignment: {expected}")
 
         # Guard against None responses that might slip through
