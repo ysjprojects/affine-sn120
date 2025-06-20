@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 import os
 import sys
 import json
 import time
-import click
+import logging
 import random
+import click
 import aiohttp
 import asyncio
 import bittensor as bt
@@ -14,15 +16,39 @@ from alive_progress import alive_bar
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional, Union
 
+# ── load env ─────────────────────────────────────────────────────────────────
 load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True)
 load_dotenv(override=True)
+
 def get_conf(key) -> Any:
     value = os.getenv(key)
-    if value is None:
-        print( f"{key} not set.\nRun:\n\taf set {key} <your-{key}-value>\n")
+    if not value:
+        click.echo(f"{key} not set.\nRun:\n\taf set {key} <value>", err=True)
         sys.exit(1)
     return value
-        
+
+# ── logging setup ─────────────────────────────────────────────────────────────
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
+def _trace(self, msg, *args, **kwargs):
+    if self.isEnabledFor(TRACE):
+        self._log(TRACE, msg, args, **kwargs)
+logging.Logger.trace = _trace
+logger = logging.getLogger("affine")
+def setup_logging(verbosity: int):
+    if verbosity >= 3: level = TRACE
+    elif verbosity == 2: level = logging.DEBUG
+    elif verbosity == 1: level = logging.INFO
+    else: level = logging.CRITICAL + 1
+    for noisy_logger in [ "websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio"]:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+# ── core models ───────────────────────────────────────────────────────────────
 class Miner(BaseModel):
     uid: int
     hotkey: str
@@ -40,8 +66,8 @@ class Response(BaseModel):
 class BaseEnv(BaseModel, ABC):
     class Config:
         arbitrary_types_allowed = True
-        
-    async def many(self, n:int) -> List["Challenge"]:
+
+    async def many(self, n: int) -> List["Challenge"]:
         return [await self.generate() for _ in range(n)]
 
     @abstractmethod
@@ -64,25 +90,29 @@ class Evaluation(BaseModel):
     env: BaseEnv
     score: float
     extra: Dict[str, Any] = Field(default_factory=dict)
-    
+
 class Result(BaseModel):
     miner: Miner
     challenge: Challenge
     response: Response
     evaluation: Evaluation
 
+# ── fetch chute & miners ─────────────────────────────────────────────────────
 async def get_chute(model: str) -> Dict[str, Any]:
-    api = f"https://api.chutes.ai/chutes/{model}"
+    url = f"https://api.chutes.ai/chutes/{model}"
     token = os.getenv("CHUTES_API_KEY", "")
-    hdr = {"Authorization": token}
+    headers = {"Authorization": token}
     async with aiohttp.ClientSession() as session:
-        async with session.get(api, headers=hdr) as r:
+        async with session.get(url, headers=headers) as r:
             text = await r.text(errors="ignore")
             if r.status != 200:
                 raise RuntimeError(f"{r.status}:{text}")
-            chute_info =  await r.json()
-            [chute_info.pop(k, None) for k in ['readme', 'cords', 'tagline', 'instances']]; chute_info.get('image', {}).pop('readme', None)
-            return chute_info
+            info = await r.json()
+            for k in ('readme','cords','tagline','instances'):
+                info.pop(k, None)
+            info.get('image', {}).pop('readme', None)
+            logger.trace("Fetched chute info for %s", model)
+            return info
 
 async def miners(uids: Optional[Union[int, List[int]]] = None, no_null: bool = False) -> Dict[int, Miner]:
     NETUID = 120
@@ -97,32 +127,34 @@ async def miners(uids: Optional[Union[int, List[int]]] = None, no_null: bool = F
         uids = [uids]
 
     out: Dict[int, Miner] = {}
-    for uid in uids: 
+    for uid in uids:
         hk = meta.hotkeys[uid] if 0 <= uid < len(meta.hotkeys) else ""
         commits = revs.get(hk) or []
         blk, mdl = commits[-1] if commits else (None, None)
-        if no_null and blk == None: continue
-        out[uid] = Miner(
-            uid=uid,
-            hotkey=hk,
-            model=str(mdl) if mdl is not None else None,
-            block=int(blk) if blk is not None else None
-        )
-    
-    miners_with_models = [m for m in out.values() if m.model]
-    if miners_with_models:
-        chute_infos = await asyncio.gather(
-            *[get_chute(m.model) for m in miners_with_models],
+        if no_null and blk is None:
+            continue
+        out[uid] = Miner(uid=uid, hotkey=hk,
+                         model=str(mdl) if mdl is not None else None,
+                         block=int(blk) if blk is not None else None)
+
+    with_models = [m for m in out.values() if m.model]
+    if with_models:
+        infos = await asyncio.gather(
+            *[get_chute(m.model) for m in with_models],
             return_exceptions=True
         )
+        for m, info in zip(with_models, infos):
+            if not isinstance(info, Exception):
+                m.chute = info
 
-        for miner, chute_info in zip(miners_with_models, chute_infos):
-            if not isinstance(chute_info, Exception):
-                miner.chute = chute_info
-
+    miner_info = [
+        f"\tUID: {m.uid}, Hotkey: {m.hotkey}, Model: {m.model}, Block: {m.block}"
+        for m in out.values()
+    ]
+    logger.debug("Discovered %d miners:\n%s", len(out), "\n".join(miner_info))
     return out
 
-
+# ── run challenges ────────────────────────────────────────────────────────────
 async def _run_one(
     session: aiohttp.ClientSession,
     chal: Challenge,
@@ -131,15 +163,14 @@ async def _run_one(
     retries: int,
     backoff: float
 ) -> Response:
-    api = "https://llm.chutes.ai/v1/chat/completions"
+    url = "https://llm.chutes.ai/v1/chat/completions"
     token = get_conf("CHUTES_API_KEY")
     hdr = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     start = time.monotonic()
-
     for attempt in range(1, retries + 2):
         try:
             async with session.post(
-                api,
+                url,
                 json={"model": model, "messages": [{"role": "user", "content": chal.prompt}]},
                 headers=hdr,
                 timeout=timeout
@@ -149,34 +180,17 @@ async def _run_one(
                     raise RuntimeError(f"{r.status}:{text}")
                 data = await r.json()
                 res = data["choices"][0]["message"]["content"]
-                return Response(
-                    response=res,
-                    latency_seconds=time.monotonic() - start,
-                    attempts=attempt,
-                    model=model,
-                    error=None
-                )
+                latency = time.monotonic() - start
+                logger.trace("Model %s answered in %.2fs on attempt %d", model, latency, attempt)
+                return Response(response=res, latency_seconds=latency, attempts=attempt, model=model, error=None)
         except Exception as e:
+            logger.debug("Attempt %d for %s failed: %s", attempt, model, e)
             if attempt > retries:
-                return Response(
-                    response=None,
-                    latency_seconds=time.monotonic() - start,
-                    attempts=attempt,
-                    model=model,
-                    error=str(e)
-                )
+                latency = time.monotonic() - start
+                return Response(response=None, latency_seconds=latency, attempts=attempt, model=model, error=str(e))
             delay = backoff * (2 ** (attempt - 1)) * (1 + random.uniform(-0.1, 0.1))
             await asyncio.sleep(delay)
-
-    # should never reach
-    return Response(
-        response=None,
-        latency_seconds=time.monotonic() - start,
-        attempts=retries + 1,
-        model=model,
-        error="unreachable code"
-    )
-
+    return Response(response=None, latency_seconds=time.monotonic()-start, attempts=retries+1, model=model, error="unreachable")
 
 async def run(
     challenges: Union[Challenge, List[Challenge]],
@@ -185,87 +199,61 @@ async def run(
     retries: int = 3,
     backoff: float = 1.0
 ) -> List[Result]:
-    challenges = challenges if isinstance(challenges, list) else [challenges]
-    if isinstance(miners, dict): 
+    if not isinstance(challenges, list):
+        challenges = [challenges]
+    if isinstance(miners, dict):
         mmap = miners
     elif isinstance(miners, list) and all(isinstance(m, Miner) for m in miners):
         mmap = {m.uid: m for m in miners}
     else:
         mmap = await miners(miners)
-    valid_miners = [m for m in mmap.values() if m.model]
-    total = len(valid_miners) * len(challenges)
+
+    valid = [m for m in mmap.values() if m.model]
+    total = len(valid) * len(challenges)
     results: List[Result] = []
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        async def run_one(miner, chal):
-            resp = await _run_one(sess, chal, miner.model, timeout, retries, backoff)
-            ev = await chal.evaluate(resp)
-            return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
-        tasks = [asyncio.create_task(run_one(miner, chal))
-                 for miner in valid_miners for chal in challenges]
+        async def run_one(m, c):
+            resp = await _run_one(sess, c, m.model, timeout, retries, backoff)
+            ev = await c.evaluate(resp)
+            return Result(miner=m, challenge=c, response=resp, evaluation=ev)
+
+        tasks = [asyncio.create_task(run_one(m, c)) for m in valid for c in challenges]
         with alive_bar(total, title='AF') as bar:
             for coro in asyncio.as_completed(tasks):
                 results.append(await coro)
                 bar()
+    logger.info("Finished %d runs", len(results))
     return results
 
+# ── CLI & commands ────────────────────────────────────────────────────────────
 from .envs.coin import COIN
 from .envs.sat import SAT
 
-ENVS = {
-    "COIN": COIN,
-    "SAT": SAT,
-}
+ENVS = {"COIN": COIN, "SAT": SAT}
 
 @click.group()
-def cli():
-    """Affine"""
-    pass
-
-
-def print_results(results):
-    # build stats per UID
-    stats = defaultdict(lambda: {'model': None, 'scores': []})
-    for r in results:
-        entry = stats[r.miner.uid]
-        entry['model']  = r.miner.model
-        entry['scores'].append(r.evaluation.score)
-    fmt = "{:<5} {:<25} {:<5} {:>7} {:>8}"
-    fifty = 5 + 1 + 25 + 1 + 5 + 1 + 7 + 1 + 8  # sum of field widths + spaces
-    click.echo(fmt.format("UID", "Model", "#", "Total", "Average"))
-    click.echo("-" * fifty)
-    for uid, data in stats.items():
-        cnt   = len(data['scores'])
-        total = sum(data['scores'])
-        avg   = total / cnt if cnt else 0
-        click.echo(fmt.format(uid, data['model'], cnt, f"{total:.4f}", f"{avg:.4f}"))
-
-def save_results(results):
-    results_dir = os.path.expanduser("~/.affine/results")
-    os.makedirs(results_dir, exist_ok=True)
-    results_path = os.path.join(results_dir, f"{int(time.time())}.json")
-    serializable_results = [r.model_dump() for r in results]
-    for sr, r in zip(serializable_results, results):
-        sr['challenge']['env'] = r.challenge.env.__class__.__name__
-    with open(results_path, "w") as f:
-        json.dump(serializable_results, f, indent=2)
-    click.echo(f"\nResults saved to: {results_path}\n")
-    return results_path
+@click.option('-v', '--verbose', count=True,
+              help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
+def cli(verbose):
+    """Affine CLI"""
+    setup_logging(verbose)
 
 @cli.command('run')
 @click.argument('uids', callback=lambda _ctx, _param, val: [int(x) for x in val.split(',')])
-@click.argument('env',  type=click.Choice(list(ENVS), case_sensitive=False))
-@click.option('-n',    default=1, show_default=True, help='Number of challenges')
+@click.argument('env', type=click.Choice(list(ENVS), case_sensitive=False))
+@click.option('-n', '--num', 'n', default=1, show_default=True, help='Number of challenges')
 def run_command(uids, env, n):
-    """Run N challenges in ENV against miners with UIDs."""
+    """Run N challenges in ENV against miners."""
+    logger.debug("Running %d challenges in %s for UIDs %s", n, env, uids)
     async def _coro():
         chals = await ENVS[env.upper()]().many(n)
-        ms    = await miners(uids)
+        ms = await miners(uids)
         return await run(challenges=chals, miners=ms)
     results = asyncio.run(_coro())
     print_results(results)
     save_results(results)
-    return results
-    
+
 @cli.command('deploy')
 @click.argument('filename', type=click.Path(exists=True))
 @click.option('--chutes-api-key', default=None, help='Chutes API key')
@@ -274,128 +262,97 @@ def run_command(uids, env, n):
 @click.option('--chute-user', default=None, help='Chutes user')
 @click.option('--wallet-cold', default=None, help='Bittensor coldkey')
 @click.option('--wallet-hot', default=None, help='Bittensor hotkey')
-def deploy(
-    filename,
-    chutes_api_key,
-    hf_user,
-    hf_token,
-    chute_user,
-    wallet_cold,
-    wallet_hot
-):
-    """Deploy a model or file using provided credentials and configuration."""
+def deploy(filename, chutes_api_key, hf_user, hf_token, chute_user, wallet_cold, wallet_hot):
+    """Deploy a model or file using provided credentials."""
+    logger.debug("Deploying %s", filename)
     chutes_api_key = chutes_api_key or get_conf("CHUTES_API_KEY")
-    hf_user = hf_user or get_conf("HF_USER")
-    hf_token = hf_token or get_conf("HF_TOKEN")
-    chute_user = chute_user or get_conf("CHUTES_USER")
-    wallet_cold = wallet_cold or get_conf("BT_COLDKEY")
-    wallet_hot = wallet_hot or get_conf("BT_HOTKEY")
-    import os
+    hf_user        = hf_user        or get_conf("HF_USER")
+    hf_token       = hf_token       or get_conf("HF_TOKEN")
+    chute_user     = chute_user     or get_conf("CHUTES_USER")
+    wallet_cold    = wallet_cold    or get_conf("BT_COLDKEY")
+    wallet_hot     = wallet_hot     or get_conf("BT_HOTKEY")
+    # ... deployment logic here ...
 
 @cli.command('set')
 @click.argument('key')
 @click.argument('value')
-def set(key: str, value: str):
-    """Set a key-value pair in ~/.affine/config.env, creating the file and directory if needed."""
-    p = os.path.expanduser("~/.affine/config.env")
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    lines = [l for l in open(p).readlines() if not l.strip().startswith(f"{key}=")] if os.path.exists(p) else []
+def set_config(key: str, value: str):
+    """Set a key-value pair in ~/.affine/config.env."""
+    path = os.path.expanduser("~/.affine/config.env")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [l for l in open(path).readlines() if not l.startswith(f"{key}=")] if os.path.exists(path) else []
     lines.append(f"{key}={value}\n")
-    open(p, "w").writelines(lines)
-    print(f"Set {key} in {p}")
-    
-    
-def get_average_scores(results):
-    stats = defaultdict(list)
-    for r in results:
-        stats[r.miner.hotkey].append(r.evaluation.score)
-    return {hotkey: sum(scores)/len(scores) if scores else 0 for hotkey, scores in stats.items()}
+    open(path, "w").writelines(lines)
+    logger.info("Set %s in %s", key, path)
+    click.echo(f"Set {key} in {path}")
 
-class EloRatingSystem:
-    def __init__(self, players, initial_rating=1500, k_factor=32):
-        """
-        :param players: iterable of player IDs (any hashable)
-        :param initial_rating: rating assigned to new players
-        :param k_factor: the K‐factor for all rating updates
-        """
-        self.ratings = {player: initial_rating for player in players}
-        self.k = k_factor
+@cli.command('validate')
+@click.option("--k-factor", "-k", default=32, show_default=True, help="Elo K-factor")
+@click.option("--challenges", "-c", default=2, show_default=True, help="SAT challenges per game")
+@click.option("--delay", "-d", default=5.0, show_default=True, help="Retry delay (s)")
+def validator(k_factor: int, challenges: int, delay: float):
+    """Continuously pit two random miners head-to-head."""
+    elo: Dict[str, float] = defaultdict(lambda: 1500.0)
 
-    def expected_score(self, rating_a, rating_b):
-        """
-        Compute expected score for player A against player B.
-        """
-        qa = 10 ** (rating_a / 400)
-        qb = 10 ** (rating_b / 400)
-        return qa / (qa + qb)
+    def update_elo(a: Miner, b: Miner, score_a: float):
+        ra, rb = elo[a.hotkey], elo[b.hotkey]
+        qa, qb = 10**(ra/400), 10**(rb/400)
+        ea, eb = qa/(qa+qb), 1 - qa/(qa+qb)
+        elo[a.hotkey] = ra + k_factor*(score_a - ea)
+        elo[b.hotkey] = rb + k_factor*((1-score_a) - eb)
+        logger.trace("ELO updated: %s→%.1f, %s→%.1f", a.hotkey, elo[a.hotkey], b.hotkey, elo[b.hotkey])
 
-    def update(self, player_a, player_b, score_a):
-        """
-        Update ratings for a single game.
-        
-        :param player_a: ID of first player
-        :param player_b: ID of second player
-        :param score_a: actual score for player A (1=win, 0=loss, 0.5=draw)
-        """
-        ra = self.ratings[player_a]
-        rb = self.ratings[player_b]
-        ea = self.expected_score(ra, rb)
-        eb = 1 - ea
-
-        # score_b is the flip of score_a
-        score_b = 1 - score_a
-
-        # New ratings
-        self.ratings[player_a] = ra + self.k * (score_a - ea)
-        self.ratings[player_b] = rb + self.k * (score_b - eb)
-    
-@cli.command('validator')
-@click.argument('coldkey')
-@click.argument('hotkey')
-def set(coldkey: str, hotkey: str):
-    
-    # Elo scoring system.
-    kfac = 32
-    elo: Dict[str, float] = defaultdict(lambda: 1500)
-    def update( miner_a: Miner, miner_b: Miner, score_a ):
-        ra = elo[miner_a.hotkey]
-        rb = elo[miner_b.hotkey]
-        qa = 10 ** (ra / 400)
-        qb = 10 ** (rb / 400)
-        ea = qa / (qa + qb)
-        eb = 1 - ea
-        score_b = 1 - score_a
-        elo[miner_a.hotkey] = ra + kfac * (score_a - ea)
-        elo[miner_b.hotkey] = rb + kfac * (score_b - eb)
-    
-    async def game( miner_a: Miner, miner_b: Miner ):
-        results = await run(
-            challenges = SAT().many(1),
-            miners = [miner_a, miner_b]
-        )
-        score_a = 0; score_b = 0
-        for r in results:
-            if r.miner.hotkey == miner_a.hotkey:
-                score_a += r.evaluation.score
-            else:
-                score_b += r.evaluation.score
-        if score_a > score_b:
-            update( miner_a, miner_b, 1.0 )
-        elif score_a == score_b:
-            update( miner_a, miner_b, float( miner_a.block < miner_b.block ))
+    async def play_game(a: Miner, b: Miner):
+        results = await run(challenges=await SAT().many(challenges), miners=[a, b])
+        sa = sum(r.evaluation.score for r in results if r.miner.hotkey == a.hotkey)
+        sb = sum(r.evaluation.score for r in results if r.miner.hotkey == b.hotkey)
+        if sa != sb:
+            update_elo(a, b, float(sa > sb))
         else:
-            update( miner_a, miner_b, 0.0 )
-            
-    async def validator_loop():
+            update_elo(a, b, float(a.block < b.block))
+
+    async def main_loop():
         while True:
             all_miners = await miners(no_null=True)
             if len(all_miners) < 2:
-                raise RuntimeError("Not enough miners to select 2 unique miners.")
-            selected_uids = random.sample(list(all_miners.keys()), 2)
-            miner_a = all_miners[selected_uids[0]]
-            miner_b = all_miners[selected_uids[1]]
-            await game(miner_a, miner_b)
+                logger.debug("Only %d miner(s); retrying in %ds", len(all_miners), delay)
+                await asyncio.sleep(delay)
+                continue
+            a, b = random.sample(list(all_miners.values()), 2)
+            logger.debug("Validator match: %s:%s vs %s:%s", a.uid, a.model, b.uid, b.model)
+            await play_game(a, b)
 
-    asyncio.run(validator_loop())
- 
-    
+    logger.info("Starting validator (k=%d, c=%d, d=%.1f)", k_factor, challenges, delay)
+    asyncio.run(main_loop())
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+def print_results(results: List[Result]):
+    stats = defaultdict(lambda: {'model': None, 'scores': []})
+    for r in results:
+        stats[r.miner.uid]['model'] = r.miner.model
+        stats[r.miner.uid]['scores'].append(r.evaluation.score)
+
+    fmt = "{:<5} {:<25} {:<5} {:>7} {:>8}"
+    header = fmt.format("UID", "Model", "#", "Total", "Average")
+    click.echo(header)
+    click.echo("-" * len(header))
+    for uid, data in stats.items():
+        cnt   = len(data['scores'])
+        total = sum(data['scores'])
+        avg   = total / cnt if cnt else 0
+        click.echo(fmt.format(uid, data['model'], cnt, f"{total:.4f}", f"{avg:.4f}"))
+
+def save_results(results: List[Result]):
+    path = os.path.expanduser("~/.affine/results")
+    os.makedirs(path, exist_ok=True)
+    file = os.path.join(path, f"{int(time.time())}.json")
+    serial = [r.model_dump() for r in results]
+    for sr, r in zip(serial, results):
+        sr['challenge']['env'] = r.challenge.env.__class__.__name__
+    with open(file, "w") as f:
+        json.dump(serial, f, indent=2)
+    logger.info("Results saved to %s", file)
+    click.echo(f"\nResults saved to: {file}\n")
+
+if __name__ == "__main__":
+    cli()
