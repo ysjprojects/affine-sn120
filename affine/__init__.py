@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import time
 import click
 import random
@@ -7,7 +8,9 @@ import aiohttp
 import asyncio
 import bittensor as bt
 from dotenv import load_dotenv
+from collections import defaultdict
 from abc import ABC, abstractmethod
+from alive_progress import alive_bar
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional, Union
 
@@ -19,7 +22,6 @@ def get_conf(key) -> Any:
         print( f"{key} not set.\nRun:\n\taf set {key} <your-{key}-value>\n")
         sys.exit(1)
     return value
-
         
 class Miner(BaseModel):
     uid: int
@@ -69,20 +71,17 @@ class Result(BaseModel):
     response: Response
     evaluation: Evaluation
 
-
 async def get_chute(model: str) -> Dict[str, Any]:
-    api = f"https://api.chutes.ai/chutes/AlphaTao/{model}"
+    api = f"https://api.chutes.ai/chutes/{model}"
     token = os.getenv("CHUTES_API_KEY", "")
     hdr = {"Authorization": token}
-
     async with aiohttp.ClientSession() as session:
         async with session.get(api, headers=hdr) as r:
             text = await r.text(errors="ignore")
             if r.status != 200:
                 raise RuntimeError(f"{r.status}:{text}")
             chute_info =  await r.json()
-            del chute_info['readme']
-            del chute_info['chords']
+            [chute_info.pop(k, None) for k in ['readme', 'cords', 'tagline', 'instances']]; chute_info.get('image', {}).pop('readme', None)
             return chute_info
 
 async def miners(uids: Optional[Union[int, List[int]]] = None) -> Dict[int, Miner]:
@@ -185,34 +184,26 @@ async def run(
     retries: int = 3,
     backoff: float = 1.0
 ) -> List[Result]:
-    if not isinstance(challenges, list):
-        challenges = [challenges]
-
-    if isinstance(miners, dict):
-        mmap = miners
-    else:
-        mmap = await miners(miners)
-
-    valid = {uid: m for uid, m in mmap.items() if m.model}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        tasks = [
-            (uid, chal, _run_one(sess, chal, m.model, timeout, retries, backoff))
-            for uid, m in valid.items()
-            for chal in challenges
-        ]
-        responses = await asyncio.gather(*(t[2] for t in tasks))
-
+    challenges = challenges if isinstance(challenges, list) else [challenges]
+    mmap = miners if isinstance(miners, dict) else await miners(miners)
+    valid_miners = [m for m in mmap.values() if m.model]
+    total = len(valid_miners) * len(challenges)
     results: List[Result] = []
-    for (uid, chal, _), resp in zip(tasks, responses):
-        ev = await chal.evaluate(resp)
-        results.append(Result(miner=valid[uid], challenge=chal, response=resp, evaluation=ev))
-
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
+        async def run_one(miner, chal):
+            resp = await _run_one(sess, chal, miner.model, timeout, retries, backoff)
+            ev = await chal.evaluate(resp)
+            return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
+        tasks = [asyncio.create_task(run_one(miner, chal))
+                 for miner in valid_miners for chal in challenges]
+        with alive_bar(total, title='AF') as bar:
+            for coro in asyncio.as_completed(tasks):
+                results.append(await coro)
+                bar()
     return results
 
-
-
-from .envs.COIN import COIN
-from .envs.SAT import SAT
+from .envs.coin import COIN
+from .envs.sat import SAT
 
 ENVS = {
     "COIN": COIN,
@@ -224,6 +215,35 @@ def cli():
     """Affine"""
     pass
 
+def print_results(results):
+    # build stats per UID
+    stats = defaultdict(lambda: {'model': None, 'scores': []})
+    for r in results:
+        entry = stats[r.miner.uid]
+        entry['model']  = r.miner.model
+        entry['scores'].append(r.evaluation.score)
+    fmt = "{:<5} {:<25} {:<5} {:>7} {:>8}"
+    fifty = 5 + 1 + 25 + 1 + 5 + 1 + 7 + 1 + 8  # sum of field widths + spaces
+    click.echo(fmt.format("UID", "Model", "#", "Total", "Average"))
+    click.echo("-" * fifty)
+    for uid, data in stats.items():
+        cnt   = len(data['scores'])
+        total = sum(data['scores'])
+        avg   = total / cnt if cnt else 0
+        click.echo(fmt.format(uid, data['model'], cnt, f"{total:.4f}", f"{avg:.4f}"))
+
+def save_results(results):
+    results_dir = os.path.expanduser("~/.affine/results")
+    os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, f"{int(time.time())}.json")
+    serializable_results = [r.model_dump() for r in results]
+    for sr, r in zip(serializable_results, results):
+        sr['challenge']['env'] = r.challenge.env.__class__.__name__
+    with open(results_path, "w") as f:
+        json.dump(serializable_results, f, indent=2)
+    click.echo(f"\nResults saved to: {results_path}\n")
+    return results_path
+
 @cli.command('run')
 @click.argument('uids', callback=lambda _ctx, _param, val: [int(x) for x in val.split(',')])
 @click.argument('env',  type=click.Choice(list(ENVS), case_sensitive=False))
@@ -231,10 +251,13 @@ def cli():
 def run_command(uids, env, n):
     """Run N challenges in ENV against miners with UIDs."""
     async def _coro():
-        ch = await ENVS[env.upper()]().many(n)
-        ms = await miners(uids)
-        return await run(challenges=ch, miners=ms)
-    print(asyncio.run(_coro()))
+        chals = await ENVS[env.upper()]().many(n)
+        ms    = await miners(uids)
+        return await run(challenges=chals, miners=ms)
+    results = asyncio.run(_coro())
+    print_results(results)
+    save_results(results)
+    return results
     
 @cli.command('deploy')
 @click.argument('filename', type=click.Path(exists=True))

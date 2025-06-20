@@ -16,9 +16,15 @@ class SAT(af.BaseEnv):
             vs = random.sample(list(sol), self.k)
             sv = random.choice(vs)
             cls.append([(lit := (v if sol[v] else -v)) if v==sv else (v if random.choice([True,False]) else -v) for v in vs])
-        txt = " ∧ ".join("(" + " ∨ ".join(f"{'' if l>0 else '¬'}x{abs(l)}" for l in c) + ")" for c in cls)
-        return af.Challenge(env=self, prompt=f"Find a satisfying assignment for:\n{txt}", extra={"sol": sol, "cls": cls})
-    
+        formula = " ∧ ".join("(" + " ∨ ".join(f"{'' if l>0 else '¬'}x{abs(l)}" for l in c) + ")" for c in cls)
+        prompt = (
+            f"Find a satisfying assignment for the following {self.k}-SAT formula over variables x1..x{self.n}:\n"
+            f"{formula}\n"
+            "Provide your answer as comma-separated assignments like `x1=True, x2=False, ...`, "
+            "or respond `UNSAT` if it has no solution."
+        )
+        return af.Challenge(env=self, prompt=prompt, extra={"sol": sol, "cls": cls})        
+
     async def evaluate(self, challenge: af.Challenge, response: af.Response):
         sol, cls = challenge.extra["sol"], challenge.extra["cls"]
         got = {int(v): val.lower() in ("true","1")
