@@ -34,7 +34,7 @@ console = Console()
 class JobResult(BaseModel):
     model: str
     index: int
-    question: str
+    generated_data: Dict[str, Any]
     response: str
     latency_seconds: float
     attempts: int
@@ -67,7 +67,7 @@ async def get_chutes_info(model: str, session: aiohttp.ClientSession) -> Optiona
 async def _run_single_inference_job(
     idx: int,
     model: str,
-    question: str, # Takes question as input now
+    generated_data: Dict[str, Any], # Takes question as input now
     env: BaseEnv,
     client: LLMClient,
     progress: Progress,
@@ -94,7 +94,7 @@ async def _run_single_inference_job(
             # 1. Solving (Generation was done before)
             await update_status("solving")
             progress.update(task_id, description=f"Job {idx}: Solving...")
-            response, latency, attempts = await client.prompt(question, model)
+            response, latency, attempts = await client.prompt(generated_data["question"], model)
 
             # Handle case where API returns no content
             if response is None:
@@ -105,7 +105,7 @@ async def _run_single_inference_job(
                 # 2. Verification
                 await update_status("verifying")
                 progress.update(task_id, description=f"Job {idx}: Verifying...")
-                metrics = await env.verify(question, response, client)
+                metrics = await env.verify(generated_data, response, client)
 
             async with lock:
                 if "verifying" in status_counts: status_counts["verifying"] -= 1
@@ -116,7 +116,7 @@ async def _run_single_inference_job(
             return JobResult(
                 model=model,
                 index=idx,
-                question=question,
+                generated_data=generated_data,
                 response=response.strip() if response else "<no response>",
                 latency_seconds=latency,
                 attempts=attempts,
@@ -132,7 +132,7 @@ async def _run_single_inference_job(
             return JobResult(
                 model=model,
                 index=idx,
-                question=question,
+                generated_data=generated_data,
                 response=f"<error in job {idx}: {e}>",
                 latency_seconds=0.0,
                 attempts=0,
@@ -168,9 +168,9 @@ async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: Bas
         client = LLMClient(session, settings.llm)
 
         # 1. Generate all questions first, with a spinner
-        questions: List[str] = []
+        generated_data_list: List[Dict[str, Any]] = []
         with console.status(f"[bold]Generating {n} questions...", spinner="dots"):
-            questions = [await env.generate_question(client) for _ in range(n)]
+            generated_data_list = [await env.generate_question(client) for _ in range(n)]
 
         # 2. Set up parallel execution for all models
         model_progress_groups = []
@@ -208,12 +208,12 @@ async def run_llm_batch(models: Tuple[str], n: int, out: Optional[str], env: Bas
                 overall_task_id = progress_bars[i].add_task("Running jobs", total=n, **status_counts_list[i])
                 task_ids = [jobs_progress_list[i].add_task(f"[dim]Job {j+1}: Queued[/dim]", total=None) for j in range(n)]
                 
-                for j, question in enumerate(questions):
+                for j, generated_data in enumerate(generated_data_list):
                     task = asyncio.create_task(
                         _run_single_inference_job(
                             idx=j + 1,
                             model=model,
-                            question=question,
+                            generated_data=generated_data,
                             env=env,
                             client=client,
                             progress=jobs_progress_list[i],

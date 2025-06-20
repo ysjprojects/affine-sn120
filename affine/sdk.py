@@ -1,50 +1,49 @@
 import asyncio
+import json
 from typing import List, Optional, Dict, Any
-import nest_asyncio
 
-from affine.runner import run_llm_batch
-from affine.environments.base import BaseEnv
+import aiohttp
 from affine.config import settings
-from affine.utils import setup_logging
-from affine.results import get_results as get_results_internal
+from affine.llm import LLMClient
+from affine.utils import get_output_path
+from affine.environments.base import GeneratedQuestion
 
-nest_asyncio.apply()
 
-async def run(
-    models: List[str],
-    n: int = 1,
-    c: Optional[int] = None,
+async def query(prompt: str, model: str) -> str:
+    """
+    Query a model with a given prompt.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.llm.api_key}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        client = LLMClient(session, settings.llm)
+        response, _, _ = await client.prompt(prompt, model)
+        return response
+
+
+def save(
+    dataset: List[GeneratedQuestion],
+    responses: List[str],
+    results: List[Dict[str, Any]],
     out: Optional[str] = None,
-    env: BaseEnv = None,
-    log_level: str = "INFO",
+    model: str = "default_model"
 ):
     """
-    Run evaluations on LLMs.
-
-    :param models: A list of model names to run.
-    :param n: Number of questions to generate per model.
-    :param c: Number of concurrent LLM queries.
-    :param out: Output file path (optional).
-    :param env: An environment instance.
-    :param log_level: Set logging level.
+    Save the dataset, responses, and results to a file.
     """
-    if c:
-        settings.app.concurrency = c
-    
-    settings.app.log_level = log_level.upper()
-    setup_logging()
+    if not dataset:
+        print("Dataset is empty, nothing to save.")
+        return
 
-    await run_llm_batch(models, n, out, env)
-
-def results(
-    models: List[str],
-    env: BaseEnv,
-) -> List[List[Dict[str, Any]]]:
-    """
-    Get results for a given list of models and an environment class.
-    
-    :param models: A list of model names.
-    :param env: An environment class (e.g., af.environments.SAT1).
-    :return: A list of lists of result dictionaries.
-    """
-    return get_results_internal(models=models, env=env, display=False) 
+    env_name = dataset[0].env.name
+    output_path = get_output_path(model, env_name, out)
+    output_data = {
+        "dataset": [d.data for d in dataset],
+        "responses": responses,
+        "results": results,
+    }
+    with open(output_path, "w") as f:
+        json.dump(output_data, f, indent=2)
+    print(f"Results saved to {output_path}") 

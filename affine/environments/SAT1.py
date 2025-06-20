@@ -23,9 +23,6 @@ class SAT1Env(BaseEnv):
     m: Optional[int] = None # number of clauses
     
     # Private attributes for internal state
-    _questions: List[str] = PrivateAttr(default_factory=list)
-    _formulas: List[List[List[int]]] = PrivateAttr(default_factory=list)
-    _assignments: List[Dict[int, bool]] = PrivateAttr(default_factory=list)
     _idx: int = PrivateAttr(default=0)
 
     @model_validator(mode='after')
@@ -36,7 +33,7 @@ class SAT1Env(BaseEnv):
             self.m = int(4.26 * self.n)
         return self
 
-    async def generate_question(self, llm_client: Optional[LLMClient] = None) -> str:
+    async def _generate(self, llm_client: Optional[LLMClient] = None) -> Dict[str, Any]:
         # 1) Plant a random solution
         assignment = {i: random.choice([True, False]) for i in range(1, self.n + 1)}
         
@@ -57,10 +54,6 @@ class SAT1Env(BaseEnv):
                 clause.append(lit)
             clauses.append(clause)
         
-        # Store for later verification
-        self._formulas.append(clauses)
-        self._assignments.append(assignment)
-        
         # Build a human-readable CNF string
         clause_strs = []
         for clause in clauses:
@@ -80,28 +73,25 @@ class SAT1Env(BaseEnv):
             "Provide your answer as comma-separated assignments like `x1=True, x2=False, ...`, "
             "or respond `UNSAT` if it has no solution."
         )
-        self._questions.append(q)
         logger.debug(f"Generated SAT question #{self._idx}: n={self.n}, m={self.m}, planted={assignment}")
         self._idx += 1
-        return q
+        return {
+            "question": q,
+            "clauses": clauses,
+            "assignment": assignment,
+        }
 
-    async def verify(
+    async def validate(
         self,
-        question: str,
+        generated_data: Dict[str, Any],
         response: str,
         llm_client: Optional[LLMClient] = None
     ) -> Dict[str, Any]:
         # Locate the corresponding formula & assignment
-        logger.debug("Starting verification...")
-        try:
-            idx = self._questions.index(question)
-            logger.debug(f"Found question at index {idx}")
-        except ValueError:
-            logger.debug(f"Unknown question: {question}")
-            return {"correct": False, "expected": None, "extraction": None}
+        logger.debug("Starting validation...")
 
-        clauses = self._formulas[idx]
-        expected = self._assignments[idx]
+        clauses = generated_data["clauses"]
+        expected = generated_data["assignment"]
         logger.debug(f"Loaded expected assignment: {expected}")
 
         # Guard against None responses that might slip through
@@ -110,7 +100,7 @@ class SAT1Env(BaseEnv):
             return {"correct": False, "expected": expected, "extraction": None, "reason": "No response from model"}
 
         resp = response.strip()
-        logger.debug(f"Verifying response: '{resp}'")
+        logger.debug(f"Validating response: '{resp}'")
         
         # If user claims UNSAT, that's always incorrect (we planted a solution)
         if re.search(r"\\bunsat\\b", resp, re.IGNORECASE):
@@ -153,6 +143,6 @@ class SAT1Env(BaseEnv):
                     logger.debug(f"First failing clause: {failed_clauses[0]}")
 
         logger.debug(
-            f"Verification result: correct={correct}"
+            f"Validation result: correct={correct}"
         )
         return {"correct": correct, "expected": expected, "extraction": extraction if 'extraction' in locals() else None}
