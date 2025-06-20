@@ -84,7 +84,7 @@ async def get_chute(model: str) -> Dict[str, Any]:
             [chute_info.pop(k, None) for k in ['readme', 'cords', 'tagline', 'instances']]; chute_info.get('image', {}).pop('readme', None)
             return chute_info
 
-async def miners(uids: Optional[Union[int, List[int]]] = None) -> Dict[int, Miner]:
+async def miners(uids: Optional[Union[int, List[int]]] = None, no_null: bool = False) -> Dict[int, Miner]:
     NETUID = 120
     s = bt.async_subtensor()
     await s.initialize()
@@ -101,6 +101,7 @@ async def miners(uids: Optional[Union[int, List[int]]] = None) -> Dict[int, Mine
         hk = meta.hotkeys[uid] if 0 <= uid < len(meta.hotkeys) else ""
         commits = revs.get(hk) or []
         blk, mdl = commits[-1] if commits else (None, None)
+        if no_null and blk == None: continue
         out[uid] = Miner(
             uid=uid,
             hotkey=hk,
@@ -179,13 +180,18 @@ async def _run_one(
 
 async def run(
     challenges: Union[Challenge, List[Challenge]],
-    miners: Optional[Union[Dict[int, Miner], int, List[int]]] = None,
+    miners: Optional[Union[Dict[int, Miner], List[Miner], int, List[int]]] = None,
     timeout: float = 30.0,
     retries: int = 3,
     backoff: float = 1.0
 ) -> List[Result]:
     challenges = challenges if isinstance(challenges, list) else [challenges]
-    mmap = miners if isinstance(miners, dict) else await miners(miners)
+    if isinstance(miners, dict): 
+        mmap = miners
+    elif isinstance(miners, list) and all(isinstance(m, Miner) for m in miners):
+        mmap = {m.uid: m for m in miners}
+    else:
+        mmap = await miners(miners)
     valid_miners = [m for m in mmap.values() if m.model]
     total = len(valid_miners) * len(challenges)
     results: List[Result] = []
@@ -214,6 +220,7 @@ ENVS = {
 def cli():
     """Affine"""
     pass
+
 
 def print_results(results):
     # build stats per UID
@@ -296,3 +303,99 @@ def set(key: str, value: str):
     lines.append(f"{key}={value}\n")
     open(p, "w").writelines(lines)
     print(f"Set {key} in {p}")
+    
+    
+def get_average_scores(results):
+    stats = defaultdict(list)
+    for r in results:
+        stats[r.miner.hotkey].append(r.evaluation.score)
+    return {hotkey: sum(scores)/len(scores) if scores else 0 for hotkey, scores in stats.items()}
+
+class EloRatingSystem:
+    def __init__(self, players, initial_rating=1500, k_factor=32):
+        """
+        :param players: iterable of player IDs (any hashable)
+        :param initial_rating: rating assigned to new players
+        :param k_factor: the K‐factor for all rating updates
+        """
+        self.ratings = {player: initial_rating for player in players}
+        self.k = k_factor
+
+    def expected_score(self, rating_a, rating_b):
+        """
+        Compute expected score for player A against player B.
+        """
+        qa = 10 ** (rating_a / 400)
+        qb = 10 ** (rating_b / 400)
+        return qa / (qa + qb)
+
+    def update(self, player_a, player_b, score_a):
+        """
+        Update ratings for a single game.
+        
+        :param player_a: ID of first player
+        :param player_b: ID of second player
+        :param score_a: actual score for player A (1=win, 0=loss, 0.5=draw)
+        """
+        ra = self.ratings[player_a]
+        rb = self.ratings[player_b]
+        ea = self.expected_score(ra, rb)
+        eb = 1 - ea
+
+        # score_b is the flip of score_a
+        score_b = 1 - score_a
+
+        # New ratings
+        self.ratings[player_a] = ra + self.k * (score_a - ea)
+        self.ratings[player_b] = rb + self.k * (score_b - eb)
+    
+@cli.command('validator')
+@click.argument('coldkey')
+@click.argument('hotkey')
+def set(coldkey: str, hotkey: str):
+    
+    # Elo scoring system.
+    kfac = 32
+    elo: Dict[str, float] = defaultdict(lambda: 1500)
+    def update( miner_a: Miner, miner_b: Miner, score_a ):
+        ra = elo[miner_a.hotkey]
+        rb = elo[miner_b.hotkey]
+        qa = 10 ** (ra / 400)
+        qb = 10 ** (rb / 400)
+        ea = qa / (qa + qb)
+        eb = 1 - ea
+        score_b = 1 - score_a
+        elo[miner_a.hotkey] = ra + kfac * (score_a - ea)
+        elo[miner_b.hotkey] = rb + kfac * (score_b - eb)
+    
+    async def game( miner_a: Miner, miner_b: Miner ):
+        results = await run(
+            challenges = SAT().many(1),
+            miners = [miner_a, miner_b]
+        )
+        score_a = 0; score_b = 0
+        for r in results:
+            if r.miner.hotkey == miner_a.hotkey:
+                score_a += r.evaluation.score
+            else:
+                score_b += r.evaluation.score
+        if score_a > score_b:
+            update( miner_a, miner_b, 1.0 )
+        elif score_a == score_b:
+            update( miner_a, miner_b, float( miner_a.block < miner_b.block ))
+        else:
+            update( miner_a, miner_b, 0.0 )
+            
+    async def validator_loop():
+        while True:
+            all_miners = await miners(no_null=True)
+            if len(all_miners) < 2:
+                raise RuntimeError("Not enough miners to select 2 unique miners.")
+            selected_uids = random.sample(list(all_miners.keys()), 2)
+            miner_a = all_miners[selected_uids[0]]
+            miner_b = all_miners[selected_uids[1]]
+            await game(miner_a, miner_b)
+
+    asyncio.run(validator_loop())
+ 
+    
