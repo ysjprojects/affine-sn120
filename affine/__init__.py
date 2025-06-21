@@ -207,17 +207,14 @@ async def run(
         mmap = {m.uid: m for m in miners}
     else:
         mmap = await miners(miners)
-
     valid = [m for m in mmap.values() if m.model]
     total = len(valid) * len(challenges)
     results: List[Result] = []
-
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
         async def run_one(m, c):
             resp = await _run_one(sess, c, m.model, timeout, retries, backoff)
             ev = await c.evaluate(resp)
             return Result(miner=m, challenge=c, response=resp, evaluation=ev)
-
         tasks = [asyncio.create_task(run_one(m, c)) for m in valid for c in challenges]
         with alive_bar(total, title='AF') as bar:
             for coro in asyncio.as_completed(tasks):
@@ -252,7 +249,7 @@ def run_command(uids, env, n):
         return await run(challenges=chals, miners=ms)
     results = asyncio.run(_coro())
     print_results(results)
-    save_results(results)
+    save(results)
 
 @cli.command('deploy')
 @click.argument('filename', type=click.Path(exists=True))
@@ -342,7 +339,7 @@ def print_results(results: List[Result]):
         avg   = total / cnt if cnt else 0
         click.echo(fmt.format(uid, data['model'], cnt, f"{total:.4f}", f"{avg:.4f}"))
 
-def save_results(results: List[Result]):
+def save(results: List[Result]):
     path = os.path.expanduser("~/.affine/results")
     os.makedirs(path, exist_ok=True)
     file = os.path.join(path, f"{int(time.time())}.json")

@@ -1,24 +1,9 @@
 # Affine
----
 ```bash
+# Install uv astral
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
----
-```bash
-git clone https://github.com/AffineFoundation/affine.git
-cd affine
-uv venv; source .venv/bin/activate; uv pip install -e .
-```
----
-```bash
-af init --api-key <your-chutes-api-key>
-```
----
-```bash
-af run -m <model_name> -e <environment_name> -n <number_of_questions>
-# e.g. af run -m unsloth/gemma-3-4b-it -e SAT1 -n 10
-```
----
-```bash
-af validate --coldkey <your-coldkey> --hotkey <your-hotkey>
+# Set your chutes api key
+uv run af set CHUTES_API_KEY <your key value>
+# Eval uid:5 miner on the SAT env with 10 samples
+uv run af -v 5 SAT -n 10
 ```
