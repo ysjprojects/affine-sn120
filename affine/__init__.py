@@ -216,7 +216,7 @@ async def run(
             ev = await c.evaluate(resp)
             return Result(miner=m, challenge=c, response=resp, evaluation=ev)
         tasks = [asyncio.create_task(run_one(m, c)) for m in valid for c in challenges]
-        with alive_bar(total, title='AF') as bar:
+        with alive_bar(total, title='△') as bar:
             for coro in asyncio.as_completed(tasks):
                 results.append(await coro)
                 bar()
