@@ -155,7 +155,7 @@ chute = build_sglang_chute(
     concurrency=20,
     node_selector=NodeSelector(
         gpu_count=8,
-        min_vram_gb_per_gpu=70,
+        min_vram_gb_per_gpu=24,
     ),
     engine_args=(
         "--trust-remote-code "
