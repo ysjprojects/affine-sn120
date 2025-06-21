@@ -224,8 +224,8 @@ async def run(
     return results
 
 # ── CLI & commands ────────────────────────────────────────────────────────────
-from .envs.coin import COIN
-from .envs.sat import SAT
+from .envs.COIN import COIN
+from .envs.SAT import SAT
 
 ENVS = {"COIN": COIN, "SAT": SAT}
 
@@ -259,16 +259,54 @@ def run_command(uids, env, n):
 @click.option('--chute-user', default=None, help='Chutes user')
 @click.option('--wallet-cold', default=None, help='Bittensor coldkey')
 @click.option('--wallet-hot', default=None, help='Bittensor hotkey')
-def deploy(filename, chutes_api_key, hf_user, hf_token, chute_user, wallet_cold, wallet_hot):
+@click.option('--existing-repo', default=None, help='Use existing HuggingFace repository')
+@click.option('--blocks-until-reveal', default=1, help='Blocks until reveal on Bittensor')
+def deploy(filename, chutes_api_key, hf_user, hf_token, chute_user, wallet_cold, wallet_hot, existing_repo, blocks_until_reveal):
     """Deploy a model or file using provided credentials."""
     logger.debug("Deploying %s", filename)
+    
+    # Resolve configuration values
     chutes_api_key = chutes_api_key or get_conf("CHUTES_API_KEY")
     hf_user        = hf_user        or get_conf("HF_USER")
     hf_token       = hf_token       or get_conf("HF_TOKEN")
     chute_user     = chute_user     or get_conf("CHUTES_USER")
     wallet_cold    = wallet_cold    or get_conf("BT_COLDKEY")
     wallet_hot     = wallet_hot     or get_conf("BT_HOTKEY")
-    # ... deployment logic here ...
+    
+    # Import deployment functions
+    from .deployment import deploy_model, DeploymentConfig
+    
+    # Create deployment configuration
+    config = DeploymentConfig(
+        chutes_api_key=chutes_api_key,
+        hf_user=hf_user,
+        hf_token=hf_token,
+        chute_user=chute_user,
+        wallet_cold=wallet_cold,
+        wallet_hot=wallet_hot
+    )
+    
+    # Run deployment
+    async def _deploy():
+        repo_id = await deploy_model(
+            local_path=filename,
+            config=config,
+            existing_repo=existing_repo,
+            blocks_until_reveal=blocks_until_reveal
+        )
+        click.echo(f"✅ Deployment completed successfully!")
+        click.echo(f"Repository: {repo_id}")
+        return repo_id
+    
+    try:
+        asyncio.run(_deploy())
+    except KeyboardInterrupt:
+        click.echo("\n Deployment interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"Deployment failed: {str(e)}", err=True)
+        logger.error("Deployment failed", exc_info=True)
+        sys.exit(1)
 
 @cli.command('set')
 @click.argument('key')
