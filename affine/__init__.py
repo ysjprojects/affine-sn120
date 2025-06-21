@@ -195,7 +195,7 @@ async def _run_one(
 async def run(
     challenges: Union[Challenge, List[Challenge]],
     miners: Optional[Union[Dict[int, Miner], List[Miner], int, List[int]]] = None,
-    timeout: float = 30.0,
+    timeout: float = 120.0,
     retries: int = 3,
     backoff: float = 1.0
 ) -> List[Result]:
