@@ -80,11 +80,3 @@ async def get_model_size(model: str) -> dict:
     return model_size
 
 
-if __name__ == "__main__":
-    info2 = get_chutes_info("Alphatao/Affine-3366128")
-    print(info2)
-    info = asyncio.run(get_chutes_model_info("Alphatao/Affine-3366128"))
-    print(info)
-    model_size = asyncio.run(get_model_size("Alphatao/Affine-3366128"))
-    print(info)
-    print(model_size)
