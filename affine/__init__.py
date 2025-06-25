@@ -197,7 +197,8 @@ async def run(
     miners: Optional[Union[Dict[int, Miner], List[Miner], int, List[int]]] = None,
     timeout: float = 120.0,
     retries: int = 3,
-    backoff: float = 1.0
+    backoff: float = 1.0,
+    progress: bool = True,
 ) -> List[Result]:
     if not isinstance(challenges, list):
         challenges = [challenges]
@@ -208,7 +209,6 @@ async def run(
     else:
         mmap = await miners(miners)
     valid = [m for m in mmap.values() if m.model]
-    total = len(valid) * len(challenges)
     results: List[Result] = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
         async def run_one(m, c):
@@ -216,18 +216,44 @@ async def run(
             ev = await c.evaluate(resp)
             return Result(miner=m, challenge=c, response=resp, evaluation=ev)
         tasks = [asyncio.create_task(run_one(m, c)) for m in valid for c in challenges]
-        with alive_bar(total, title='△') as bar:
-            for coro in asyncio.as_completed(tasks):
-                results.append(await coro)
-                bar()
+        for coro in asyncio.as_completed(tasks):
+            results.append(await coro)
     logger.info("Finished %d runs", len(results))
     return results
 
 # ── CLI & commands ────────────────────────────────────────────────────────────
-from .envs.COIN import COIN
-from .envs.SAT import SAT
+from .envs.coin import COIN
+from .envs.sat import SAT
 
 ENVS = {"COIN": COIN, "SAT": SAT}
+
+# ── persistent Elo helpers ──────────────────────────────────────────
+ELO_FILE = os.path.expanduser("~/.affine/results/elo.json")
+
+def load_elo() -> Dict[str, float]:
+    """Load Elo table from disk, creating it if absent."""
+    if not os.path.exists(ELO_FILE):
+        # Ensure directory exists and create an empty file
+        os.makedirs(os.path.dirname(ELO_FILE), exist_ok=True)
+        with open(ELO_FILE, "w") as f:
+            json.dump({}, f)
+        return defaultdict(lambda: 1500.0)
+
+    try:
+        with open(ELO_FILE) as f:
+            data = json.load(f)
+        return {k: float(v) for k, v in data.items()}
+    except Exception:
+        # Corrupted file: start fresh
+        return defaultdict(lambda: 1500.0)
+
+def save_elo(table: Dict[str, float]) -> None:
+    """Persist Elo dict to disk."""
+    os.makedirs(os.path.dirname(ELO_FILE), exist_ok=True)
+    # convert defaultdict to regular dict for json
+    serial = dict(table)
+    with open(ELO_FILE, "w") as f:
+        json.dump(serial, f, indent=2)
 
 @click.group()
 @click.option('-v', '--verbose', count=True,
@@ -260,7 +286,7 @@ def run_command(uids, env, n):
 @click.option('--wallet-cold', default=None, help='Bittensor coldkey')
 @click.option('--wallet-hot', default=None, help='Bittensor hotkey')
 @click.option('--existing-repo', default=None, help='Use existing HuggingFace repository')
-@click.option('--blocks-until-reveal', default=1, help='Blocks until reveal on Bittensor')
+@click.option('--blocks-until-reveal', default=720, help='Blocks until reveal on Bittensor')
 def deploy(filename, chutes_api_key, hf_user, hf_token, chute_user, wallet_cold, wallet_hot, existing_repo, blocks_until_reveal):
     """Deploy a model or file using provided credentials."""
     logger.debug("Deploying %s", filename)
@@ -327,7 +353,9 @@ def set_config(key: str, value: str):
 @click.option("--delay", "-d", default=5.0, show_default=True, help="Retry delay (s)")
 def validator(k_factor: int, challenges: int, delay: float):
     """Continuously pit two random miners head-to-head."""
-    elo: Dict[str, float] = defaultdict(lambda: 1500.0)
+    elo: Dict[str, float] = load_elo()
+    if isinstance(elo, dict) and not isinstance(elo, defaultdict):
+        elo = defaultdict(lambda: 1500.0, elo)
 
     def update_elo(a: Miner, b: Miner, score_a: float):
         ra, rb = elo[a.hotkey], elo[b.hotkey]
@@ -335,27 +363,123 @@ def validator(k_factor: int, challenges: int, delay: float):
         ea, eb = qa/(qa+qb), 1 - qa/(qa+qb)
         elo[a.hotkey] = ra + k_factor*(score_a - ea)
         elo[b.hotkey] = rb + k_factor*((1-score_a) - eb)
+        save_elo(elo)
         logger.trace("ELO updated: %s→%.1f, %s→%.1f", a.hotkey, elo[a.hotkey], b.hotkey, elo[b.hotkey])
 
-    async def play_game(a: Miner, b: Miner):
-        results = await run(challenges=await SAT().many(challenges), miners=[a, b])
+    async def play_game(a: Miner, b: Miner, progress=None, task_id=None):
+        # Announce match
+        if progress is None:
+            click.echo(f"▶ Match {a.uid} vs {b.uid}")
+        else:
+            progress.console.print(f"▶ Match {a.uid} vs {b.uid}")
+
+        # Run the challenges for this pair
+        results = await run(challenges=await SAT().many(challenges), miners=[a, b], progress=False)
+
+        # Aggregate scores
         sa = sum(r.evaluation.score for r in results if r.miner.hotkey == a.hotkey)
         sb = sum(r.evaluation.score for r in results if r.miner.hotkey == b.hotkey)
+
+        # Determine outcome and update Elo
         if sa != sb:
-            update_elo(a, b, float(sa > sb))
+            winner = a if sa > sb else b
         else:
-            update_elo(a, b, float(a.block < b.block))
+            winner = a if a.block < b.block else b
+
+        loser = b if winner is a else a
+
+        # Single-line Elo update equivalent to previous logic
+        update_elo(a, b, float(sa > sb) if sa != sb else float(a.block < b.block))
+
+        # Compose message
+        if sa != sb:
+            msg = f"🏆 Winner: {winner.uid} (score {sa:.2f} – {sb:.2f}) against {loser.uid}"
+        else:
+            msg = f"🤝 Draw on scores ({sa:.2f} – {sb:.2f}), tiebreak winner {winner.uid}"
+
+        # Output
+        if progress is None:
+            click.echo(msg)
+        else:
+            progress.console.print(msg)
+
+        # Mark progress bar complete if provided
+        if progress is not None and task_id is not None:
+            progress.update(task_id, advance=1)
 
     async def main_loop():
+        """Run continuous validation cycles with concurrent matches.
+
+        Each cycle:
+          1. Fetch up-to-date miners (with a model).
+          2. Shuffle and take up to 64 ⇒ pair into ⌊n/2⌋ matches (max 32).
+          3. Launch a play_game task per pair and await them concurrently.
+        """
         while True:
-            all_miners = await miners(no_null=True)
-            if len(all_miners) < 2:
-                logger.debug("Only %d miner(s); retrying in %ds", len(all_miners), delay)
+            all_miners_dict = await miners(no_null=True)
+
+            # Keep only miners that have registered a model
+            available = [m for m in all_miners_dict.values() if m.model]
+            if len(available) < 2:
+                logger.debug("Only %d miner(s) with model; retrying in %ds", len(available), delay)
                 await asyncio.sleep(delay)
                 continue
-            a, b = random.sample(list(all_miners.values()), 2)
-            logger.debug("Validator match: %s:%s vs %s:%s", a.uid, a.model, b.uid, b.model)
-            await play_game(a, b)
+
+            random.shuffle(available)
+
+            # Limit to first 64 miners (or less) then pair them
+            sample_size = min(64, len(available))
+            selected = available[:sample_size]
+
+            pairs = [(selected[i], selected[i + 1])
+                     for i in range(0, (sample_size // 2) * 2, 2)]
+            if not pairs:
+                await asyncio.sleep(delay)
+                continue
+
+            # Keep at most 32 matches
+            pairs = pairs[:32]
+
+            logger.debug("Validator batch: %d matches queued", len(pairs))
+
+            try:
+                from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+                rich_available = True
+            except ImportError:
+                rich_available = False
+
+            if rich_available:
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("{task.description}"),
+                    BarColumn(),
+                    TimeElapsedColumn(),
+                    transient=True,
+                )
+
+                with progress:
+                    tasks = []
+                    for a, b in pairs:
+                        t_id = progress.add_task(f"{a.uid} vs {b.uid}", total=1)
+                        tasks.append(asyncio.create_task(play_game(a, b, progress, t_id)))
+
+                    await asyncio.gather(*tasks)
+            else:
+                # Fallback: no progress bars, just run concurrently
+                tasks = [asyncio.create_task(play_game(a, b)) for a, b in pairs]
+                await asyncio.gather(*tasks)
+
+            # ── leaderboard ─────────────────────────────────────────
+            if elo:
+                sorted_elo = sorted(elo.items(), key=lambda kv: kv[1], reverse=True)
+                click.echo("\n🏅 Elo leaderboard:")
+                click.echo("{:<5} {:<48} {:>8}".format("#", "Hotkey", "Elo"))
+                click.echo("-"*65)
+                for rank, (hk, rating) in enumerate(sorted_elo, 1):
+                    click.echo(f"{rank:<5} {hk:<48} {rating:>8.1f}")
+
+            # Wait before the next batch
+            await asyncio.sleep(delay)
 
     logger.info("Starting validator (k=%d, c=%d, d=%.1f)", k_factor, challenges, delay)
     asyncio.run(main_loop())
