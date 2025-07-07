@@ -37,8 +37,6 @@ af deploy /path/to/model
 # Affine – Validator
 
 ```bash
-# dev env
-python -m pip install -e .[dev]    # numpy, redis, pytest, termcolor …
 export AFFINE_WINDOW=360           # spec-compliant window length
 
 # validator (per-block tests)
@@ -49,5 +47,4 @@ python -m affine.rollup            # prints weight vector, ready for on-chain
 
 # diagnostics
 pytest -q                          # unit tests
-python demo_system_check.py        # synthetic pipeline smoke-test
 ``` 
