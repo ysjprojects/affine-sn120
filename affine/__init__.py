@@ -14,7 +14,12 @@ from collections import defaultdict
 from abc import ABC, abstractmethod
 from alive_progress import alive_bar
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
+from .utils import validate_miners_hot, load_samples, save_samples
+import types  # for SimpleNamespace used in warm-up helper
+from .invalidation import invalidate  # local import to avoid cycles
+import numpy as np  # lightweight dependency, safe to import anywhere
+from typing import Sequence
 
 # ── load env ─────────────────────────────────────────────────────────────────
 load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True)
@@ -68,7 +73,37 @@ class BaseEnv(BaseModel, ABC):
         arbitrary_types_allowed = True
 
     async def many(self, n: int) -> List["Challenge"]:
-        return [await self.generate() for _ in range(n)]
+        """Return *n* Challenge objects, using on-disk samples for caching.
+
+        The algorithm is:
+            1. Load all cached samples for this environment.
+            2. Pop up to *n* of them to create Challenge objects.
+            3. If we still need more, call *generate()* synchronously to fill
+               the gap.
+            4. Persist the *unused* remainder back to disk so the cache never
+               shrinks unexpectedly.
+        """
+        env_name = self.__class__.__name__
+
+        # 1 & 2 — fetch cached samples --------------------------------------
+        cached = load_samples(env_name)
+        used, remaining = cached[:n], cached[n:]
+
+        challenges: List["Challenge"] = [
+            Challenge(env=self, prompt=sd["prompt"], extra={k: v for k, v in sd.items() if k != "prompt"})
+            for sd in used
+        ]
+
+        # 3 — top-up with freshly generated ones ---------------------------
+        needed = n - len(challenges)
+        if needed > 0:
+            for _ in range(needed):
+                challenges.append(await self.generate())
+
+        # 4 — persist leftover cache --------------------------------------
+        save_samples(env_name, remaining)
+
+        return challenges
 
     @abstractmethod
     async def generate(self) -> "Challenge":
@@ -155,6 +190,23 @@ async def miners(uids: Optional[Union[int, List[int]]] = None, no_null: bool = F
     return out
 
 # ── run challenges ────────────────────────────────────────────────────────────
+HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))  # limit concurrent HTTP calls
+
+# ── persistent last results store ─────────────────────────────────────────
+RESULTS_FILE = os.path.expanduser("~/.affine/results.json")
+
+def save_last_results(data: Dict[str, Any]):
+    os.makedirs(os.path.dirname(RESULTS_FILE), exist_ok=True)
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _reset_in_memory() -> None:  # pragma: no cover
+    """Clear in-memory/Redis state for unit testing."""
+    if _USE_REDIS:
+        _R.flushdb()  # type: ignore[attr-defined]
+    else:
+        _LOCAL.clear()
+
 async def _run_one(
     session: aiohttp.ClientSession,
     chal: Challenge,
@@ -167,22 +219,30 @@ async def _run_one(
     token = get_conf("CHUTES_API_KEY")
     hdr = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     start = time.monotonic()
+    TERMINAL_STATUS = {400, 404, 410}
+    # NOTE: When *retries* is provided >0 we still break early on terminal errors to avoid useless traffic.
     for attempt in range(1, retries + 2):
         try:
-            async with session.post(
-                url,
-                json={"model": model, "messages": [{"role": "user", "content": chal.prompt}]},
-                headers=hdr,
-                timeout=timeout
-            ) as r:
-                text = await r.text(errors="ignore")
-                if r.status != 200:
-                    raise RuntimeError(f"{r.status}:{text}")
-                data = await r.json()
-                res = data["choices"][0]["message"]["content"]
-                latency = time.monotonic() - start
-                logger.trace("Model %s answered in %.2fs on attempt %d", model, latency, attempt)
-                return Response(response=res, latency_seconds=latency, attempts=attempt, model=model, error=None)
+            async with HTTP_SEM:
+                async with session.post(
+                    url,
+                    json={"model": model, "messages": [{"role": "user", "content": chal.prompt}]},
+                    headers=hdr,
+                    timeout=timeout
+                ) as r:
+                    text = await r.text(errors="ignore")
+                    if r.status in TERMINAL_STATUS:
+                        # Permanent failure: do not retry further
+                        latency = time.monotonic() - start
+                        logger.debug("Permanent failure (%s) for %s: %s", r.status, model, text)
+                        return Response(response=None, latency_seconds=latency, attempts=attempt, model=model, error=f"{r.status}:{text}")
+                    if r.status != 200:
+                        raise RuntimeError(f"{r.status}:{text}")
+                    data = await r.json()
+                    res = data["choices"][0]["message"]["content"]
+                    latency = time.monotonic() - start
+                    logger.trace("Model %s answered in %.2fs on attempt %d", model, latency, attempt)
+                    return Response(response=res, latency_seconds=latency, attempts=attempt, model=model, error=None)
         except Exception as e:
             logger.debug("Attempt %d for %s failed: %s", attempt, model, e)
             if attempt > retries:
@@ -210,22 +270,50 @@ async def run(
         mmap = await miners(miners)
     valid = [m for m in mmap.values() if m.model]
     results: List[Result] = []
+    total_tests = len(valid) * len(challenges)
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        async def run_one(m, c):
-            resp = await _run_one(sess, c, m.model, timeout, retries, backoff)
-            ev = await c.evaluate(resp)
-            return Result(miner=m, challenge=c, response=resp, evaluation=ev)
-        tasks = [asyncio.create_task(run_one(m, c)) for m in valid for c in challenges]
-        for coro in asyncio.as_completed(tasks):
-            results.append(await coro)
+
+        if progress:
+            with alive_bar(total_tests, title="Running challenges") as bar:
+
+                async def _run_for_miner(miner: Miner) -> List[Result]:
+                    """Run *all* challenges for *miner* sequentially."""
+                    local_results: List[Result] = []
+                    for chal in challenges:
+                        resp = await _run_one(sess, chal, miner.model, timeout, retries, backoff)
+                        ev = await chal.evaluate(resp)
+                        local_results.append(Result(miner=miner, challenge=chal, response=resp, evaluation=ev))
+                        bar()
+                    return local_results
+
+                miner_tasks = [asyncio.create_task(_run_for_miner(m)) for m in valid]
+                for coro in asyncio.as_completed(miner_tasks):
+                    results.extend(await coro)
+        else:
+            async def _run_for_miner(miner: Miner) -> List[Result]:
+                local_results: List[Result] = []
+                for chal in challenges:
+                    resp = await _run_one(sess, chal, miner.model, timeout, retries, backoff)
+                    ev = await chal.evaluate(resp)
+                    local_results.append(Result(miner=miner, challenge=chal, response=resp, evaluation=ev))
+                return local_results
+
+            miner_tasks = [asyncio.create_task(_run_for_miner(m)) for m in valid]
+            for coro in asyncio.as_completed(miner_tasks):
+                results.extend(await coro)
+
     logger.info("Finished %d runs", len(results))
     return results
 
 # ── CLI & commands ────────────────────────────────────────────────────────────
 from .envs.coin import COIN
 from .envs.sat import SAT
+from .envs.abd import ABD
+from .envs.research import RES
+from .envs.gaia import GAIA
 
-ENVS = {"COIN": COIN, "SAT": SAT}
+ENVS = {"COIN": COIN, "SAT": SAT, "ABD": ABD, "RES": RES, "GAIA": GAIA}
 
 # ── persistent Elo helpers ──────────────────────────────────────────
 ELO_FILE = os.path.expanduser("~/.affine/results/elo.json")
@@ -286,7 +374,7 @@ def run_command(uids, env, n):
 @click.option('--wallet-cold', default=None, help='Bittensor coldkey')
 @click.option('--wallet-hot', default=None, help='Bittensor hotkey')
 @click.option('--existing-repo', default=None, help='Use existing HuggingFace repository')
-@click.option('--blocks-until-reveal', default=720, help='Blocks until reveal on Bittensor')
+@click.option('--blocks-until-reveal', default=1, help='Blocks until reveal on Bittensor')
 def deploy(filename, chutes_api_key, hf_user, hf_token, chute_user, wallet_cold, wallet_hot, existing_repo, blocks_until_reveal):
     """Deploy a model or file using provided credentials."""
     logger.debug("Deploying %s", filename)
@@ -347,142 +435,156 @@ def set_config(key: str, value: str):
     logger.info("Set %s in %s", key, path)
     click.echo(f"Set {key} in {path}")
 
-@cli.command('validate')
-@click.option("--k-factor", "-k", default=32, show_default=True, help="Elo K-factor")
-@click.option("--challenges", "-c", default=2, show_default=True, help="SAT challenges per game")
-@click.option("--delay", "-d", default=5.0, show_default=True, help="Retry delay (s)")
-def validator(k_factor: int, challenges: int, delay: float):
-    """Continuously pit two random miners head-to-head."""
-    elo: Dict[str, float] = load_elo()
-    if isinstance(elo, dict) and not isinstance(elo, defaultdict):
-        elo = defaultdict(lambda: 1500.0, elo)
+# ── simplified weight-based validator ─────────────────────────────────────
+@cli.command("validate")
+@click.option("--delay", "-d", default=5.0, show_default=True,
+              help="Seconds between validation cycles")
+def validate(delay: float):
+    """Valide tous les mineurs sur 5 SAT + 5 ABD, calcule GRPO et annonce le gagnant.
 
-    def update_elo(a: Miner, b: Miner, score_a: float):
-        ra, rb = elo[a.hotkey], elo[b.hotkey]
-        qa, qb = 10**(ra/400), 10**(rb/400)
-        ea, eb = qa/(qa+qb), 1 - qa/(qa+qb)
-        elo[a.hotkey] = ra + k_factor*(score_a - ea)
-        elo[b.hotkey] = rb + k_factor*((1-score_a) - eb)
-        save_elo(elo)
-        logger.trace("ELO updated: %s→%.1f, %s→%.1f", a.hotkey, elo[a.hotkey], b.hotkey, elo[b.hotkey])
+    • 10 prompts identiques pour tout le monde (5 SAT, 5 ABD)
+    • Jamais plus d'une requête en vol par mineur
+    • Résultats bruts + GRPO stockés dans ~/.affine/results.json
+    """
 
-    async def play_game(a: Miner, b: Miner, progress=None, task_id=None):
-        # Announce match
-        if progress is None:
-            click.echo(f"▶ Match {a.uid} vs {b.uid}")
-        else:
-            progress.console.print(f"▶ Match {a.uid} vs {b.uid}")
+    SAT_N, ABD_N = 5, 5  # nombres fixes de challenges par environnement
 
-        # Run the challenges for this pair
-        results = await run(challenges=await SAT().many(challenges), miners=[a, b], progress=False)
+    async def _cycle_once() -> None:
+        miners_dict = await miners(no_null=True)
+        # Initial filter: miners with a published model
+        miners_live = [m for m in miners_dict.values() if m.model]
 
-        # Aggregate scores
-        sa = sum(r.evaluation.score for r in results if r.miner.hotkey == a.hotkey)
-        sb = sum(r.evaluation.score for r in results if r.miner.hotkey == b.hotkey)
+        # ── invalidation pipeline: keep only verified miners ────────────
+        if miners_live:
+            entries = await asyncio.gather(*[
+                invalidate(uid=m.uid,
+                           commit_hash="",  # not used for check here
+                           hotkey=m.hotkey,
+                           block=m.block or 0,
+                           model_name=m.model or "")
+                for m in miners_live
+            ])
+            miners_live = [m for m, e in zip(miners_live, entries) if e.finetune_verified]
 
-        # Determine outcome and update Elo
-        if sa != sb:
-            winner = a if sa > sb else b
-        else:
-            winner = a if a.block < b.block else b
+        if len(miners_live) < 1:
+            click.echo("🚫 No verified miners – waiting…")
+            return
 
-        loser = b if winner is a else a
+        # Prepare challenges (common)
+        sat_chals = await SAT().many(SAT_N)
+        abd_chals = await ABD().many(ABD_N)
+        common_chals = sat_chals + abd_chals
 
-        # Single-line Elo update equivalent to previous logic
-        update_elo(a, b, float(sa > sb) if sa != sb else float(a.block < b.block))
+        random.shuffle(miners_live)      # ordre aléatoire des mineurs
+        random.shuffle(common_chals)     # même ordre pour tous
 
-        # Compose message
-        if sa != sb:
-            msg = f"🏆 Winner: {winner.uid} (score {sa:.2f} – {sb:.2f}) against {loser.uid}"
-        else:
-            msg = f"🤝 Draw on scores ({sa:.2f} – {sb:.2f}), tiebreak winner {winner.uid}"
+        total_reqs = len(miners_live) * len(common_chals)
 
-        # Output
-        if progress is None:
-            click.echo(msg)
-        else:
-            progress.console.print(msg)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
+            async def _score(miner: Miner, chal: Challenge):
+                try:
+                    resp = await _run_one(sess, chal, miner.model, timeout=120.0, retries=0, backoff=0.0)
+                    ev = await chal.evaluate(resp)
+                    return miner, chal, ev.score
+                except Exception as exc:
+                    logger.error("Request failed for %s: %s", miner.hotkey, exc)
+                    return miner, chal, 0.0
 
-        # Mark progress bar complete if provided
-        if progress is not None and task_id is not None:
-            progress.update(task_id, advance=1)
+            # Wave-par-wave: garantit max 1 requête par mineur
+            results: List[tuple] = []
+            with alive_bar(total_reqs, title="Validation") as bar:
+                for chal in common_chals:
+                    tasks = [asyncio.create_task(_score(m, chal)) for m in miners_live]
+                    for coro in asyncio.as_completed(tasks):
+                        res = await coro
+                        results.append(res)
+                        bar()
 
-    async def main_loop():
-        """Run continuous validation cycles with concurrent matches.
+        # ──────────────────────────────────────────────────────────────
+        # Agrégation par mineur + persistance ND-JSON -----------------
+        # ──────────────────────────────────────────────────────────────
+        from collections import defaultdict
+        env_totals: Dict[str, Dict[str, float]] = defaultdict(lambda: {"ABD": 0.0, "SAT": 0.0})
+        hk_to_meta: Dict[str, Tuple[int, int]] = {}
+        for miner, chal, score in results:
+            env_name = chal.env.__class__.__name__
+            env_totals[miner.hotkey][env_name] += score
+            hk_to_meta[miner.hotkey] = (miner.uid, miner.block or 0)
 
-        Each cycle:
-          1. Fetch up-to-date miners (with a model).
-          2. Shuffle and take up to 64 ⇒ pair into ⌊n/2⌋ matches (max 32).
-          3. Launch a play_game task per pair and await them concurrently.
-        """
-        while True:
-            all_miners_dict = await miners(no_null=True)
+        # Calcul des deltas par miner ----------------------------------
+        miners_ordered = sorted(hk_to_meta.items(), key=lambda kv: kv[1][1])  # by block asc
+        running_max = {"ABD": 0.0, "SAT": 0.0}
+        delta_by_hk: Dict[str, float] = {}
+        delta_env_by_hk: Dict[str, Dict[str, float]] = {}
+        for hk, (_uid, _blk) in miners_ordered:
+            scores = env_totals[hk]
+            # Compute tentative increments w.r.t current maxima
+            incs = {e: scores[e] - running_max[e] for e in ("ABD", "SAT")}
+            # Rule: if any negative increment, whole round contribution is 0
+            if any(v < 0 for v in incs.values()):
+                incs = {e: 0.0 for e in incs}
+            # total delta for this miner this round
+            delta = sum(incs.values())
+            delta_by_hk[hk] = delta
+            delta_env_by_hk[hk] = incs
+            for e in ("ABD", "SAT"):
+                running_max[e] = max(running_max[e], scores[e])
 
-            # Keep only miners that have registered a model
-            available = [m for m in all_miners_dict.values() if m.model]
-            if len(available) < 2:
-                logger.debug("Only %d miner(s) with model; retrying in %ds", len(available), delay)
-                await asyncio.sleep(delay)
-                continue
+        # Ligne ND-JSON par miner (avec round & delta) -----------------
+        try:
+            ts_now = time.time()
+            round_id = next_round_id()
+            rows_to_append = [
+                {
+                    "timestamp": ts_now,
+                    "round": round_id,
+                    "hotkey": hk,
+                    "uid": uid,
+                    "block": blk,
+                    "ABD": env_totals[hk]["ABD"],
+                    "SAT": env_totals[hk]["SAT"],
+                    "delta": delta_by_hk[hk],
+                    "delta_ABD": delta_env_by_hk[hk]["ABD"],
+                    "delta_SAT": delta_env_by_hk[hk]["SAT"],
+                }
+                for hk, (uid, blk) in hk_to_meta.items()
+            ]
+            append(rows_to_append)
+        except Exception as _exc:
+            logger.error("Failed to append aggregated results: %s", _exc, exc_info=True)
 
-            random.shuffle(available)
-
-            # Limit to first 64 miners (or less) then pair them
-            sample_size = min(64, len(available))
-            selected = available[:sample_size]
-
-            pairs = [(selected[i], selected[i + 1])
-                     for i in range(0, (sample_size // 2) * 2, 2)]
-            if not pairs:
-                await asyncio.sleep(delay)
-                continue
-
-            # Keep at most 32 matches
-            pairs = pairs[:32]
-
-            logger.debug("Validator batch: %d matches queued", len(pairs))
-
-            try:
-                from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-                rich_available = True
-            except ImportError:
-                rich_available = False
-
-            if rich_available:
-                progress = Progress(
-                    SpinnerColumn(),
-                    TextColumn("{task.description}"),
-                    BarColumn(),
-                    TimeElapsedColumn(),
-                    transient=True,
+        # ──────────────────────────────────────────────────────────────
+        # Rebuild score.json and determine the winner ------------------
+        # ──────────────────────────────────────────────────────────────
+        try:
+            table = compute_scores_window()
+            save_scores(table)
+            if table:
+                winner = table[0]
+                click.echo(
+                    f"\n🏆 Gagnant: UID {winner['uid']} – {winner['hotkey'][:12]}… (score={winner['score']:.3f})"
                 )
+        except Exception as _exc:  # pragma: no cover
+            logger.error("Ranking computation failed: %s", _exc, exc_info=True)
 
-                with progress:
-                    tasks = []
-                    for a, b in pairs:
-                        t_id = progress.add_task(f"{a.uid} vs {b.uid}", total=1)
-                        tasks.append(asyncio.create_task(play_game(a, b, progress, t_id)))
+        # Early return – skip legacy GRPO computation ------------------
+        return
 
-                    await asyncio.gather(*tasks)
-            else:
-                # Fallback: no progress bars, just run concurrently
-                tasks = [asyncio.create_task(play_game(a, b)) for a, b in pairs]
-                await asyncio.gather(*tasks)
-
-            # ── leaderboard ─────────────────────────────────────────
-            if elo:
-                sorted_elo = sorted(elo.items(), key=lambda kv: kv[1], reverse=True)
-                click.echo("\n🏅 Elo leaderboard:")
-                click.echo("{:<5} {:<48} {:>8}".format("#", "Hotkey", "Elo"))
-                click.echo("-"*65)
-                for rank, (hk, rating) in enumerate(sorted_elo, 1):
-                    click.echo(f"{rank:<5} {hk:<48} {rating:>8.1f}")
-
-            # Wait before the next batch
+    async def _main_loop():
+        """Persistent async loop – keeps the event-loop alive so that
+        long-lived background tasks (e.g., finetune worker) can run."""
+        while True:
+            try:
+                await _cycle_once()
+            except KeyboardInterrupt:
+                click.echo("\nStopped.")
+                break
+            except Exception as exc:
+                logger.error("validation loop failed: %s", exc, exc_info=True)
             await asyncio.sleep(delay)
 
-    logger.info("Starting validator (k=%d, c=%d, d=%.1f)", k_factor, challenges, delay)
-    asyncio.run(main_loop())
+    # Run a single event-loop for the whole lifetime of the command
+    asyncio.run(_main_loop())
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 def print_results(results: List[Result]):
@@ -512,6 +614,438 @@ def save(results: List[Result]):
         json.dump(serial, f, indent=2)
     logger.info("Results saved to %s", file)
     click.echo(f"\nResults saved to: {file}\n")
+
+# ── inline submodules (scorer & state) to minimise file count ───────────────
+# These blocks replicate the previous ``affine.scorer`` and ``affine.state``
+# files directly inside __init__.py.  The original standalone files can be
+# safely removed once this patch is in place since we manually register the
+# replacement modules in ``sys.modules`` so external imports (including the
+# test-suite) continue to work unchanged.
+
+import sys as _sys, types as _types, json as _json, os as _os, time as _time
+from collections import defaultdict as _defaultdict, deque as _deque
+from typing import Sequence as _Sequence, Dict as _Dict, Deque as _Deque
+
+import numpy as _np
+
+# ---------------------------------------------------------------------------
+# 1. scorer sub-module – pure numpy helpers
+# ---------------------------------------------------------------------------
+_scorer_mod = _types.ModuleType(__name__ + ".scorer")
+
+# ---- public API ------------------------------------------------------------
+
+def window_average(window_sum: "_np.ndarray", sub_blocks: int) -> "_np.ndarray":
+    """Simple average of *window_sum* over *sub_blocks* blocks."""
+    return _np.asarray(window_sum, dtype=_np.float64) / float(sub_blocks or 1)
+
+
+def compute_scores(window_sum: "_np.ndarray", sub_blocks: int, b: float = 0.0) -> "_np.ndarray":
+    """Convert cumulative rewards to a normalised weight vector.
+
+    Algorithm:
+      1. Average over the window.
+      2. Shift by baseline *b* (ghost baseline).
+      3. Truncate negatives and renormalise so ∑w = 1.
+    """
+    avg = window_average(window_sum, sub_blocks)
+    shifted = _np.maximum(avg - float(b), 0.0)
+    total = shifted.sum()
+    if total <= 0.0:
+        return _np.full_like(shifted, 1.0 / shifted.size, dtype=_np.float64)
+    return shifted / total
+
+# Expose in sub-module + package namespace (advantage_vector removed)
+for _name in ("window_average", "compute_scores"):
+    setattr(_scorer_mod, _name, globals()[_name])
+    globals()[_name] = globals()[_name]  # also at package level
+
+# Register so that ``import affine.scorer`` keeps working
+_sys.modules[_scorer_mod.__name__] = _scorer_mod
+# Additionally add as attribute so ``from affine import scorer`` works
+setattr(sys.modules[__name__], "scorer", _scorer_mod)
+
+# ---------------------------------------------------------------------------
+# 2. state sub-module – lightweight Redis-backed persistence
+# ---------------------------------------------------------------------------
+_state_mod = _types.ModuleType(__name__ + ".state")
+
+# --- configuration ----------------------------------------------------------
+MAX_MINERS: int = 256
+WINDOW: int = int(_os.getenv("AFFINE_WINDOW", "128"))
+setattr(_state_mod, "MAX_MINERS", MAX_MINERS)
+setattr(_state_mod, "WINDOW", WINDOW)
+
+# Internal generic store (either Redis or in-memory fallback)
+_LOCAL: _Dict[str, _Dict[str, str]] = _defaultdict(dict)
+try:  # pragma: no cover – real Redis present
+    import redis as _redis  # type: ignore
+
+    _R = _redis.Redis(host=_os.getenv("REDIS_HOST", "localhost"), db=0, decode_responses=True)
+    _USE_REDIS = True
+except Exception:  # pragma: no cover – fall-back to in-memory store
+    _USE_REDIS = False
+
+
+def _hset(name: str, key: str, val: str) -> None:
+    if _USE_REDIS:
+        _R.hset(name, key, val)  # type: ignore[attr-defined]
+    else:
+        _LOCAL[name][key] = val
+
+
+def _hget(name: str, key: str) -> str | None:
+    if _USE_REDIS:
+        return _R.hget(name, key)  # type: ignore[attr-defined]
+    return _LOCAL.get(name, {}).get(key)
+
+
+def _hgetall(name: str) -> _Dict[str, str]:
+    if _USE_REDIS:
+        return _R.hgetall(name)  # type: ignore[attr-defined]
+    return dict(_LOCAL.get(name, {}))
+
+
+def _hdel(name: str, key: str) -> None:
+    if _USE_REDIS:
+        _R.hdel(name, key)  # type: ignore[attr-defined]
+    else:
+        _LOCAL.get(name, {}).pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Public API – mirrors old ``affine.state``
+# ---------------------------------------------------------------------------
+
+
+def upsert_miner(hotkey: str, uid: int, block_height: int) -> None:
+    """Register *hotkey* or refresh metadata, evicting if > MAX_MINERS."""
+    meta = _json.dumps({"uid": uid, "block": block_height})
+    _hset("miners", hotkey, meta)
+    if _hget("vectors", hotkey) is None:
+        _hset("vectors", hotkey, _json.dumps([]))
+
+
+def _vector_avg(vec) -> float:  # type: ignore[explicit-any]
+    if isinstance(vec, (list, tuple)) and not vec:
+        return 0.0
+    if hasattr(vec, "size") and vec.size == 0:  # ndarray
+        return 0.0
+    return float(_np.mean(vec))
+
+
+def evict_lowest() -> str | None:
+    """Evict the miner with the *lowest* average window score."""
+    vectors = get_window_vectors()
+    if not vectors:
+        return None
+    worst = min(vectors.items(), key=lambda kv: (_vector_avg(kv[1]), kv[0]))[0]
+    for bucket in ("miners", "vectors", "last_ts"):
+        _hdel(bucket, worst)
+    return worst
+
+
+def slide_window_update(score_map: _Dict[str, float]) -> None:
+    """Append new *score* for each hotkey, trimming to WINDOW length."""
+    for hk, score in score_map.items():
+        raw = _hget("vectors", hk)
+        hist: _Deque[float] = _deque(_json.loads(raw) if raw else [], maxlen=WINDOW)
+        hist.append(float(score))
+        _hset("vectors", hk, _json.dumps(list(hist)))
+
+    # Enforce cap after insertion
+    while len(_hgetall("miners")) > MAX_MINERS:
+        evict_lowest()
+
+
+def get_window_vectors() -> _Dict[str, _np.ndarray]:
+    """Return all vectors as np.float64 arrays."""
+    return {hk: _np.asarray(_json.loads(vec), dtype=_np.float64) for hk, vec in _hgetall("vectors").items()}
+
+
+# Misc helpers (kept for compatibility)
+# ---------------------------------------------------------------------------
+
+def decay_factor(delta_blocks: int, half_life: int | None = None) -> float:
+    hl = half_life or WINDOW
+    return float(0.5 ** (delta_blocks / hl))
+
+# Expose all public names in the sub-module & register it --------------------
+for _name in [
+    "upsert_miner",
+    "slide_window_update",
+    "get_window_vectors",
+    "evict_lowest",
+    "_reset_in_memory",
+]:
+    setattr(_state_mod, _name, globals()[_name])
+
+_sys.modules[_state_mod.__name__] = _state_mod
+setattr(sys.modules[__name__], "state", _state_mod)
+
+# ---------------------------------------------------------------------------
+# 3. result_store sub-module – ND-JSON persistence helpers
+# ---------------------------------------------------------------------------
+_result_store_mod = _types.ModuleType(__name__ + ".result_store")
+
+import os as _rs_os, json as _rs_json
+
+RESULTS_FILE = _rs_os.path.expanduser("~/.affine/results.json")
+
+def _rs_ensure_parent(path: str) -> None:
+    _rs_os.makedirs(_rs_os.path.dirname(path), exist_ok=True)
+
+
+def append(rows: list[dict]) -> None:
+    """Append *rows* (list of dict) as ND-JSON lines to *RESULTS_FILE*."""
+    if not rows:
+        return
+    _rs_ensure_parent(RESULTS_FILE)
+    with open(RESULTS_FILE, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(_rs_json.dumps(row, ensure_ascii=False))
+            f.write("\n")
+
+
+def load() -> list[dict]:
+    """Load and return all test results contained in *RESULTS_FILE*."""
+    if not _rs_os.path.exists(RESULTS_FILE):
+        return []
+    out: list[dict] = []
+    with open(RESULTS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(_rs_json.loads(line))
+            except _rs_json.JSONDecodeError:
+                continue  # skip malformed line – robustness in prod loops
+    return out
+
+
+def clear() -> None:
+    """Truncate *RESULTS_FILE* if it exists (no-op otherwise)."""
+    if _rs_os.path.exists(RESULTS_FILE):
+        open(RESULTS_FILE, "w").close()
+
+
+def next_round_id() -> int:
+    """Return the next round identifier (monotonically increasing)."""
+    rows = load()
+    if not rows:
+        return 0
+    try:
+        current_max = max(int(r.get("round", -1)) for r in rows)
+        return current_max + 1
+    except ValueError:
+        return 0
+
+# – expose & register --------------------------------------------------------
+for _name in ("RESULTS_FILE", "append", "load", "clear", "next_round_id"):
+    setattr(_result_store_mod, _name, globals()[_name])
+    globals()[_name] = globals()[_name]  # also at package level
+
+_sys.modules[_result_store_mod.__name__] = _result_store_mod
+setattr(sys.modules[__name__], "result_store", _result_store_mod)
+
+# ---------------------------------------------------------------------------
+# 4. round_scoring sub-module – sliding-window helper (UI/monitoring)
+# ---------------------------------------------------------------------------
+_round_mod = _types.ModuleType(__name__ + ".round_scoring")
+
+from typing import Dict as _r_Dict, List as _r_List, Any as _r_Any, Tuple as _r_Tuple
+from collections import defaultdict as _r_defaultdict
+
+ENV_NAMES: _r_Tuple[str, str] = ("SAT", "ABD")
+ROUNDS_WINDOW: int = 20
+SCORE_FILE: str = _rs_os.path.expanduser("~/.affine/score.json")
+
+
+def compute_scores_window(round_window: int = ROUNDS_WINDOW) -> _r_List[_r_Dict[str, _r_Any]]:
+    """Compute miners' scores over the last *round_window* rounds."""
+    rows = load()
+    if not rows:
+        return []
+
+    max_round = max(int(r.get("round", -1)) for r in rows)
+    min_round = max_round - round_window + 1
+    rows = [r for r in rows if int(r.get("round", -1)) >= min_round]
+
+    cumul_env: _r_Dict[str, _r_Dict[str, float]] = _r_defaultdict(lambda: {env: 0.0 for env in ENV_NAMES})
+    cumul_total: _r_Dict[str, float] = _r_defaultdict(float)
+    meta: _r_Dict[str, _r_Tuple[int, int]] = {}
+    for r in rows:
+        hk = r["hotkey"]
+        meta.setdefault(hk, (int(r.get("uid", -1)), int(r.get("block", -1))))
+        if "delta_ABD" in r and "delta_SAT" in r:
+            d_abd = float(r.get("delta_ABD", 0.0))
+            d_sat = float(r.get("delta_SAT", 0.0))
+            cumul_env[hk]["ABD"] += d_abd
+            cumul_env[hk]["SAT"] += d_sat
+            cumul_total[hk] += d_abd + d_sat
+        else:
+            cumul_total[hk] += float(r.get("delta", 0.0))
+
+    out: _r_List[_r_Dict[str, _r_Any]] = []
+    for hk in cumul_total:
+        uid, blk = meta.get(hk, (None, None))
+        out.append({
+            "hotkey": hk,
+            "uid": uid,
+            "block": blk,
+            "delta_ABD": cumul_env[hk]["ABD"],
+            "delta_SAT": cumul_env[hk]["SAT"],
+            "score": cumul_total[hk],
+        })
+
+    out.sort(key=lambda d: d["score"], reverse=True)
+    return out
+
+
+def save_scores(table: _r_List[_r_Dict[str, _r_Any]]) -> None:
+    _rs_os.makedirs(_rs_os.path.dirname(SCORE_FILE), exist_ok=True)
+    with open(SCORE_FILE, "w", encoding="utf-8") as f:
+        _rs_json.dump(table, f, indent=2)
+
+# – expose & register --------------------------------------------------------
+for _name in ("compute_scores_window", "save_scores", "ENV_NAMES", "ROUNDS_WINDOW", "SCORE_FILE"):
+    setattr(_round_mod, _name, globals()[_name])
+    globals()[_name] = globals()[_name]
+
+_sys.modules[_round_mod.__name__] = _round_mod
+setattr(sys.modules[__name__], "round_scoring", _round_mod)
+
+# ---------------------------------------------------------------------------
+# 5. ranking sub-module – decayed score ranking over commit blocks
+# ---------------------------------------------------------------------------
+_ranking_mod = _types.ModuleType(__name__ + ".ranking")
+
+import math as _rk_math, asyncio as _rk_asyncio, bittensor as _rk_bt
+from typing import Dict as _rk_Dict, List as _rk_List, Any as _rk_Any, Tuple as _rk_Tuple
+
+ENV_NAMES_RK: _rk_Tuple[str, str] = ("SAT", "ABD")
+PROMPTS_PER_ENV: int = 5
+WINDOW_BLOCKS: int = 7_200
+SCORE_FILE_RK: str = _rs_os.path.expanduser("~/.affine/score.json")
+
+
+def _rk_ensure_parent(path: str) -> None:
+    _rs_os.makedirs(_rs_os.path.dirname(path), exist_ok=True)
+
+
+async def build_score_table(*, window_blocks: int = WINDOW_BLOCKS, current_block: int | None = None) -> _rk_List[_rk_Dict[str, _rk_Any]]:
+    from . import miners as _rk_miners, Miner as _rk_Miner  # late import to avoid cycles
+
+    tests = load()
+    miners_dict = await _rk_miners(no_null=True)
+    hk_to_miner: _rk_Dict[str, _rk_Miner] = {m.hotkey: m for m in miners_dict.values() if m.model}
+
+    if not current_block:
+        try:
+            current_block = _rk_bt.subtensor().get_current_block()
+        except Exception:
+            current_block = max((m.block or 0) for m in hk_to_miner.values())
+
+    env_totals: _rk_Dict[str, _rk_Dict[str, float]] = {hk: {env: 0.0 for env in ENV_NAMES_RK} for hk in hk_to_miner}
+
+    for row in tests:
+        hk = row.get("hotkey")
+        if hk not in hk_to_miner:
+            continue
+        blk = row.get("current_block", row.get("block", 0))
+        if current_block - int(blk) > window_blocks:
+            continue
+        # RAW format
+        if "env" in row and "score" in row:
+            env = str(row["env"]).upper()
+            if env in ENV_NAMES_RK:
+                env_totals[hk][env] += float(row.get("score", 0.0))
+        else:  # Aggregated
+            for env in ENV_NAMES_RK:
+                if env in row:
+                    env_totals[hk][env] += float(row[env])
+
+    running_max: _rk_Dict[str, float] = {env: 0.0 for env in ENV_NAMES_RK}
+    table: _rk_List[_rk_Dict[str, _rk_Any]] = []
+
+    for m in sorted(hk_to_miner.values(), key=lambda x: (x.block or _rk_math.inf, x.uid)):
+        avg = env_totals.get(m.hotkey, {env: 0.0 for env in ENV_NAMES_RK})
+        diff = {env: avg[env] - running_max[env] for env in ENV_NAMES_RK}
+        table.append({
+            "hotkey": m.hotkey,
+            "uid": m.uid,
+            "block": m.block,
+            "avg": avg,
+            "max_prev": running_max.copy(),
+            "diff": diff,
+        })
+        for env in ENV_NAMES_RK:
+            running_max[env] = max(running_max[env], avg[env])
+
+    return table
+
+
+def save_score_table(table: _rk_List[_rk_Dict[str, _rk_Any]]) -> None:
+    _rk_ensure_parent(SCORE_FILE_RK)
+    with open(SCORE_FILE_RK, "w", encoding="utf-8") as f:
+        _rs_json.dump(table, f, indent=2)
+
+
+async def rank_miners(*, window_blocks: int = WINDOW_BLOCKS) -> _rk_List[_rk_Dict[str, _rk_Any]]:
+    table = await build_score_table(window_blocks=window_blocks)
+    try:
+        current_block = _rk_bt.subtensor().get_current_block()
+    except Exception:
+        current_block = max(row["block"] or 0 for row in table)
+
+    ranked: _rk_List[_rk_Dict[str, _rk_Any]] = []
+    for row in table:
+        diff_values = list(row["diff"].values())
+        raw_score = sum(diff_values) / len(diff_values) if diff_values else 0.0
+        commit_block = row["block"] or current_block
+        age_blocks = max(current_block - commit_block, 0)
+        decay_factor = 2 ** (age_blocks // window_blocks)
+        decayed_score = raw_score / max(decay_factor, 1)
+        ranked.append({
+            "hotkey": row["hotkey"],
+            "uid": row["uid"],
+            "score": decayed_score,
+            "raw_score": raw_score,
+            "decay_factor": decay_factor,
+        })
+
+    ranked.sort(key=lambda d: d["score"], reverse=True)
+    return ranked
+
+
+async def compute_and_save_scores(window_blocks: int = WINDOW_BLOCKS) -> _rk_Dict[str, _rk_Any] | None:
+    table = await build_score_table(window_blocks=window_blocks)
+    save_score_table(table)
+    ranking = await rank_miners(window_blocks=window_blocks)
+    return ranking[0] if ranking else None
+
+# – expose & register --------------------------------------------------------
+for _name in (
+    "build_score_table",
+    "save_score_table",
+    "rank_miners",
+    "compute_and_save_scores",
+):
+    setattr(_ranking_mod, _name, globals()[_name])
+    globals()[_name] = globals()[_name]
+
+_sys.modules[_ranking_mod.__name__] = _ranking_mod
+setattr(sys.modules[__name__], "ranking", _ranking_mod)
+
+# Misc helpers (kept for compatibility)
+# ---------------------------------------------------------------------------
+
+def decay_factor(delta_blocks: int, half_life: int | None = None) -> float:
+    hl = half_life or WINDOW
+    return float(0.5 ** (delta_blocks / hl))
+
+
 
 if __name__ == "__main__":
     cli()

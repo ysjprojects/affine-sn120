@@ -31,3 +31,45 @@ class SAT(af.BaseEnv):
                for v, val in re.findall(r"x(\d+)=(True|False|1|0)", (response.response or ""))}
         ok = all(any((lit>0)==got.get(abs(lit), None) for lit in c) for c in cls)
         return af.Evaluation(env=self, score=float(ok), extra={"expected": sol, "got": got})
+
+# ---------------------------------------------------------------------------
+# Deterministic helper – used by the incentive mechanism
+# ---------------------------------------------------------------------------
+
+def generate(seed: int, n: int = 3, k: int = 2, m: int | None = None) -> dict:
+    """Deterministically generate a SAT challenge and its ground-truth.
+
+    Parameters
+    ----------
+    seed : int
+        RNG seed – same seed yields the exact same prompt/solution.
+    n, k, m : int
+        Classic n-variable, k-CNF with *m* clauses (defaults to 4.26·n).
+
+    Returns
+    -------
+    dict
+        ``{"prompt": str, "sol": dict[int,bool], "cls": list[list[int]]}``
+    """
+    import random as _r  # local import to avoid polluting global RNG
+
+    rnd = _r.Random(seed)
+    m = m or int(4.26 * n)
+
+    sol = {i: rnd.choice([True, False]) for i in range(1, n + 1)}
+    cls = []
+    for _ in range(m):
+        vs = rnd.sample(list(sol), k)
+        sv = rnd.choice(vs)
+        cls.append([
+            (v if sol[v] else -v) if v == sv else (v if rnd.choice([True, False]) else -v)
+            for v in vs
+        ])
+    formula = " ∧ ".join("(" + " ∨ ".join(f"{'' if l>0 else '¬'}x{abs(l)}" for l in c) + ")" for c in cls)
+    prompt = (
+        f"Find a satisfying assignment for the following {k}-SAT formula over variables x1..x{n}:\n"
+        f"{formula}\n"
+        "Provide your answer as comma-separated assignments like `x1=True, x2=False, ...`, "
+        "or respond `UNSAT` if it has no solution."
+    )
+    return {"prompt": prompt, "sol": sol, "cls": cls}

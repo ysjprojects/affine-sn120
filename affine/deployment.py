@@ -30,9 +30,9 @@ async def deploy_model(
     """
     Deploy a model through the complete pipeline:
     1. Push to HuggingFace (if not existing_repo)
-    2. Commit to Bittensor chain
-    3. Deploy to Chutes
-    4. Test deployment
+    2. Deploy to Chutes
+    3. Warm-up / test deployment
+    4. Commit the repository hash to the Bittensor chain
     """
     if existing_repo:
         repo_id = existing_repo
@@ -46,9 +46,14 @@ async def deploy_model(
         
         await push_to_huggingface(local_path, repo_id, config.hf_token)
     
-    await push_to_chain(repo_id, blocks_until_reveal, config.wallet_cold, config.wallet_hot)
+    # --- Deploy to Chutes first ------------------------------------------------
     await deploy_to_chutes(repo_id, config.chute_user, config.chutes_api_key)
+
+    # --- Optional warm-up / smoke test ---------------------------------------
     await test_deployment(repo_id, config.chutes_api_key)
+
+    # --- Finally, commit on-chain -------------------------------------------
+    await push_to_chain(repo_id, blocks_until_reveal, config.wallet_cold, config.wallet_hot)
     
     return repo_id
 
@@ -155,13 +160,13 @@ chute = build_sglang_chute(
     concurrency=20,
     node_selector=NodeSelector(
         gpu_count=8,
-        min_vram_gb_per_gpu=24,
+        min_vram_gb_per_gpu=40,
+
     ),
     engine_args=(
         "--trust-remote-code "
-        "--grammar-backend xgrammar "
-        "--tool-call-parser qwen25 "
-        "--json-model-override-args {{\\"rope_scaling\\":{{\\"type\\":\\"yarn\\",\\"factor\\":4.0,\\"original_max_position_embeddings\\":32768}}}}"
+        "--revision 6e8885a6ff5c1dc5201574c8fd700323f23c25fa "
+        "--tool-call-parser deepseekv3 "
     ),
 )
 '''
@@ -197,3 +202,25 @@ async def test_deployment(repo_id: str, chutes_api_key: str) -> None:
         except Exception as e:
             print(f"Note: Expected timeout during warm-up: {str(e)}")
             print("Deployment test completed!")
+
+
+# ---------------------------------------------------------------------------
+# Incentive vector commitment (stub)
+# ---------------------------------------------------------------------------
+
+
+def commit_weights(weights: list[tuple[str, float]], block: int) -> None:  # noqa: D401
+    """Commit *weights* on-chain – **stub** implementation.
+
+    Parameters
+    ----------
+    weights : list[tuple[hotkey, float]]
+        Normalised weight vector (must sum to 1).
+    block : int
+        Current block height (informational only).
+    """
+    total = sum(w for _hk, w in weights)
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError("Weights must be normalised (∑w=1)")
+    print(f"[commit_weights] block={block} n={len(weights)} first5={weights[:5]}")
+    # TODO: replace print with real Bittensor extrinsic
