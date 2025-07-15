@@ -440,14 +440,9 @@ def set_config(key: str, value: str):
 @click.option("--delay", "-d", default=5.0, show_default=True,
               help="Seconds between validation cycles")
 def validate(delay: float):
-    """Valide tous les mineurs sur 5 SAT + 5 ABD, calcule GRPO et annonce le gagnant.
+    """Validate all miners on 5 SAT + 5 ABD, compute GRPO and announce the winner."""
 
-    • 10 prompts identiques pour tout le monde (5 SAT, 5 ABD)
-    • Jamais plus d'une requête en vol par mineur
-    • Résultats bruts + GRPO stockés dans ~/.affine/results.json
-    """
-
-    SAT_N, ABD_N = 5, 5  # nombres fixes de challenges par environnement
+    SAT_N, ABD_N = 5, 5 
 
     async def _cycle_once() -> None:
         miners_dict = await miners(no_null=True)
@@ -455,7 +450,8 @@ def validate(delay: float):
         miners_live = [m for m in miners_dict.values() if m.model]
 
         # ── invalidation pipeline: keep only verified miners ────────────
-        if miners_live:
+
+        """if miners_live:
             entries = await asyncio.gather(*[
                 invalidate(uid=m.uid,
                            commit_hash="",  # not used for check here
@@ -464,19 +460,18 @@ def validate(delay: float):
                            model_name=m.model or "")
                 for m in miners_live
             ])
-            miners_live = [m for m, e in zip(miners_live, entries) if e.finetune_verified]
+            miners_live = [m for m, e in zip(miners_live, entries) if e.finetune_verified]"""
 
         if len(miners_live) < 1:
             click.echo("🚫 No verified miners – waiting…")
             return
 
-        # Prepare challenges (common)
         sat_chals = await SAT().many(SAT_N)
         abd_chals = await ABD().many(ABD_N)
         common_chals = sat_chals + abd_chals
 
-        random.shuffle(miners_live)      # ordre aléatoire des mineurs
-        random.shuffle(common_chals)     # même ordre pour tous
+        random.shuffle(miners_live)      
+        random.shuffle(common_chals)     
 
         total_reqs = len(miners_live) * len(common_chals)
 
@@ -490,7 +485,7 @@ def validate(delay: float):
                     logger.error("Request failed for %s: %s", miner.hotkey, exc)
                     return miner, chal, 0.0
 
-            # Wave-par-wave: garantit max 1 requête par mineur
+            
             results: List[tuple] = []
             with alive_bar(total_reqs, title="Validation") as bar:
                 for chal in common_chals:
@@ -500,74 +495,155 @@ def validate(delay: float):
                         results.append(res)
                         bar()
 
-        # ──────────────────────────────────────────────────────────────
-        # Agrégation par mineur + persistance ND-JSON -----------------
-        # ──────────────────────────────────────────────────────────────
         from collections import defaultdict
-        env_totals: Dict[str, Dict[str, float]] = defaultdict(lambda: {"ABD": 0.0, "SAT": 0.0})
-        hk_to_meta: Dict[str, Tuple[int, int]] = {}
+
+        # Map hotkey → Miner for quick access
+        hk_to_miner = {m.hotkey: m for m in miners_live}
+
+        # 1) Record raw task outcomes (0/1) per environment ------------
+        miner_results: Dict[str, Dict[str, list[int]]] = defaultdict(lambda: {"SAT": [], "ABD": []})
+
+        # 2) Collect successes per challenge to determine the winner ---
         for miner, chal, score in results:
             env_name = chal.env.__class__.__name__
-            env_totals[miner.hotkey][env_name] += score
-            hk_to_meta[miner.hotkey] = (miner.uid, miner.block or 0)
+            success = 1 if score >= 1.0 else 0
+            miner_results[miner.hotkey][env_name].append(success)
 
-        # Calcul des deltas par miner ----------------------------------
-        miners_ordered = sorted(hk_to_meta.items(), key=lambda kv: kv[1][1])  # by block asc
-        running_max = {"ABD": 0.0, "SAT": 0.0}
-        delta_by_hk: Dict[str, float] = {}
-        delta_env_by_hk: Dict[str, Dict[str, float]] = {}
-        for hk, (_uid, _blk) in miners_ordered:
-            scores = env_totals[hk]
-            # Compute tentative increments w.r.t current maxima
-            incs = {e: scores[e] - running_max[e] for e in ("ABD", "SAT")}
-            # Rule: if any negative increment, whole round contribution is 0
-            if any(v < 0 for v in incs.values()):
-                incs = {e: 0.0 for e in incs}
-            # total delta for this miner this round
-            delta = sum(incs.values())
-            delta_by_hk[hk] = delta
-            delta_env_by_hk[hk] = incs
-            for e in ("ABD", "SAT"):
-                running_max[e] = max(running_max[e], scores[e])
+        # 3) Compute simple counts (0-5) per miner and environment -----
+        miner_scores: Dict[str, Dict[str, int]] = defaultdict(lambda: {"SAT": 0, "ABD": 0})
 
-        # Ligne ND-JSON par miner (avec round & delta) -----------------
+        for hk, env_lists in miner_results.items():
+            miner_scores[hk]["SAT"] = sum(env_lists["SAT"])
+            miner_scores[hk]["ABD"] = sum(env_lists["ABD"])
+
+        # 4) Persist raw outcomes to ~/.affine/results.json ------------
         try:
-            ts_now = time.time()
             round_id = next_round_id()
-            rows_to_append = [
-                {
-                    "timestamp": ts_now,
+            rows_to_append = []
+            for hk in miner_scores:
+                sat_score = miner_scores[hk]["SAT"]
+                abd_score = miner_scores[hk]["ABD"]
+                #
+                # Store detailed per-task success (0/1) lists as well for
+                # easier debugging / analytics while keeping the aggregated
+                # numeric scores used elsewhere.
+                sat_raw  = miner_results[hk]["SAT"]
+                abd_raw  = miner_results[hk]["ABD"]
+                rows_to_append.append({
                     "round": round_id,
+                    "uid": hk_to_miner[hk].uid,
                     "hotkey": hk,
-                    "uid": uid,
-                    "block": blk,
-                    "ABD": env_totals[hk]["ABD"],
-                    "SAT": env_totals[hk]["SAT"],
-                    "delta": delta_by_hk[hk],
-                    "delta_ABD": delta_env_by_hk[hk]["ABD"],
-                    "delta_SAT": delta_env_by_hk[hk]["SAT"],
-                }
-                for hk, (uid, blk) in hk_to_meta.items()
-            ]
+                    # aggregated relative scores (used by monitoring helpers)
+                    "SAT": sat_score,
+                    "ABD": abd_score,
+                    # raw binary successes per prompt (detail requested)
+                    "SAT_tasks": sat_raw,
+                    "ABD_tasks": abd_raw,
+                })
             append(rows_to_append)
         except Exception as _exc:
-            logger.error("Failed to append aggregated results: %s", _exc, exc_info=True)
+            logger.error("Failed to append results: %s", _exc, exc_info=True)
 
-        # ──────────────────────────────────────────────────────────────
-        # Rebuild score.json and determine the winner ------------------
-        # ──────────────────────────────────────────────────────────────
+        # 5) Update 20-round rolling averages --------------------------
         try:
-            table = compute_scores_window()
-            save_scores(table)
-            if table:
-                winner = table[0]
-                click.echo(
-                    f"\n🏆 Gagnant: UID {winner['uid']} – {winner['hotkey'][:12]}… (score={winner['score']:.3f})"
-                )
-        except Exception as _exc:  # pragma: no cover
-            logger.error("Ranking computation failed: %s", _exc, exc_info=True)
+            from affine import round_scoring as _rs
+            table20 = _rs.compute_scores_window()
+            _rs.save_scores(table20)
+        except Exception as _exc:
+            logger.error("Failed to update score.json: %s", _exc, exc_info=True)
 
-        # Early return – skip legacy GRPO computation ------------------
+        # 6) Determine winner using 20-round window statistics ----------
+        try:
+            # Build helper dicts from 20-round table
+            env_names = ("SAT", "ABD")
+            if not 'table20' in locals():
+                from affine import round_scoring as _rs
+                table20 = _rs.compute_scores_window()
+            if table20:
+                # Average score per env across miners (in 0-100 scale)
+                env_avg: Dict[str, float] = {
+                    env: float(sum(row[env] for row in table20)) / len(table20)
+                    for env in env_names
+                }
+
+                env_max: Dict[str, float] = {
+                    env: max(row[env] for row in table20)
+                    for env in env_names
+                }
+
+                # Compute final score per miner
+                ranking: list[Dict[str, Any]] = []
+                for row in table20:
+                    hk = row["hotkey"]
+                    # Only leaders for each environment earn points.
+                    # Each earned point equals (1 - env_avg / 100).
+                    bonus = sum(
+                        (1.0 - env_avg[env] / 100.0)
+                        for env in env_names
+                        if row[env] == env_max[env]
+                    )
+                    # Final score is 2 ^ (total points earned).
+                    final = 2 ** bonus
+                    ranking.append({"hotkey": hk, "uid": row["uid"], "final": final})
+
+                ranking.sort(key=lambda d: d["final"], reverse=True)
+                top = ranking[0]
+            else:
+                # Fallback – use current round min(SAT,ABD)
+                top = {
+                    "hotkey": max(miner_scores, key=lambda h: min(miner_scores[h]["SAT"], miner_scores[h]["ABD"])) ,
+                    "uid": hk_to_miner[max(miner_scores, key=lambda h: min(miner_scores[h]["SAT"], miner_scores[h]["ABD"]))].uid,
+                }
+        except Exception as _exc:
+            logger.error("Winner computation failed: %s", _exc, exc_info=True)
+            # Graceful degradation: simple min criterion
+            top = {
+                "hotkey": max(miner_scores, key=lambda h: min(miner_scores[h]["SAT"], miner_scores[h]["ABD"])) ,
+                "uid": hk_to_miner[max(miner_scores, key=lambda h: min(miner_scores[h]["SAT"], miner_scores[h]["ABD"]))].uid,
+            }
+
+        # 7) Persist winner history (ND-JSON) ------------------
+        WIN_FILE = os.path.expanduser("~/.affine/winners.json")
+        os.makedirs(os.path.dirname(WIN_FILE), exist_ok=True)
+        with open(WIN_FILE, "a", encoding="utf-8") as wf:
+            wf.write(json.dumps({
+                "round": round_id,
+                "uid": top["uid"],
+                "hotkey": top["hotkey"],
+                "block": (hk_to_miner.get(top["hotkey"]) or types.SimpleNamespace(block=None)).block,
+            }))
+            wf.write("\n")
+
+        # 8) Compute champion over last 20 rounds -------------
+        try:
+            recent: Dict[str, int] = defaultdict(int)
+            winners: list = []
+            if os.path.exists(WIN_FILE):
+                with open(WIN_FILE, "r", encoding="utf-8") as rf:
+                    for line in rf:
+                        try:
+                            winners.append(json.loads(line))
+                        except Exception:
+                            continue
+            if winners:
+                max_round = max(w["round"] for w in winners)
+                window_min = max_round - 19
+                for w in winners:
+                    if w["round"] >= window_min:
+                        recent[w["hotkey"]] += 1
+                champion_hk, wins = max(recent.items(), key=lambda kv: kv[1])
+                champ = next((w for w in winners if w["hotkey"] == champion_hk), None)
+                if champ:
+                    click.echo(f"🥇 Leader 20rds: UID {champ['uid']} – {champion_hk[:12]}… ({wins} wins)")
+        except Exception as _exc:
+            logger.error("Failed to compute 20-round champion: %s", _exc, exc_info=True)
+
+        
+        click.echo(
+            f"\n🏆 Winner round {round_id}: UID {top['uid']} – {top['hotkey'][:12]}… (score={top.get('final', 0):.3f})"
+        )
+
+        # End of cycle -----------------------------------------------
         return
 
     async def _main_loop():
@@ -863,7 +939,7 @@ SCORE_FILE: str = _rs_os.path.expanduser("~/.affine/score.json")
 
 
 def compute_scores_window(round_window: int = ROUNDS_WINDOW) -> _r_List[_r_Dict[str, _r_Any]]:
-    """Compute miners' scores over the last *round_window* rounds."""
+    """Return average score per environment over the last *round_window* rounds."""
     rows = load()
     if not rows:
         return []
@@ -872,34 +948,28 @@ def compute_scores_window(round_window: int = ROUNDS_WINDOW) -> _r_List[_r_Dict[
     min_round = max_round - round_window + 1
     rows = [r for r in rows if int(r.get("round", -1)) >= min_round]
 
-    cumul_env: _r_Dict[str, _r_Dict[str, float]] = _r_defaultdict(lambda: {env: 0.0 for env in ENV_NAMES})
-    cumul_total: _r_Dict[str, float] = _r_defaultdict(float)
+    totals: _r_Dict[str, _r_Dict[str, float]] = _r_defaultdict(lambda: {env: 0.0 for env in ENV_NAMES})
     meta: _r_Dict[str, _r_Tuple[int, int]] = {}
+
     for r in rows:
         hk = r["hotkey"]
         meta.setdefault(hk, (int(r.get("uid", -1)), int(r.get("block", -1))))
-        if "delta_ABD" in r and "delta_SAT" in r:
-            d_abd = float(r.get("delta_ABD", 0.0))
-            d_sat = float(r.get("delta_SAT", 0.0))
-            cumul_env[hk]["ABD"] += d_abd
-            cumul_env[hk]["SAT"] += d_sat
-            cumul_total[hk] += d_abd + d_sat
-        else:
-            cumul_total[hk] += float(r.get("delta", 0.0))
+        for env in ENV_NAMES:
+            if env in r:
+                totals[hk][env] += float(r[env])  # accumulate raw scores (0–5 per round)
 
     out: _r_List[_r_Dict[str, _r_Any]] = []
-    for hk in cumul_total:
+    for hk, env_total in totals.items():
         uid, blk = meta.get(hk, (None, None))
         out.append({
             "hotkey": hk,
             "uid": uid,
             "block": blk,
-            "delta_ABD": cumul_env[hk]["ABD"],
-            "delta_SAT": cumul_env[hk]["SAT"],
-            "score": cumul_total[hk],
+            "SAT": env_total["SAT"],  # total successes over the window (0-100)
+            "ABD": env_total["ABD"],
         })
 
-    out.sort(key=lambda d: d["score"], reverse=True)
+    out.sort(key=lambda d: min(d["SAT"], d["ABD"]), reverse=True)
     return out
 
 
@@ -954,7 +1024,8 @@ async def build_score_table(*, window_blocks: int = WINDOW_BLOCKS, current_block
         if hk not in hk_to_miner:
             continue
         blk = row.get("current_block", row.get("block", 0))
-        if current_block - int(blk) > window_blocks:
+        if current_block - int(blk) > window_blocks
+        
             continue
         # RAW format
         if "env" in row and "score" in row:

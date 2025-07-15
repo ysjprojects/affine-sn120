@@ -1,0 +1,19 @@
+services:
+  validator:
+    build: ../
+    image: affinefdn/validator:latest
+    depends_on: [redis]
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=300
+volumes:
+  redis_data: 

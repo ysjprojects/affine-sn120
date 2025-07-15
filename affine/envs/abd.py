@@ -1,180 +1,486 @@
-"""affine.envs.abd – *Almost Blind Decompiler* mini-environment.
-
-The task: we give the model a short Python **program** together with its
-**expected stdout** and ask for an **input** that triggers exactly that
-output.  The solver must supply the input inside `<INPUT>...</INPUT>` tags.
-
-This trimmed version (≈150 LoC) is self-contained – no external datasets – and
-relies on a few randomly-generated toy programs so that we can generate an
-arbitrary amount of samples on-the-fly without network traffic.
-"""
-
-from __future__ import annotations
-
-import random, re, textwrap
-from typing import List, Dict, Any
+import random
+import asyncio
+import re
+import json
+from datasets import load_dataset, IterableDataset
+from typing import Any, ClassVar, List, Dict, Optional
 import affine as af
-from ..utils import ProgramExecutor
-from pydantic import Field
+from affine.program_executor import ProgramExecutor
+import logging
+from .. import val_config
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Prompt templates
-# ──────────────────────────────────────────────────────────────────────────────
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-PROMPT_TEMPLATE = textwrap.dedent("""
-    You are a programming expert. Given a Python program and its expected
-    output, determine a **stdin** input that reproduces the output.
+PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
 
-    Program:
-    ```python
-    {program}
-    ```
+Program:
+```python
+{program}
+```
 
-    Expected Output:
-    ```
-    {output}
-    ```
+Expected Output:
+```
+{output}
+```
 
-    Task: provide the input **exactly** as the program should receive it.
-    Insert it between the tags below – nothing else will be captured.
+Task: Analyze the program to understand what input format it expects from stdin, then provide the input data that would produce the expected output.
 
-    <INPUT>
-    your input here
-    </INPUT>
-    """).strip()
+You can provide any explanations, analysis, or reasoning you want. However, you MUST include the input data within <INPUT> </INPUT> tags.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tiny helpers
-# ──────────────────────────────────────────────────────────────────────────────
+Format the input data like this:
+<INPUT>
+[input data here - each line on a separate line as the program expects]
+</INPUT>
 
-def _random_string(n: int = 5) -> str:
-    return "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(n))
+I will extract only the content between these tags.
 
+Requirements for the input data within the tags:
+1. Each line of input should be on a separate line
+2. Use the exact format the program expects  
+3. Provide the raw input values that should be fed to stdin
+4. Do not include any prefixes or extra formatting within the INPUT tags
 
-def _toy_program() -> tuple[str, str]:
-    """Return *(program, output)* for a randomly-parameterised snippet.
+Please analyze the program and provide the required input:"""
 
-    We generate three kinds of very small deterministic programs so we can
-    compute their ground-truth outputs cheaply.
-    """
-    kind = random.choice(["reverse", "sum", "upper"])
+INPUT_GENERATION_PROMPT = """Given this Python program, generate a valid input that would be accepted by the program:
 
-    if kind == "reverse":
-        inp = _random_string()
-        program = "s=input()[::-1];print(s)"
-        expected = inp[::-1]
-    elif kind == "sum":
-        a, b = random.randint(0, 99), random.randint(0, 99)
-        program = "a,b=map(int,input().split());print(a+b)"
-        inp = f"{a} {b}"
-        expected = str(a + b)
-    else:  # upper
-        inp = _random_string()
-        program = "print(input().upper())"
-        expected = inp.upper()
+Program:
+```python
+{program}
+```
 
-    return program, inp, expected
+Requirements:
+1. Each line of input should be on a separate line
+2. Use the exact format the program expects from stdin
+3. Provide only raw input values
+4. Do not include any prefixes or extra formatting
 
+Format your response with <INPUT> </INPUT> tags like this:
+<INPUT>
+[your input data here]
+</INPUT>
+
+Please generate a valid input:"""
 
 class ABD(af.BaseEnv):
-    """Simple ABD environment using toy programs generated on-the-fly."""
+    dataset_name: str
+    executor: ProgramExecutor = None
+    _dataset: Any = None
+    _dataset_iterator: Any = None
+    
+    # Recommended timeout for this environment
+    LLM_RESPONSE_TIMEOUT: ClassVar[float] = val_config.LLM_RESPONSE_TIMEOUT
+    
+    # Maximum number of samples to keep in memory
+    MAX_SAMPLES: ClassVar[int] = 1000
+    
+    def __init__(self, dataset_name="satpalsr/rl-python"):
+        super().__init__(dataset_name=dataset_name, executor=ProgramExecutor(), _dataset=None)
+        self._dataset_iterator = None
+        
+    def _get_dataset(self):
+        """Load dataset as an iterator to prevent memory issues"""
+        if self._dataset is None:
+            try:
+                # Load dataset in streaming mode
+                self._dataset = load_dataset(
+                    self.dataset_name,
+                    streaming=True
+                )
+                
+                # Use training split if available, otherwise use the first available split
+                if 'train' in self._dataset:
+                    self._dataset_iterator = iter(self._dataset['train'])
+                else:
+                    # Get the first available split
+                    split_name = list(self._dataset.keys())[0]
+                    self._dataset_iterator = iter(self._dataset[split_name])
+                    
+                logging.info(f"Successfully initialized streaming dataset: {self.dataset_name}")
+            except Exception as e:
+                logging.error(f"Error loading dataset: {str(e)}")
+                raise RuntimeError(f"Failed to load dataset: {str(e)}")
+                
+        return self._dataset
 
-    executor: ProgramExecutor = Field(default_factory=ProgramExecutor, exclude=True)
+    def _get_random_samples(self, n: int) -> List[Dict]:
+        """Get n random samples from the dataset using reservoir sampling"""
+        if not self._dataset_iterator:
+            self._get_dataset()
+            
+        samples = []
+        count = 0
+        
+        try:
+            # Get all samples at once
+            while count < self.MAX_SAMPLES:
+                try:
+                    item = next(self._dataset_iterator)
+                    samples.append(item)
+                    count += 1
+                except StopIteration:
+                    # Reset iterator and continue collecting if we need more samples
+                    self._dataset_iterator = iter(self._dataset['train'])
+                    if count < n:  # Only continue if we don't have enough samples
+                        continue
+                    break
+            
+            logger.debug(f"Collected {count} samples from dataset")
+            
+            # If we have fewer samples than requested, just return what we have
+            if count <= n:
+                logger.debug(f"Returning all {len(samples)} samples (fewer than requested {n})")
+                return samples
+            
+            # Use reservoir sampling to select n random samples
+            result = []
+            indices = random.sample(range(count), n)  # Select n random unique indices
+            for idx in indices:
+                result.append(samples[idx])
+            
+            logger.debug(f"Selected {len(result)} samples using reservoir sampling")
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error during sampling: {str(e)}")
+            return samples[:n] if samples else []
 
-    # ------------------------------------------------------------------
-    # Challenge generation
-    # ------------------------------------------------------------------
+    async def generate_new_test_cases(self, n: int, max_concurrent: int = val_config.MAX_CONCURRENT_REQUESTS) -> List[Dict[str, Any]]:
+        """Generate test cases in parallel"""
+        # Get random samples using reservoir sampling
+        logger.debug("Starting to generate new test cases")
+        samples = self._get_random_samples(n)
+        
+        if not samples:
+            logger.error("Failed to get samples from dataset")
+            raise RuntimeError("Failed to get samples from dataset")
+
+        logger.debug(f"Got {len(samples)} samples from dataset")
+
+        # Generate prompts for input generation
+        prompts = [
+            INPUT_GENERATION_PROMPT.format(program=sample['program'])
+            for sample in samples
+        ]
+
+        logger.debug(f"Processing {len(prompts)} prompts in parallel")
+        
+        # Generate inputs for all prompts in parallel
+        try:
+            generated_inputs = await self.generate_inputs_parallel(
+                prompts, 
+                max_concurrent,
+                model="unsloth/gemma-3-27b-it"
+            )
+            logger.debug(f"Generated {len(generated_inputs)} inputs")
+        except Exception as e:
+            logger.error(f"Failed to generate inputs: {str(e)}")
+            return []
+
+        # Process each generated input through the program
+        new_test_cases = []
+        for idx, (sample, generated_input) in enumerate(zip(samples, generated_inputs)):
+            logger.debug(f"Processing generated input {idx + 1}")
+            
+            if not generated_input:
+                logger.warning("Empty generated input, skipping")
+                continue
+
+            # Extract input from LLM response
+            input_data = self.extract_input_from_response(generated_input)
+            if not input_data:
+                logger.warning("Failed to extract input from LLM response")
+                logger.debug(f"Raw LLM response: {generated_input}")
+                continue
+
+            # Run the program with generated input
+            output, error = self.executor.execute_program(sample['program'], input_data)
+            if error:
+                logger.warning(f"Program execution failed: {error}")
+                logger.debug(f"Program: {sample['program']}")
+                logger.debug(f"Input: {input_data}")
+                continue
+
+            logger.debug("Successfully generated test case")
+            # Create new test case
+            new_test_cases.append({
+                'program': sample['program'],
+                'input': input_data,
+                'output': output
+            })
+
+            # Break if we have enough test cases
+            if len(new_test_cases) >= n:
+                break
+
+        if not new_test_cases:
+            logger.error("Failed to generate any valid test cases")
+            raise RuntimeError("Failed to generate any valid test cases")
+
+        logger.info(f"Successfully generated {len(new_test_cases)} test cases")
+        return new_test_cases
 
     async def generate(self) -> af.Challenge:
-        program, hidden_input, expected = _toy_program()
-
-        prompt = PROMPT_TEMPLATE.format(program=program, output=expected)
+        """Generate a challenge by creating new test cases"""
+        # Generate one new test case
+        test_cases = await self.generate_new_test_cases(1)
+        test_case = test_cases[0]  # We know this exists because generate_new_test_cases raises if empty
+        
+        # Create the prompt using the template
+        prompt = PROMPT_TEMPLATE.format(
+            program=test_case['program'],
+            output=test_case['output']
+        )
+        
         return af.Challenge(
             env=self,
             prompt=prompt,
-            extra={"program": program, "expected": expected, "hidden_input": hidden_input},
+            extra={
+                "program": test_case['program'],
+                "expected_output": test_case['output'],
+            }
         )
 
-    # ------------------------------------------------------------------
-    # Evaluation helpers
-    # ------------------------------------------------------------------
+    async def generate_batch(self, n: int) -> List[af.Challenge]:
+        """Generate multiple challenges in parallel"""
+        # Generate n test cases at once
+        test_cases = await self.generate_new_test_cases(n)
+        
+        # Convert test cases to challenges
+        challenges = []
+        for test_case in test_cases:
+            prompt = PROMPT_TEMPLATE.format(
+                program=test_case['program'],
+                output=test_case['output']
+            )
+            
+            challenge = af.Challenge(
+                env=self,
+                prompt=prompt,
+                extra={
+                    "program": test_case['program'],
+                    "expected_output": test_case['output'],
+                }
+            )
+            challenges.append(challenge)
 
-    @staticmethod
-    def _extract_input(resp: str) -> str:
-        """Return the payload inside the last `<INPUT>...</INPUT>` pair."""
-        # Strip auxiliary *thinking* tags (optional convention)
-        resp = re.sub(r"<(think|thinking)>.*?</\1>", "", resp, flags=re.DOTALL | re.IGNORECASE)
-        matches = re.findall(r"<INPUT>(.*?)</INPUT>", resp, flags=re.DOTALL | re.IGNORECASE)
-        return matches[-1].strip() if matches else ""
+        # Start background task to generate more samples if needed
+        asyncio.create_task(self._replenish_samples_background())
+        
+        return challenges
 
-    @staticmethod
-    def _same_out(a: str, b: str) -> bool:
-        return a.strip() == b.strip()
+    async def _replenish_samples_background(self, target_stock: int = val_config.TARGET_STOCK):
+        """Background task to replenish sample stock"""
+        try:
+            from affine.sample_manager import SampleManager
+            sample_manager = SampleManager()
+            
+            # Get current sample count
+            stats = sample_manager.get_stats(self.__class__.__name__)
+            current_count = stats.total
+            
+            if current_count < target_stock:
+                # Generate more samples in background
+                needed = target_stock - current_count
+                logger.info(f"Background: Generating {needed} samples to replenish stock")
+                
+                # Generate new samples
+                new_test_cases = await self.generate_new_test_cases(needed)
+                
+                # Convert to Sample objects
+                new_samples = []
+                for test_case in new_test_cases:
+                    sample = af.Sample.from_challenge(
+                        af.Challenge(
+                            env=self,
+                            prompt=PROMPT_TEMPLATE.format(
+                                program=test_case['program'],
+                                output=test_case['output']
+                            ),
+                            extra={
+                                "program": test_case['program'],
+                                "expected_output": test_case['output'],
+                            }
+                        ),
+                        self.__class__.__name__
+                    )
+                    new_samples.append(sample)
+                
+                # Add to storage
+                sample_manager.add_samples(self.__class__.__name__, new_samples)
+                logger.info(f"Background: Added {len(new_samples)} samples")
+        except Exception as e:
+            logger.error(f"Background sample generation failed: {e}")
 
+    def extract_input_from_response(self, response: str) -> str:
+        """Extract input data from <INPUT> </INPUT> tags only"""
+        # Remove thinking tags first
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+        response = re.sub(r'<thinking>.*?</thinking>', '', response, flags=re.DOTALL)
+        
+        # Look for <INPUT> </INPUT> tags - case insensitive
+        input_pattern = r'<INPUT>(.*?)</INPUT>'
+        matches = re.findall(input_pattern, response, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            # Take the last match if multiple exist
+            input_data = matches[-1].strip()
+            # Clean up the input data
+            lines = input_data.split('\n')
+            cleaned_lines = []
+            
+            for line in lines:
+                # Remove leading/trailing whitespace but preserve internal spacing
+                cleaned_line = line.rstrip()
+                cleaned_lines.append(cleaned_line)
+            
+            # Remove empty lines at the end
+            while cleaned_lines and not cleaned_lines[-1].strip():
+                cleaned_lines.pop()
+            
+            return '\n'.join(cleaned_lines)
+        
+        # If no INPUT tags found, return empty string
+        return ""
+    
+    def compare_outputs(self, expected: str, actual: str) -> bool:
+        """Compare expected and actual outputs with multiple normalization strategies"""
+        # Direct comparison
+        if expected == actual:
+            return True
+        
+        # Normalize line endings
+        expected_normalized = expected.strip().replace('\r\n', '\n')
+        actual_normalized = actual.strip().replace('\r\n', '\n')
+        
+        if expected_normalized == actual_normalized:
+            return True
+        
+        # Compare line by line (strip trailing whitespace)
+        expected_lines = [line.rstrip() for line in expected_normalized.split('\n')]
+        actual_lines = [line.rstrip() for line in actual_normalized.split('\n')]
+        
+        if expected_lines == actual_lines:
+            return True
+        
+        # Compact comparison (remove all whitespace)
+        expected_compact = ''.join(expected_normalized.split())
+        actual_compact = ''.join(actual_normalized.split())
+        
+        if expected_compact == actual_compact:
+            return True
+        
+        # Numeric comparison (try to parse as numbers)
+        try:
+            expected_nums = [float(x) for x in expected_normalized.split()]
+            actual_nums = [float(x) for x in actual_normalized.split()]
+            if len(expected_nums) == len(actual_nums):
+                return all(abs(e - a) < 1e-9 for e, a in zip(expected_nums, actual_nums))
+        except Exception:
+            pass
+        
+        return False
+    
     async def evaluate(self, challenge: af.Challenge, response: af.Response) -> af.Evaluation:
+        """Evaluate the response by extracting input and running the program"""
         program = challenge.extra["program"]
-        expected = challenge.extra["expected"]
-        supplied_inp = self._extract_input(response.response or "")
-
-        if not supplied_inp:
-            return af.Evaluation(env=self, score=0.0, extra={"error": "no <INPUT> tag found"})
-
-        out, err = self.executor.execute(program, supplied_inp)
-        if err:
-            return af.Evaluation(env=self, score=0.0, extra={"error": err})
-
-        score = 1.0 if self._same_out(out, expected) else 0.0
+        expected_output = challenge.extra["expected_output"]
+        
+        # Extract input from the LLM response
+        generated_input = self.extract_input_from_response(response.response or "")
+        
+        if not generated_input:
+            # No input found in response
+            return af.Evaluation(
+                env=self,
+                score=0.0,
+                extra={
+                    "expected_output": expected_output,
+                    "generated_input": generated_input,
+                    "error": "No input found in response"
+                }
+            )
+        
+        # Execute the program with the extracted input
+        generated_output, error = self.executor.execute_program(program, generated_input)
+        
+        if error:
+            # Program execution failed
+            return af.Evaluation(
+                env=self,
+                score=0.0,
+                extra={
+                    "expected_output": expected_output,
+                    "generated_input": generated_input,
+                    "generated_output": generated_output,
+                    "error": error
+                }
+            )
+        
+        # Compare the actual output with expected output
+        outputs_match = self.compare_outputs(expected_output, generated_output)
+        score = 1.0 if outputs_match else 0.0
+        
         return af.Evaluation(
             env=self,
             score=score,
-            extra={"expected": expected, "got": out.strip(), "input": supplied_inp},
+            extra={
+                "expected_output": expected_output,
+                "generated_input": generated_input,
+                "generated_output": generated_output,
+                "outputs_match": outputs_match,
+                "error": None
+            }
         )
-
-    # Clean-up – not strictly needed but keeps temp dir tidy
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if hasattr(self, 'executor'):
+            self.executor.cleanup()
+    
     def __del__(self):
+        """Destructor to ensure cleanup"""
         try:
-            import os, glob, tempfile
-            for f in glob.glob(str(tempfile.gettempdir() + "/tmp*")):
-                os.unlink(f)
+            self.cleanup()
         except Exception:
             pass
 
-# ---------------------------------------------------------------------------
-# Deterministic helper – used by the incentive mechanism
-# ---------------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # Helper: simple parallel LLM call à l’API Chutes
+    # --------------------------------------------------------------
+    async def generate_inputs_parallel(
+        self,
+        prompts: List[str],
+        max_concurrent: int,
+        model: str = "unsloth/gemma-3-27b-it",
+        timeout: float = None,
+    ) -> List[str]:
+        """Call the LLM in parallel to get <INPUT>…</INPUT> responses."""
+        import aiohttp
+        from affine import get_conf
 
-def generate(seed: int) -> dict:
-    """Deterministically generate a toy ABD sample.
+        url = "https://llm.chutes.ai/v1/chat/completions"
+        token = get_conf("CHUTES_API_KEY")
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        sem = asyncio.Semaphore(max_concurrent)
+        timeout = timeout or self.LLM_RESPONSE_TIMEOUT
 
-    The implementation mirrors the async *generate* method but uses a
-    deterministic RNG seeded with *seed* so that every validator observes the
-    **exact** same challenge.
-    """
-    import random as _r
-    rnd = _r.Random(seed)
+        async def _one(prompt: str) -> str:
+            async with sem:
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.post(
+                            url,
+                            json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+                            headers=headers,
+                            timeout=timeout,
+                        ) as r:
+                            data = await r.json()
+                            return data["choices"][0]["message"]["content"]
+                except Exception as e:
+                    logger.error(f"LLM call failed: {e}")
+                    return ""
 
-    # Re-implement the toy program generation with a private RNG instance.
-    kind = rnd.choice(["reverse", "sum", "upper"])
-    if kind == "reverse":
-        txt = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
-        program = "s=input()[::-1];print(s)"
-        hidden_input = txt
-        expected = txt[::-1]
-    elif kind == "sum":
-        a, b = rnd.randint(0, 99), rnd.randint(0, 99)
-        program = "a,b=map(int,input().split());print(a+b)"
-        hidden_input = f"{a} {b}"
-        expected = str(a + b)
-    else:
-        txt = "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
-        program = "print(input().upper())"
-        hidden_input = txt
-        expected = txt.upper()
-
-    prompt = PROMPT_TEMPLATE.format(program=program, output=expected)
-    return {
-        "prompt": prompt,
-        "program": program,
-        "expected": expected,
-        "hidden_input": hidden_input,
-    } 
+        return await asyncio.gather(*[_one(p) for p in prompts])
