@@ -36,6 +36,72 @@ uv run af -vv run 5 SAT -n 10
 af deploy /path/to/model
 ```
 
+## First-time setup pitfalls & required secrets
+
+### 1. Docker prerequisites
+* Docker Engine ≥20.10 with the **Compose v2 plugin** (`docker compose version` must work)
+* Outbound network (Docker Hub + S3).
+
+### 2. Mandatory secrets
+The validator never ships secrets inside the image; it expects them as
+**environment variables** at runtime (Compose or host).  Missing vars cause the
+container to exit immediately.
+
+| Variable | Why it is needed |
+|----------|------------------|
+| `CHUTES_API_KEY`           | query LLM models & deployment helper |
+| `AWS_ACCESS_KEY_ID`        | upload gzip traces & weight snapshots to S3 |
+| `AWS_SECRET_ACCESS_KEY`    | idem |
+| `TRACE_BUCKET`             | S3 bucket name (defaults to `affine-traces`) |
+| `REDIS_HOST`               | host:port for the Redis instance (`redis` in compose) |
+| `BT_COLDKEY` / `BT_HOTKEY` | (optional) deploy command, not used by validator |
+| `HF_TOKEN`                 | (optional) model deploy helper |
+
+Place them **once** in `~/.affine/config.env` so both CLI & Docker can load
+them automatically:
+
+```bash
+mkdir -p ~/.affine
+cat > ~/.affine/config.env <<'EOF'
+CHUTES_API_KEY=xxx
+AWS_ACCESS_KEY_ID=yyy
+AWS_SECRET_ACCESS_KEY=zzz
+TRACE_BUCKET=affine-traces
+EOF
+```
+
+### 3. Local state directories
+The app writes small files under `~/.affine/`:
+
+```
+~/.affine/samples      – env sample cache (auto-created)
+~/.affine/results.json – raw validator outcomes
+~/.affine/score.json   – 20-round rolling table
+~/.affine/winners.json – per-round winners
+```
+You don’t need to create them; the code ensures parents exist, but make sure
+your user has write permission.
+
+### 4. First run checklist
+```bash
+# 1. source secrets OR ensure ~/.affine/config.env exists
+source ~/.affine/config.env
+
+# 2. Launch services
+cd ops && docker compose up -d            # redis + validator + watchtower
+
+# 3. Tail validator until it stays Up (healthy)
+docker compose logs -f validator
+
+# 4. Tail watchtower and observe first pull (5-min default)
+docker compose logs -f watchtower
+```
+
+If the validator container restarts, run `docker compose logs validator` and
+look for `get_conf()` complaining about a missing var.
+
+---
+
 ## Running the validator in Docker (production)
 
 ```bash
