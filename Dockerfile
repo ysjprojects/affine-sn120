@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
 
 # Expose nothing – validator runs as a cron-style process
-CMD ["python", "-m", "affine", "validate", "--delay", "5"] 
+CMD ["python", "-m", "affine", "validate"] 
