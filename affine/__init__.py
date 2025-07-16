@@ -169,22 +169,30 @@ ENDPOINT   = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
 CLIENT_CFG = botocore.config.Config(max_pool_connections=256)
 CLIENT     = None
 
-async def get(key: str) -> Optional[List[Result]]:
-    try:
-        resp = await CLIENT.get_object(Bucket=BUCKET, Key=key)
-        data = await resp["Body"].read()
-        json_data = data.decode('utf-8')
-        results = json.loads(json_data, object_hook=lambda d: Result(**d))
-        return results
-    except ClientError as e:
-        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return None
-        raise
+async def get_client():
+    global CLIENT
+    if CLIENT is None:
+        session = get_session()
+        CLIENT = await session.create_client(
+            "s3",
+            endpoint_url=ENDPOINT,
+            aws_access_key_id=KEY_ID,
+            aws_secret_access_key=SECRET,
+            config=CLIENT_CFG,
+        ).__aenter__()
+    return CLIENT
 
-async def put(key: str, results: List[Result]):
-    json_data = [result.json() for result in results]
-    data = '\n'.join(json_data).encode('utf-8')
-    await CLIENT.put_object(Bucket=BUCKET, Key=key, Body=data)
+async def sink(key: str, obj: Any):
+    client = await get_client()
+    body = json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode("utf-8")
+    await client.put_object(Bucket=BUCKET, Key=key, Body=body)
+
+async def load(key: str) -> Any:
+    client = await get_client()
+    resp = await client.get_object(Bucket=BUCKET, Key=key)
+    data = await resp["Body"].read()
+    return json.loads(data)
+
     
 # ── API ───────────────────────────────────────────────────────────────
 async def get_chute(model: str) -> Dict[str, Any]:
@@ -331,6 +339,7 @@ def validate():
                 blk = await subtensor.get_current_block()
                 challenges = [await env().generate() for env in ENVS.values()]
                 results    = await run(challenges=challenges, miners=miners_map)
+                await sink(f"raw/{wallet.hotkey.ss58_address}/{blk:08d}.json", [ r.json() for r in results ])
                 for r in results:
                     e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
                     prev = scores[hk][e]
@@ -363,6 +372,15 @@ def validate():
 
             # — Prepare weights
             weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
+            
+            # Sink snapshot to s3.
+            snap_key = f"snapshots/{window_start:08d}.json"
+            await sink(snap_key, {
+                "window_start": window_start,
+                "scores":       {hk: dict(scores[hk]) for hk in hotkeys},
+                "blocks":       blocks,
+                "weights":      weights
+            })
 
             # — Render Rich table
             table = Table(title=f"Window {window_start}–{window_start+K}")
