@@ -208,9 +208,11 @@ async def miners(
         no_null: bool = False, 
         netuid: int = NETUID,
         min_block: int = 0,
+        metagraph: object = None,
     ) -> Dict[int, Miner]:
     subtensor = await get_subtensor()
-    metagraph = await subtensor.metagraph(netuid)
+    if metagraph is None:
+        metagraph = await subtensor.metagraph(netuid)
     revs = await subtensor.get_all_revealed_commitments(netuid)
     if uids is None: uids = list(range(len(metagraph.hotkeys)))
     elif isinstance(uids, int): uids = [uids]
@@ -293,21 +295,6 @@ from .envs.sat import SAT
 from .envs.coin import COIN
 ENVS = {"SAT": SAT, "COIN": COIN}
 
-@cli.command('run')
-@click.argument('uids', callback=lambda _ctx, _param, val: [int(x) for x in val.split(',')])
-@click.argument('env', type=click.Choice(list(ENVS), case_sensitive=False))
-@click.option('-n', '--num', 'n', default=1, show_default=True, help='Number of challenges')
-def run_command(uids, env, n):
-    """Run N challenges in ENV against miners."""
-    logger.debug("Running %d challenges in %s for UIDs %s", n, env, uids)
-    async def _coro():
-        chals = await ENVS[env.upper()]().many(n)
-        ms = await miners(uids)
-        return await run(challenges=chals, miners=ms)
-    results = asyncio.run(_coro())
-    print (results)
-
-
 @cli.command("validate")
 def validate():
     console = Console()
@@ -319,7 +306,7 @@ def validate():
         meta      = await subtensor.metagraph(NETUID)
 
         # — Initial state
-        miners_map   = await miners(no_null=True)
+        miners_map   = await miners(no_null=True, metagraph=meta)
         hotkeys      = [m.hotkey for m in miners_map.values()]
         blocks       = {m.hotkey: m.block for m in miners_map.values()}
         scores       = {m.hotkey: defaultdict(float) for m in miners_map.values()}
@@ -327,7 +314,9 @@ def validate():
 
         while True:
             # — Refresh miners
-            miners_map = await miners(no_null=True)
+            meta       = await subtensor.metagraph(NETUID)
+            miners_map = await miners(no_null=True, metagraph=meta)
+            miners_by_hotkey = {m.hotkey: m for m in miners_map.values()}
             for m in miners_map.values():
                 if m.hotkey not in blocks:
                     hotkeys.append(m.hotkey)
@@ -378,8 +367,9 @@ def validate():
                 table.add_column(f"{e} Rank", justify="right")
             table.add_column("Weight", justify="right")
             for hk in hotkeys:
-                miner = miners_map[hk]
-                row = [ miner.uid, str(miner.block), miner.model]
+                if hk not in miners_by_hotkey: continue
+                miner = miners_by_hotkey[hk]
+                row = [ str(miner.uid), str(miner.block), miner.model]
                 for e in ENVS:
                     row.extend([f"{scores[hk][e]:.4f}", str(ranks[e][hk])])
                 row.append(f"{weights[meta.hotkeys.index(hk)]:.2f}")
