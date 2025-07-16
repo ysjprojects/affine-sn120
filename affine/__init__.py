@@ -336,11 +336,17 @@ def validate():
                     prev = scores[hk][e]
                     scores[hk][e] = raw * (1 - alpha) + prev * alpha
 
-            # — Compute ranks & dominance
+            # — Compute dense ranks & dominance
             ranks, counts = {}, defaultdict(int)
             for e in ENVS:
-                ordered = sorted(hotkeys, key=lambda h: scores[h][e], reverse=True)
-                ranks[e] = {h: i+1 for i, h in enumerate(ordered)}
+                # 1) collect unique scores in descending order
+                uniq = sorted({scores[h][e] for h in hotkeys}, reverse=True)
+                # 2) map score → dense rank
+                rank_of = {score: i+1 for i, score in enumerate(uniq)}
+                # 3) assign ranks (ties share same rank)
+                ranks[e] = {h: rank_of[scores[h][e]] for h in hotkeys}
+
+            # Compute dominance counts.
             env_list = list(ENVS)
             for a in hotkeys:
                 for b in hotkeys:
@@ -350,6 +356,7 @@ def validate():
             # — Pick best (tie-break by newest model)
             best_key, best = (-1, None), None
             for h in hotkeys:
+                # first compare dominance count (desc), then block number (asc → oldest wins)
                 key = (counts.get(h, 0), -blocks.get(h, 0))
                 if key > best_key:
                     best_key, best = key, h
