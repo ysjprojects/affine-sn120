@@ -184,17 +184,17 @@ async def get_client():
     return CLIENT
 
 async def _json_bytes(obj: Any) -> bytes:
-    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
     return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
 
-async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    """Upload an object to the configured S3 bucket.
+async def get(key: str) -> Any:
+    client = await get_client()
+    response = await client.get_object(Bucket=BUCKET, Key=key)
+    body = await response["Body"].read()
+    content_type = response.get("ContentType", "")
+    if content_type == "application/json": return json.loads(body.decode("utf-8"))
+    else: return body
 
-    If *content_type* is ``application/json`` the object is JSON-serialised
-    using the same pydantic-aware encoder as before; otherwise *obj* must be
-    bytes-like.  This generalisation allows us to persist arbitrary state
-    such as numpy arrays or pickles.
-    """
+async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
     client = await get_client()
     body = await _json_bytes(obj) if content_type == "application/json" else obj
     await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
@@ -322,28 +322,6 @@ from .envs.math import MATH
 # Registry of active environments
 ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "MATH": MATH}
 
-# ── Snapshot helpers ────────────────────────────────────────────────────
-
-async def _json_bytes(obj: Any) -> bytes:
-    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
-    return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
-
-async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    """Upload an object to the configured S3 bucket.
-
-    If *content_type* is ``application/json`` the object is JSON-serialised
-    using the same pydantic-aware encoder as before; otherwise *obj* must be
-    bytes-like.  This generalisation allows us to persist arbitrary state
-    such as numpy arrays or pickles.
-    """
-    client = await get_client()
-    body = await _json_bytes(obj) if content_type == "application/json" else obj
-    await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
-
-# convenience wrapper for validator
-async def snapshot_scores(window: int, scores_table: Dict[str, Any]):
-    await sink(f"snapshots/scores/{window:08d}.json", scores_table)
-
 @cli.command("validate")
 def validate():
     console = Console()
@@ -353,30 +331,19 @@ def validate():
         K, alpha = 10, 0.999
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
-        commit_lead = 5
 
         # — Initial state
-        window_start = await subtensor.get_current_block()
         miners_map   = await miners(no_null=True, metagraph=meta)
-        
-        miners_map   = {uid: m for uid, m in miners_map.items() if m.block is not None and m.block <= window_start - commit_lead}
         hotkeys      = [m.hotkey for m in miners_map.values()]
         blocks       = {m.hotkey: m.block for m in miners_map.values()}
         scores       = {m.hotkey: defaultdict(float) for m in miners_map.values()}
+        window_start = await subtensor.get_current_block()
 
         while True:
             # — Refresh miners
             meta       = await subtensor.metagraph(NETUID)
             miners_map = await miners(no_null=True, metagraph=meta)
-            # Filtre commit_lead lors du rafraîchissement
-            miners_map = {uid: m for uid, m in miners_map.items() if m.block is not None and m.block <= window_start - commit_lead}
-
-            
-            hotkeys            = [m.hotkey for m in miners_map.values()]
-            blocks             = {m.hotkey: m.block for m in miners_map.values()}
-            miners_by_hotkey   = {m.hotkey: m for m in miners_map.values()}
-            
-            scores             = {hk: scores.get(hk, defaultdict(float)) for hk in hotkeys}
+            miners_by_hotkey = {m.hotkey: m for m in miners_map.values()}
             for m in miners_map.values():
                 if m.hotkey not in blocks:
                     hotkeys.append(m.hotkey)
@@ -391,42 +358,45 @@ def validate():
                 blk = await subtensor.get_current_block()
                 challenges = [await env().generate() for env in ENVS.values()]
                 results    = await run(challenges=challenges, miners=miners_map)
-                await sink(f"raw/{wallet.hotkey.ss58_address}/{blk:08d}.json", [ r.json() for r in results ])
+                await sink(f"raw/{wallet.hotkey.ss58_address}/{blk:08d}.json",
+                           [r.json() for r in results])
                 for r in results:
                     e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
                     prev = scores[hk][e]
                     scores[hk][e] = raw * (1 - alpha) + prev * alpha
 
-            # — Compute dense ranks & dominator counts
+            # — Compute dense ranks & custom dominance counts
             ranks, counts = {}, defaultdict(int)
             for e in ENVS:
-                # 1) collect unique scores in descending order
                 uniq = sorted({scores[h][e] for h in hotkeys}, reverse=True)
-                # 2) map score → dense rank
                 rank_of = {score: i+1 for i, score in enumerate(uniq)}
-                # 3) assign ranks (ties share same rank)
                 ranks[e] = {h: rank_of[scores[h][e]] for h in hotkeys}
 
-            # Compute dominator counts: how many others beat you in all envs
             env_list = list(ENVS)
             for a in hotkeys:
                 for b in hotkeys:
-                    if a != b and all(ranks[e][b] < ranks[e][a] for e in env_list):
+                    if a == b:
+                        continue
+                    # new rule:
+                    # a "beats" b if
+                    #   - a is never worse than b on any env (<=)
+                    #   - a is strictly better on more than one env
+                    better_count = sum(ranks[e][a] < ranks[e][b] for e in env_list)
+                    not_worse    = all(ranks[e][a] <= ranks[e][b] for e in env_list)
+                    if not_worse and better_count >= 2:
                         counts[a] += 1
 
-            # — Pick best (fewest dominators), tie-break by oldest block
+            # — Pick best (most custom wins), tie‑break by oldest block
             best_key, best = (-1, None), None
             for h in hotkeys:
-                # first compare negative dominator count (so fewer dominators is larger key),
-                # then block number (asc → oldest wins)
-                key = (-counts.get(h, 0), -blocks.get(h, 0))
+                key = (counts.get(h, 0), -blocks.get(h, 0))
                 if key > best_key:
                     best_key, best = key, h
 
             # — Prepare weights
             weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
 
-            # Sink snapshot to s3.
+            # — Sink snapshot
             snap_key = f"snapshots/{window_start:08d}.json"
             await sink(snap_key, {
                 "window_start": window_start,
@@ -434,10 +404,6 @@ def validate():
                 "blocks":       blocks,
                 "weights":      weights
             })
-
-            # Periodically snapshot the detailed score matrix
-            if window_start % (K * 5) == 0:  # every 5 windows
-                await snapshot_scores(window_start, {hk: dict(scores[hk]) for hk in hotkeys})
 
             # — Render Rich table
             table = Table(title=f"Window {window_start}–{window_start+K}")
@@ -448,10 +414,12 @@ def validate():
                 table.add_column(f"{e} Score", justify="right")
                 table.add_column(f"{e} Rank", justify="right")
             table.add_column("Weight", justify="right")
+
             for hk in hotkeys:
-                if hk not in miners_by_hotkey: continue
+                if hk not in miners_by_hotkey:
+                    continue
                 miner = miners_by_hotkey[hk]
-                row = [ str(miner.uid), str(miner.block), miner.model]
+                row = [str(miner.uid), str(miner.block), miner.model]
                 for e in ENVS:
                     row.extend([f"{scores[hk][e]:.4f}", str(ranks[e][hk])])
                 row.append(f"{weights[meta.hotkeys.index(hk)]:.2f}")
@@ -471,3 +439,4 @@ def validate():
             window_start += K
 
     asyncio.run(main())
+
