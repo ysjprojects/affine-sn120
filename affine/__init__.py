@@ -489,35 +489,34 @@ def validate(coldkey:str, hotkey:str):
     
 @cli.command("pull")
 @click.argument("uid", type=int)
-@click.option("--path", "-p", required=True, type=click.Path(), help="Local directory to save the model")
+@click.option("--model_path", "-p", required=True, type=click.Path(), help="Local directory to save the model")
 @click.option('--hf-token', default=None, help="Hugging Face API token (env HF_TOKEN if unset)")
-def pull(uid: int, path: str, hf_token: str):
+def pull(uid: int, model_path: str, hf_token: str):
  
     # 1. Ensure HF token
     hf_token     = hf_token or get_conf("HF_TOKEN")
 
     # 2. Lookup miner on‑chain
     miner_map = asyncio.run(miners(uids=uid, no_null=True))
-    print (miner_map)
     miner = miner_map.get(uid)
-    print(miner)
     
     if miner is None:
         click.echo(f"No miner found for UID {uid}", err=True)
         sys.exit(1)
     repo_name = miner.model
-    logger.info("Pulling model %s for UID %d into %s", repo_name, uid, path)
+    logger.info("Pulling model %s for UID %d into %s", repo_name, uid, model_path)
 
     # 3. Download snapshot
     try:
         snapshot_download(
             repo_id=repo_name,
             repo_type="model",
-            local_dir=path,
+            local_dir=model_path,
             token=hf_token,
-            resume_download=True
+            resume_download=True,
+            revision=miner.revision,
         )
-        click.echo(f"Model {repo_name} pulled to {path}")
+        click.echo(f"Model {repo_name} pulled to {model_path}")
     except Exception as e:
         logger.error("Failed to download %s: %s", repo_name, e)
         click.echo(f"Error pulling model: {e}", err=True)
