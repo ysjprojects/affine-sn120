@@ -490,7 +490,7 @@ def validate(coldkey:str, hotkey:str):
     
 @cli.command("pull")
 @click.argument("uid", type=int)
-@click.option("--model_path", "-p", required=True, type=click.Path(), help="Local directory to save the model")
+@click.option("--model_path", "-p", default = './model_path', required=True, type=click.Path(), help="Local directory to save the model")
 @click.option('--hf-token', default=None, help="Hugging Face API token (env HF_TOKEN if unset)")
 def pull(uid: int, model_path: str, hf_token: str):
     """Pulls a model from a specific miner UID if exists."""
@@ -525,7 +525,7 @@ def pull(uid: int, model_path: str, hf_token: str):
         sys.exit(1)
 
 @cli.command("push")
-@click.option('--model_path',  default=None, help='Local path to model artifacts.')
+@click.option('--model_path',  default = './model_path', help='Local path to model artifacts.')
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
 def push(model_path: str, coldkey: str, hotkey: str):

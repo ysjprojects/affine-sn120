@@ -3,6 +3,7 @@ results/
 tests/
 
 notebooks/
+modelpath/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
