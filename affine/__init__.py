@@ -169,15 +169,13 @@ class Result(BaseModel):
     
     
 # ── S3 ─────────────────────────────────────────────────────────────────
-BUCKET     = get_conf("R2_BUCKET_ID")
-ACCOUNT    = get_conf("R2_ACCOUNT_ID")
-KEY_ID     = get_conf("R2_WRITE_ACCESS_KEY_ID")
-SECRET     = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
-ENDPOINT   = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
-CLIENT_CFG = botocore.config.Config(max_pool_connections=256)
-CLIENT     = None
-
 async def get_client():
+    ACCOUNT    = get_conf("R2_ACCOUNT_ID")
+    KEY_ID     = get_conf("R2_WRITE_ACCESS_KEY_ID")
+    SECRET     = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
+    ENDPOINT   = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
+    CLIENT_CFG = botocore.config.Config(max_pool_connections=256)
+    CLIENT     = None
     global CLIENT
     if CLIENT is None:
         session = get_session()
@@ -195,6 +193,7 @@ async def _json_bytes(obj: Any) -> bytes:
 
 async def get(key: str) -> Any:
     client = await get_client()
+    BUCKET     = get_conf("R2_BUCKET_ID")
     response = await client.get_object(Bucket=BUCKET, Key=key)
     body = await response["Body"].read()
     content_type = response.get("ContentType", "")
@@ -203,6 +202,7 @@ async def get(key: str) -> Any:
 
 async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
     client = await get_client()
+    BUCKET     = get_conf("R2_BUCKET_ID")
     body = await _json_bytes(obj) if content_type == "application/json" else obj
     await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
 
@@ -374,6 +374,7 @@ def validate(coldkey:str, hotkey:str):
 
     async def main():
         K, alpha = 10, 0.999
+        await get_client() # Test S3 connection.
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
 
@@ -526,7 +527,7 @@ def pull(uid: int, model_path: str, hf_token: str):
 @click.option('--model_path',  default=None, help='Local path to model artifacts.')
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
-def mine(model_path: str, coldkey: str, hotkey: str):
+def push(model_path: str, coldkey: str, hotkey: str):
     # -----------------------------------------------------------------------------
     # 1. Wallet & config
     # -----------------------------------------------------------------------------
