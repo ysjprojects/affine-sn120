@@ -576,18 +576,21 @@ def push(model_path: str, coldkey: str, hotkey: str):
                 if not (fname.startswith(".") or fname.endswith(".lock")):
                     files.append(os.path.join(root, fname))
 
-        # Upload concurrently
+        # Upload files with limited concurrency to avoid HF 429 errors
+        SEM = asyncio.Semaphore(int(os.getenv("AFFINE_UPLOAD_CONCURRENCY", "2")))
+
         async def _upload(path: str):
             rel = os.path.relpath(path, model_path)
-            await asyncio.to_thread(
-                lambda: api.upload_file(
-                    path_or_fileobj=path,
-                    path_in_repo=rel,
-                    repo_id=repo_name,
-                    repo_type="model"
+            async with SEM:  # limit concurrent commits
+                await asyncio.to_thread(
+                    lambda: api.upload_file(
+                        path_or_fileobj=path,
+                        path_in_repo=rel,
+                        repo_id=repo_name,
+                        repo_type="model"
+                    )
                 )
-            )
-            logger.debug("Uploaded %s", rel)
+                logger.debug("Uploaded %s", rel)
 
         await asyncio.gather(*(_upload(p) for p in files))
         logger.debug("Model upload complete (%d files)", len(files))
@@ -633,10 +636,9 @@ def push(model_path: str, coldkey: str, hotkey: str):
     async def deploy_to_chutes():
         logger.debug("Building Chute config")
         rev_flag = f"--revision {revision} " if revision else ""
-        chutes_config = f'''
+        chutes_config = textwrap.dedent(f"""
 from chutes.chute import NodeSelector
 from chutes.chute.template.sglang import build_sglang_chute
-
 import os
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
@@ -656,7 +658,7 @@ chute = build_sglang_chute(
         "--tool-call-parser deepseekv3 "
     ),
 )
-'''
+""")
         tmp_file = Path("tmp_chute.py")
         tmp_file.write_text(chutes_config)
         logger.debug("Wrote Chute config to %s", tmp_file)
@@ -666,8 +668,14 @@ chute = build_sglang_chute(
         proc = await asyncio.create_subprocess_exec(
             *cmd, env=env,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
+            stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.PIPE,
         )
+        # Auto-answer the interactive Y/N prompt
+        if proc.stdin:
+            proc.stdin.write(b"y\n")
+            await proc.stdin.drain()
+            proc.stdin.close()
         stdout, _ = await proc.communicate()
         logger.trace(stdout.decode())
         if proc.returncode != 0:
@@ -686,13 +694,13 @@ chute = build_sglang_chute(
         sub       = await get_subtensor()
         meta      = await sub.metagraph(NETUID)
         my_uid    = meta.hotkeys.index(wallet.hotkey.ss58_address)
-        miner     = await miners(uid=my_uid)
+        miner  = (await miners(uids=my_uid))[my_uid]
 
-        while not miner.chute.hot:
+        while not (miner.chute or {}).get("hot", False):
             challenge = await SAT().generate()
             await run(challenges=challenge, miners=miner)
             await sub.wait_for_block()
-            miner = await miners(uid=my_uid)
+            miner = (await miners(uids=my_uid))[my_uid]
             logger.trace("Checked hot status: %s", miner.chute.hot)
 
         logger.debug("Model is now hot and ready")
