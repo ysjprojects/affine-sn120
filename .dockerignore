@@ -1,5 +1,0 @@
-.venv
-BACKUP*
-*.pyc
-__pycache__/
-tests

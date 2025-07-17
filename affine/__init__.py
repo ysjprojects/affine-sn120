@@ -88,7 +88,6 @@ def get_conf(key, default = None) -> Any:
 @click.argument('value')
 def set_config(key: str, value: str):
     """Set a key-value pair in ~/.affine/config.env."""
-    print ('set again')
     path = os.path.expanduser("~/.affine/config.env")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lines = [l for l in open(path).readlines() if not l.startswith(f"{key}=")] if os.path.exists(path) else []
@@ -198,10 +197,14 @@ async def get(key: str) -> Any:
     else: return body
 
 async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    client = await get_client()
-    BUCKET     = get_conf("R2_BUCKET_ID")
-    body = await _json_bytes(obj) if content_type == "application/json" else obj
-    await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
+    try:
+        client = await get_client()
+        BUCKET     = get_conf("R2_BUCKET_ID")
+        body = await _json_bytes(obj) if content_type == "application/json" else obj
+        await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
+    except:
+        logger.trace('R2 bucket is not set cannot sink. Continuing...')
+        pass
 
 # ── API ───────────────────────────────────────────────────────────────
 async def get_chute(model: str) -> Dict[str, Any]:
@@ -364,6 +367,7 @@ ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "MATH": MATH}
 @click.option('--coldkey', default=None, help='Cold wallet name')
 @click.option('--hotkey', default=None, help='Hot wallet key')
 def validate(coldkey:str, hotkey:str):
+    """Starts a affine validator"""
     console = Console()
     coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
     hotkey = hotkey or get_conf("BT_WALLET_HOT", "default")
@@ -371,7 +375,6 @@ def validate(coldkey:str, hotkey:str):
 
     async def main():
         K, alpha = 10, 0.999
-        await get_client() # Test S3 connection.
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
 
@@ -490,7 +493,8 @@ def validate(coldkey:str, hotkey:str):
 @click.option("--model_path", "-p", required=True, type=click.Path(), help="Local directory to save the model")
 @click.option('--hf-token', default=None, help="Hugging Face API token (env HF_TOKEN if unset)")
 def pull(uid: int, model_path: str, hf_token: str):
- 
+    """Pulls a model from a specific miner UID if exists."""
+
     # 1. Ensure HF token
     hf_token     = hf_token or get_conf("HF_TOKEN")
 
@@ -525,6 +529,7 @@ def pull(uid: int, model_path: str, hf_token: str):
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
 def push(model_path: str, coldkey: str, hotkey: str):
+    """Pushes a model to be hosted by your miner."""
     # -----------------------------------------------------------------------------
     # 1. Wallet & config
     # -----------------------------------------------------------------------------
