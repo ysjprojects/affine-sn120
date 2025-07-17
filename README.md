@@ -189,7 +189,7 @@ ops/docker/
 
 ```bash
 # build & launch
-make overnight   # or docker compose -f ops/docker/docker-compose.validator.yml up -d
+make overnight   # or docker compose -f ops/docker/docker-compose.yml up -d
 ```
 
 Watchtower checks for new images every 5 min and restarts the `validator` service automatically.

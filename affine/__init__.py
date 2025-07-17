@@ -269,7 +269,6 @@ async def miners(
         if no_null and model is None: return None # Filter on null.
         if block < min_block: return None # Filter on block.
         chute = await get_chute(str(model))
-        revision = None
         if chute is None:
             # fall back to code endpoint using model as identifier
             code = await get_chute_code(str(model))
@@ -285,7 +284,7 @@ async def miners(
                     code = await get_chute_code(cid)
                     revision = _extract_revision(code or "") if code else None
         if no_null and chute is None: return None # Filter on no chute.
-        miner = Miner( uid=uid, hotkey=hotkey, model=str(model), revision=revision, block=int(block), chute=chute )
+        miner = Miner(uid=uid, hotkey=hotkey, model=str(model), revision=revision, block=int(block), chute=chute)
         return miner
     miners = {uid: miner for uid in uids if (miner := await _get_miner(uid)) is not None}
     return miners

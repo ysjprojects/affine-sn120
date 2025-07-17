@@ -27,5 +27,4 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: >-
-      --interval 300 --cleanup --enable-lifecycle-hooks 
+    command: --interval 300 --cleanup --enable-lifecycle-hooks 

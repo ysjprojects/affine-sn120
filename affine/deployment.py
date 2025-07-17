@@ -3,15 +3,15 @@ Affine deployment utilities – push model code to HF, deploy via Chutes, and co
 """
 from __future__ import annotations
 
-import os, random, asyncio, logging, subprocess, json, shutil
+import os, random, asyncio, json
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import aiohttp
 import bittensor as bt
 from huggingface_hub import HfApi
 
-from . import get_conf, logger  # re-use common logging
+from . import logger  # shared TRACE logger
 
 __all__ = [
     "DeploymentConfig",
