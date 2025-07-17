@@ -345,7 +345,7 @@ def validate():
                     prev = scores[hk][e]
                     scores[hk][e] = raw * (1 - alpha) + prev * alpha
 
-            # — Compute dense ranks & dominance
+            # — Compute dense ranks & dominator counts
             ranks, counts = {}, defaultdict(int)
             for e in ENVS:
                 # 1) collect unique scores in descending order
@@ -355,24 +355,25 @@ def validate():
                 # 3) assign ranks (ties share same rank)
                 ranks[e] = {h: rank_of[scores[h][e]] for h in hotkeys}
 
-            # Compute dominance counts.
+            # Compute dominator counts: how many others beat you in all envs
             env_list = list(ENVS)
             for a in hotkeys:
                 for b in hotkeys:
-                    if a != b and all(ranks[e][a] < ranks[e][b] for e in env_list):
+                    if a != b and all(ranks[e][b] < ranks[e][a] for e in env_list):
                         counts[a] += 1
 
-            # — Pick best (tie-break by newest model)
+            # — Pick best (fewest dominators), tie-break by oldest block
             best_key, best = (-1, None), None
             for h in hotkeys:
-                # first compare dominance count (desc), then block number (asc → oldest wins)
-                key = (counts.get(h, 0), -blocks.get(h, 0))
+                # first compare negative dominator count (so fewer dominators is larger key),
+                # then block number (asc → oldest wins)
+                key = (-counts.get(h, 0), -blocks.get(h, 0))
                 if key > best_key:
                     best_key, best = key, h
 
             # — Prepare weights
             weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
-            
+
             # Sink snapshot to s3.
             snap_key = f"snapshots/{window_start:08d}.json"
             await sink(snap_key, {
@@ -414,7 +415,3 @@ def validate():
             window_start += K
 
     asyncio.run(main())
-
-
-
-
