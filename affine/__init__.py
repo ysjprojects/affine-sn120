@@ -216,6 +216,26 @@ async def get_chute(model: str) -> Dict[str, Any]:
             logger.trace("Fetched chute info for %s", model)
             return info
         
+async def get_chute_code(identifier: str) -> Optional[str]:
+    """Return raw chute Python code for *identifier* or ``None``.
+
+    The endpoint is `https://api.chutes.ai/chutes/code/{identifier}`.
+    """
+    url = f"https://api.chutes.ai/chutes/code/{identifier}"
+    token = os.getenv("CHUTES_API_KEY", "")
+    headers = {"Authorization": token}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as r:
+            if r.status != 200:
+                return None
+            return await r.text(errors="ignore")
+
+def _extract_revision(code: str) -> Optional[str]:
+    """Extract `--revision <sha>` from chute code string."""
+    import re
+    m = re.search(r"--revision\s+([0-9a-f]{40})", code)
+    return m.group(1) if m else None
+
 async def miners(
         uids: Optional[Union[int, List[int]]] = None, 
         no_null: bool = False, 
@@ -249,6 +269,21 @@ async def miners(
         if no_null and model is None: return None # Filter on null.
         if block < min_block: return None # Filter on block.
         chute = await get_chute(str(model))
+        revision = None
+        if chute is None:
+            # fall back to code endpoint using model as identifier
+            code = await get_chute_code(str(model))
+            revision = _extract_revision(code or "") if code else None
+        else:
+            # Try extract revision from returned info first
+            if 'revision' in chute and chute['revision']:
+                revision = str(chute['revision'])
+            else:
+                # fallback: fetch code via uuid if available
+                cid = chute.get('id') or chute.get('uuid')
+                if cid:
+                    code = await get_chute_code(cid)
+                    revision = _extract_revision(code or "") if code else None
         if no_null and chute is None: return None # Filter on no chute.
         miner = Miner( uid=uid, hotkey=hotkey, model=str(model), revision=revision, block=int(block), chute=chute )
         return miner

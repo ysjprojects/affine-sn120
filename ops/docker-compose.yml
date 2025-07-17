@@ -1,19 +1,28 @@
+version: "3.9"
 services:
   validator:
-    build: ../
-    image: affinefdn/validator:latest
-    depends_on: [redis]
+    image: affinefdn/validator:latest  # auto-pulled by Watchtower
     restart: unless-stopped
-  redis:
-    image: redis:7-alpine
+    environment:
+      # ***** chain & storage creds – inject from host ENV or .env file *****
+      - R2_BUCKET_ID=${R2_BUCKET_ID}
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
+      - R2_WRITE_ACCESS_KEY_ID=${R2_WRITE_ACCESS_KEY_ID}
+      - R2_WRITE_SECRET_ACCESS_KEY=${R2_WRITE_SECRET_ACCESS_KEY}
+      - CHUTES_API_KEY=${CHUTES_API_KEY}
+      - BT_WALLET_COLD=${BT_WALLET_COLD}
+      - BT_WALLET_HOT=${BT_WALLET_HOT}
     volumes:
-      - redis_data:/data
+      - ~/.affine:/root/.affine           # wallet + config.env
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python.*affine validate' || exit 1"]
+      interval: 30s
+      retries: 3
+      start_period: 40s
+
   watchtower:
-    image: containrrr/watchtower
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=300
-volumes:
-  redis_data: 
+    command: --interval 300 --cleanup --enable-lifecycle-hooks 
