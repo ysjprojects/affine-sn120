@@ -50,9 +50,6 @@ First you need to set up chutes developer account a huggingface account.
 NOTE: A developer account costs 5k USD in TAO but you get this back after. 
 NOTE: You need to register to the affine network netuid=120. 
 ```bash
-# Install chutes on top of your env
-uv pip install chutes
-
 # Register to chutes you need an account etc.
 chutes register 
 
