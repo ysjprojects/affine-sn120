@@ -16,9 +16,11 @@ import botocore
 import numpy as np
 import bittensor as bt
 import botocore.config
+from pathlib import Path
 from rich.table import Table
 from dotenv import load_dotenv
 from rich.console import Console
+from huggingface_hub import HfApi
 from collections import defaultdict
 from abc import ABC, abstractmethod
 from alive_progress import alive_bar
@@ -71,11 +73,13 @@ def cli(verbose):
 # ── Config. ─────────────────────────────────────────────────────────────────
 load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True)
 load_dotenv(override=True)
-def get_conf(key) -> Any:
+def get_conf(key, default = None) -> Any:
     value = os.getenv(key)
-    if not value:
+    if not value and default == None:
         click.echo(f"{key} not set.\nRun:\n\taf set {key} <value>", err=True)
         sys.exit(1)
+    elif not value:
+        return default
     return value
 
 @cli.command('set')
@@ -358,9 +362,13 @@ from .envs.math import MATH
 ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "MATH": MATH}
 
 @cli.command("validate")
-def validate():
+@click.option('--coldkey', default=None, help='Cold wallet name')
+@click.option('--hotkey', default=None, help='Hot wallet key')
+def validate(coldkey:str, hotkey:str):
     console = Console()
-    wallet = bt.wallet()
+    coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
+    hotkey = hotkey or get_conf("BT_WALLET_HOT", "default")
+    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
 
     async def main():
         K, alpha = 10, 0.999
@@ -475,4 +483,185 @@ def validate():
             window_start += K
 
     asyncio.run(main())
+
+# -----------------------------------------------------------------------------
+# CLI command
+# -----------------------------------------------------------------------------
+@cli.command("mine")
+@click.option('--model_path',  default=None, help='Local path to model artifacts.')
+@click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
+@click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
+def mine(model_path: str, coldkey: str, hotkey: str):
+    # -----------------------------------------------------------------------------
+    # 1. Wallet & config
+    # -----------------------------------------------------------------------------
+    coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
+    hotkey  = hotkey  or get_conf("BT_WALLET_HOT", "default")
+    logger.debug("Using coldkey=%s, hotkey=%s", coldkey, hotkey)
+    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
+
+    # Required API credentials
+    hf_user        = get_conf("HF_USER")
+    hf_token       = get_conf("HF_TOKEN")
+    chutes_api_key = get_conf("CHUTES_API_KEY")
+    chute_user     = get_conf("CHUTE_USER")
+    # TODO: validate API creds, exit gracefully if missing
+
+    # -----------------------------------------------------------------------------
+    # 2. Prepare HF repo name
+    # -----------------------------------------------------------------------------
+    address   = wallet.hotkey.ss58_address
+    repo_name = f"{hf_user}/Affine-{address}"
+    logger.debug("Hugging Face repo: %s", repo_name)
+
+    # -----------------------------------------------------------------------------
+    # 3. Create & secure HF repo
+    # -----------------------------------------------------------------------------
+    api = HfApi(token=hf_token)
+    api.create_repo(repo_id=repo_name, repo_type="model", private=True, exist_ok=True)
+    try:
+        api.update_repo_visibility(repo_id=repo_name, private=True)
+    except Exception:
+        logger.trace("Repo already private or visibility update failed")
+
+    # -----------------------------------------------------------------------------
+    # 4. Upload model files to HF
+    # -----------------------------------------------------------------------------
+    async def deploy_model_to_hf():
+        logger.debug("Starting model upload from %s", model_path)
+        # Gather files
+        files = []
+        for root, _, fnames in os.walk(model_path):
+            if ".cache" in root or any(p.startswith(".") for p in root.split(os.sep)):
+                continue
+            for fname in fnames:
+                if not (fname.startswith(".") or fname.endswith(".lock")):
+                    files.append(os.path.join(root, fname))
+
+        # Upload concurrently
+        async def _upload(path: str):
+            rel = os.path.relpath(path, model_path)
+            await asyncio.to_thread(
+                lambda: api.upload_file(
+                    path_or_fileobj=path,
+                    path_in_repo=rel,
+                    repo_id=repo_name,
+                    repo_type="model"
+                )
+            )
+            logger.debug("Uploaded %s", rel)
+
+        await asyncio.gather(*(_upload(p) for p in files))
+        logger.debug("Model upload complete (%d files)", len(files))
+
+    asyncio.run(deploy_model_to_hf())
+
+    # -----------------------------------------------------------------------------
+    # 5. Fetch latest revision hash
+    # -----------------------------------------------------------------------------
+    info     = api.repo_info(repo_id=repo_name, repo_type="model")
+    revision = getattr(info, "sha", getattr(info, "oid", "")) or ""
+    logger.debug("Latest revision: %s", revision)
+
+    # -----------------------------------------------------------------------------
+    # 6. Commit model revision on-chain
+    # -----------------------------------------------------------------------------
+    async def commit_to_chain():
+        logger.debug("Preparing on-chain commitment")
+        sub     = await get_subtensor()
+        payload = json.dumps({"model": repo_name, "revision": revision})
+        await sub.set_reveal_commitment(
+            wallet=wallet,
+            netuid=NETUID,
+            data=payload,
+            blocks_until_reveal=1
+        )
+        logger.debug("On-chain commitment submitted")
+
+    asyncio.run(commit_to_chain())
+
+    # -----------------------------------------------------------------------------
+    # 7. Make HF repo public
+    # -----------------------------------------------------------------------------
+    try:
+        api.update_repo_visibility(repo_id=repo_name, private=False)
+        logger.debug("Repo made public")
+    except Exception:
+        logger.trace("Failed to make repo public (already public?)")
+
+    # -----------------------------------------------------------------------------
+    # 8. Deploy Chute
+    # -----------------------------------------------------------------------------
+    async def deploy_to_chutes():
+        logger.debug("Building Chute config")
+        rev_flag = f"--revision {revision} " if revision else ""
+        chutes_config = f'''
+from chutes.chute import NodeSelector
+from chutes.chute.template.sglang import build_sglang_chute
+
+import os
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+
+chute = build_sglang_chute(
+    username="{chute_user}",
+    readme="{repo_name}",
+    model_name="{repo_name}",
+    image="chutes/sglang:0.4.6.post5b",
+    concurrency=20,
+    node_selector=NodeSelector(
+        gpu_count=8,
+        min_vram_gb_per_gpu=40,
+    ),
+    engine_args=(
+        "--trust-remote-code "
+        "{rev_flag}"
+        "--tool-call-parser deepseekv3 "
+    ),
+)
+'''
+        tmp_file = Path("tmp_chute.py")
+        tmp_file.write_text(chutes_config)
+        logger.debug("Wrote Chute config to %s", tmp_file)
+
+        cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--public"]
+        env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
+        )
+        stdout, _ = await proc.communicate()
+        logger.trace(stdout.decode())
+        if proc.returncode != 0:
+            logger.debug("Chutes deploy failed with code %d", proc.returncode)
+            raise RuntimeError("Chutes deploy failed")
+        tmp_file.unlink(missing_ok=True)
+        logger.debug("Chute deployment successful")
+
+    asyncio.run(deploy_to_chutes())
+
+    # -----------------------------------------------------------------------------
+    # 9. Warm up model until it’s marked hot
+    # -----------------------------------------------------------------------------
+    async def warmup_model():
+        logger.debug("Warming up model with SAT challenges")
+        sub       = await get_subtensor()
+        meta      = await sub.metagraph(NETUID)
+        my_uid    = meta.hotkeys.index(wallet.hotkey.ss58_address)
+        miner     = await miners(uid=my_uid)
+
+        while not miner.chute.hot:
+            challenge = await SAT().generate()
+            await run(challenges=challenge, miners=miner)
+            await sub.wait_for_block()
+            miner = await miners(uid=my_uid)
+            logger.trace("Checked hot status: %s", miner.chute.hot)
+
+        logger.debug("Model is now hot and ready")
+
+    asyncio.run(warmup_model())
+    logger.debug("Mining setup complete. Model is live!")  
+
+
+        
 
