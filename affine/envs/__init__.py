@@ -2,7 +2,13 @@ from importlib import import_module
 from pkgutil import iter_modules
 from pathlib import Path
 
-__all__ = []
+# Local environment imports
+from .sat import SAT
+from .abduction import ABDUCTION
+from .math import MATH
+
+# Public re-exports
+__all__ = ["SAT", "ABDUCTION", "MATH"]
 
 # Auto-import all env modules in this package
 pkg_path = str(Path(__file__).parent)
