@@ -417,7 +417,7 @@ def validate():
                     #   - a is strictly better on more than one env
                     better_count = sum(ranks[e][a] < ranks[e][b] for e in env_list)
                     not_worse    = all(ranks[e][a] <= ranks[e][b] for e in env_list)
-                    if not_worse and better_count >= 2:
+                    if not_worse and better_count >= 1:
                         counts[a] += 1
 
             # — Pick best (most custom wins), tie‑break by oldest block
