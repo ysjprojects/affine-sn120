@@ -1,0 +1,31 @@
+version: "3.9"
+services:
+  validator:
+    image: ${VALIDATOR_IMAGE:-yourdockerhubuser/affine-validator:latest}
+    restart: unless-stopped
+    environment:
+      R2_BUCKET_ID: ${R2_BUCKET_ID}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID}
+      R2_WRITE_ACCESS_KEY_ID: ${R2_WRITE_ACCESS_KEY_ID}
+      R2_WRITE_SECRET_ACCESS_KEY: ${R2_WRITE_SECRET_ACCESS_KEY}
+      CHUTES_API_KEY: ${CHUTES_API_KEY}
+      HF_USER: ${HF_USER}
+      HF_TOKEN: ${HF_TOKEN}
+      CHUTE_USER: ${CHUTE_USER:-${HF_USER}}
+      BT_WALLET_COLD: ${BT_WALLET_COLD}
+      BT_WALLET_HOT: ${BT_WALLET_HOT}
+    volumes:
+      - ~/.affine:/root/.affine
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "affine.validate"]
+      interval: 30s
+      retries: 3
+      start_period: 40s
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >-
+      --interval 300 --cleanup --enable-lifecycle-hooks 
