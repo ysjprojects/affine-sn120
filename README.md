@@ -153,4 +153,56 @@ python -m affine.rollup            # prints weight vector, ready for on-chain
 
 # diagnostics
 pytest -q                          # unit tests
-``` 
+```
+
+## Challenge environments
+
+Active set:
+
+* **SAT** – Boolean satisfiability puzzles
+* **ABDUCTION** – simple propositional-logic abduction (find the missing cause)
+* **MATH** – elementary arithmetic word problems (GSM8K-style)
+
+The registry lives in `affine/envs/__init__.py`; plug-ins follow the `BaseEnv` interface.
+
+## Deployment pipeline (HF → Commit-Reveal → Chutes)
+
+`af deploy <local_model_dir>` performs the full release flow:
+
+1. Pushes `local_model_dir` to HuggingFace under a **private** repo (or re-uses `--existing-repo`).
+2. Captures the commit SHA and computes the next Bittensor round (10-block cadence); emits `set_reveal_commitment` with JSON payload `{"model": …, "revision": <sha>}`.
+3. Waits until the reveal block is reached, then switches the HF repo to **public**.
+4. Generates a Chutes template embedding `--revision <sha>` so the exact code is deployed.
+5. Deploys to Chutes and performs a warm-up request.
+
+All credentials are read from `~/.affine/config.env`; use `af set KEY VALUE` to configure.
+
+## Validator docker stack
+
+The validator can run unattended via Docker Compose + Watchtower:
+
+```
+ops/docker/
+├── validator.Dockerfile
+└── docker-compose.validator.yml
+```
+
+```bash
+# build & launch
+make overnight   # or docker compose -f ops/docker/docker-compose.validator.yml up -d
+```
+
+Watchtower checks for new images every 5 min and restarts the `validator` service automatically.
+
+### Snapshots
+
+Every 10-block window the validator uploads a snapshot to Cloudflare R2:
+
+* `snapshots/<window_start>.json` – window summary & weight vector
+* `snapshots/scores/<window_start>.json` – full exponentially-smoothed score matrix
+
+Raw challenge results are stored under `raw/<wallet_hotkey>/<block>.json`.
+
+---
+
+See `affine/__init__.py` for implementation details and additional CLI commands. 

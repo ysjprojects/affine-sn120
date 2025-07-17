@@ -101,6 +101,7 @@ class Miner(BaseModel):
     uid: int
     hotkey: str
     model: Optional[str] = None
+    revision: Optional[str] = None
     block: Optional[int] = None
     chute: Optional[Dict[str, Any]] = None
 
@@ -182,18 +183,22 @@ async def get_client():
         ).__aenter__()
     return CLIENT
 
-async def sink(key: str, obj: Any):
-    client = await get_client()
-    body = json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode("utf-8")
-    await client.put_object(Bucket=BUCKET, Key=key, Body=body)
+async def _json_bytes(obj: Any) -> bytes:
+    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
+    return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
 
-async def load(key: str) -> Any:
-    client = await get_client()
-    resp = await client.get_object(Bucket=BUCKET, Key=key)
-    data = await resp["Body"].read()
-    return json.loads(data)
+async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
+    """Upload an object to the configured S3 bucket.
 
-    
+    If *content_type* is ``application/json`` the object is JSON-serialised
+    using the same pydantic-aware encoder as before; otherwise *obj* must be
+    bytes-like.  This generalisation allows us to persist arbitrary state
+    such as numpy arrays or pickles.
+    """
+    client = await get_client()
+    body = await _json_bytes(obj) if content_type == "application/json" else obj
+    await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
+
 # ── API ───────────────────────────────────────────────────────────────
 async def get_chute(model: str) -> Dict[str, Any]:
     url = f"https://api.chutes.ai/chutes/{model}"
@@ -229,13 +234,23 @@ async def miners(
         hotkey = metagraph.hotkeys[uid]
         commits = revs.get(hotkey) or []
         if not commits: return None # Filter on null.
-        block, model = commits[-1]
+        block, model_data = commits[-1]
+        revision = None
+        # Nouveau format JSON {"model":..., "revision":...}
+        if isinstance(model_data, str) and model_data.strip().startswith("{"):
+            try:
+                parsed = json.loads(model_data)
+                model_data = parsed.get("model")
+                revision = parsed.get("revision")
+            except Exception:
+                pass
+        model = model_data
         if no_null and block is None: return None # Filter on null.
         if no_null and model is None: return None # Filter on null.
         if block < min_block: return None # Filter on block.
         chute = await get_chute(str(model))
         if no_null and chute is None: return None # Filter on no chute.
-        miner = Miner( uid=uid, hotkey=hotkey, model=str(model), block=int(block), chute=chute )
+        miner = Miner( uid=uid, hotkey=hotkey, model=str(model), revision=revision, block=int(block), chute=chute )
         return miner
     miners = {uid: miner for uid in uids if (miner := await _get_miner(uid)) is not None}
     return miners
@@ -299,9 +314,35 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
 
 
 # ── CLI & commands ────────────────────────────────────────────────────────────
+# Import environments
 from .envs.sat import SAT
-from .envs.coin import COIN
-ENVS = {"SAT": SAT, "COIN": COIN}
+from .envs.abduction import ABDUCTION
+from .envs.math import MATH
+
+# Registry of active environments
+ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "MATH": MATH}
+
+# ── Snapshot helpers ────────────────────────────────────────────────────
+
+async def _json_bytes(obj: Any) -> bytes:
+    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
+    return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
+
+async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
+    """Upload an object to the configured S3 bucket.
+
+    If *content_type* is ``application/json`` the object is JSON-serialised
+    using the same pydantic-aware encoder as before; otherwise *obj* must be
+    bytes-like.  This generalisation allows us to persist arbitrary state
+    such as numpy arrays or pickles.
+    """
+    client = await get_client()
+    body = await _json_bytes(obj) if content_type == "application/json" else obj
+    await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
+
+# convenience wrapper for validator
+async def snapshot_scores(window: int, scores_table: Dict[str, Any]):
+    await sink(f"snapshots/scores/{window:08d}.json", scores_table)
 
 @cli.command("validate")
 def validate():
@@ -312,19 +353,30 @@ def validate():
         K, alpha = 10, 0.999
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
+        commit_lead = 5
 
         # — Initial state
+        window_start = await subtensor.get_current_block()
         miners_map   = await miners(no_null=True, metagraph=meta)
+        
+        miners_map   = {uid: m for uid, m in miners_map.items() if m.block is not None and m.block <= window_start - commit_lead}
         hotkeys      = [m.hotkey for m in miners_map.values()]
         blocks       = {m.hotkey: m.block for m in miners_map.values()}
         scores       = {m.hotkey: defaultdict(float) for m in miners_map.values()}
-        window_start = await subtensor.get_current_block()
 
         while True:
             # — Refresh miners
             meta       = await subtensor.metagraph(NETUID)
             miners_map = await miners(no_null=True, metagraph=meta)
-            miners_by_hotkey = {m.hotkey: m for m in miners_map.values()}
+            # Filtre commit_lead lors du rafraîchissement
+            miners_map = {uid: m for uid, m in miners_map.items() if m.block is not None and m.block <= window_start - commit_lead}
+
+            
+            hotkeys            = [m.hotkey for m in miners_map.values()]
+            blocks             = {m.hotkey: m.block for m in miners_map.values()}
+            miners_by_hotkey   = {m.hotkey: m for m in miners_map.values()}
+            
+            scores             = {hk: scores.get(hk, defaultdict(float)) for hk in hotkeys}
             for m in miners_map.values():
                 if m.hotkey not in blocks:
                     hotkeys.append(m.hotkey)
@@ -382,6 +434,10 @@ def validate():
                 "blocks":       blocks,
                 "weights":      weights
             })
+
+            # Periodically snapshot the detailed score matrix
+            if window_start % (K * 5) == 0:  # every 5 windows
+                await snapshot_scores(window_start, {hk: dict(scores[hk]) for hk in hotkeys})
 
             # — Render Rich table
             table = Table(title=f"Window {window_start}–{window_start+K}")
