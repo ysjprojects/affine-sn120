@@ -175,17 +175,14 @@ async def get_client():
     SECRET     = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
     ENDPOINT   = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
     CLIENT_CFG = botocore.config.Config(max_pool_connections=256)
-    CLIENT     = None
-    global CLIENT
-    if CLIENT is None:
-        session = get_session()
-        CLIENT = await session.create_client(
-            "s3",
-            endpoint_url=ENDPOINT,
-            aws_access_key_id=KEY_ID,
-            aws_secret_access_key=SECRET,
-            config=CLIENT_CFG,
-        ).__aenter__()
+    session = get_session()
+    CLIENT = await session.create_client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=KEY_ID,
+        aws_secret_access_key=SECRET,
+        config=CLIENT_CFG,
+    ).__aenter__()
     return CLIENT
 
 async def _json_bytes(obj: Any) -> bytes:
