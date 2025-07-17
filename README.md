@@ -67,7 +67,7 @@ af set HF_USER <your hf user>
 
 Pull a model off the network.
 ```bash
-af --vvv pull <uid to pull> --model_path <model_location>
+af -vvv pull <uid to pull> --model_path <model_location>
 ```
 
 Improve the model
@@ -77,5 +77,5 @@ Improve the model
 
 Push the model to my key.
 ```bash
-af --vvv push  --coldkey <your coldkey> --hotkey <your hotkey> --model_path <model_location>
+af -vvv push  --coldkey <your coldkey> --hotkey <your hotkey> --model_path <model_location>
 ```
