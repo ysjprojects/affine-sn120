@@ -42,7 +42,7 @@ def setup_logging(verbosity: int):
     elif verbosity == 2: level = logging.DEBUG
     elif verbosity == 1: level = logging.INFO
     else: level = logging.CRITICAL + 1
-    for noisy_logger in [ "websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio"]:
+    for noisy_logger in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions"]:
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     logging.basicConfig(
         level=level,
@@ -127,6 +127,7 @@ class BaseEnv(BaseModel, ABC):
     def name(self) -> str:return self.__class__.__name__
     class Config: arbitrary_types_allowed = True
     def __hash__(self): return hash(self.name)
+    def __repr__(self): return self.name
     async def many(self, n: int) -> List["Challenge"]:
         return await asyncio.gather(*(self.generate() for _ in range(n)))
     @abstractmethod
@@ -392,7 +393,7 @@ def validate():
                 blk = await subtensor.get_current_block()
                 challenges = [await env().generate() for env in ENVS.values()]
                 results    = await run(challenges=challenges, miners=miners_map)
-                await sink(f"raw/{wallet.hotkey.ss58_address}/{blk:08d}.json",
+                await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk:08d}.json",
                            [r.json() for r in results])
                 for r in results:
                     e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
@@ -431,12 +432,13 @@ def validate():
             weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
 
             # — Sink snapshot
-            snap_key = f"snapshots/{window_start:08d}.json"
+            snap_key = f"affine/snapshots/{wallet.hotkey.ss58_address}/{window_start:08d}.json"
             await sink(snap_key, {
                 "window_start": window_start,
                 "scores":       {hk: dict(scores[hk]) for hk in hotkeys},
                 "blocks":       blocks,
-                "weights":      weights
+                "weights":      weights,
+                "miners":       {hk: {'uid': miner.uid, 'model': miner.model} for hk, miner in miners_map.items()}
             })
 
             # — Render Rich table

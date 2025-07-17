@@ -1,49 +1,33 @@
-import random, re, math as _math
+import random, re
 import affine as af
 
 class MATH(af.BaseEnv):
-    """Elementary arithmetic word-problem environment (GSM8K-style)."""
-
-    templates = [
-        (
-            "If John has {a} apples and eats {b}, how many apples does he have left?",
-            lambda a, b: a - b,
-        ),
-        (
-            "Sarah bought {a} books and her friend gave her {b} more. How many books does Sarah have now?",
-            lambda a, b: a + b,
-        ),
-        (
-            "A rectangle has length {a} cm and width {b} cm. What is its area in square cm?",
-            lambda a, b: a * b,
-        ),
-        (
-            "Tom walked {a} km on Monday and {b} km on Tuesday. How far did he walk in total?",
-            lambda a, b: a + b,
-        ),
-        (
-            "A tank contains {a} liters of water. {b} liters are drained. How much water remains?",
-            lambda a, b: a - b,
-        ),
-    ]
-
-    def __init__(self, tol: float = 1e-2):
-        super().__init__(tol=tol)
-        self.tol = tol
-
+    n: int
+    k: int
+    m: int
+    
+    def __init__(self, n=3, k=2, m=None):
+        super().__init__(n=n, k=k, m=m or int(4.26 * n))
+        
     async def generate(self):
-        tmpl, fn = random.choice(self.templates)
-        a, b = random.randint(3, 50), random.randint(1, 20)
-        while b > a and "left" in tmpl:
-            b = random.randint(1, a)
-        answer = fn(a, b)
-        prompt = tmpl.format(a=a, b=b)
-        return af.Challenge(env=self, prompt=prompt, extra={"ans": answer})
+        sol = {i: random.choice([True, False]) for i in range(1, self.n+1)}
+        cls = []
+        for _ in range(self.m):
+            vs = random.sample(list(sol), self.k)
+            sv = random.choice(vs)
+            cls.append([(lit := (v if sol[v] else -v)) if v==sv else (v if random.choice([True,False]) else -v) for v in vs])
+        formula = " ∧ ".join("(" + " ∨ ".join(f"{'' if l>0 else '¬'}x{abs(l)}" for l in c) + ")" for c in cls)
+        prompt = (
+            f"Find a satisfying assignment for the following {self.k}-SAT formula over variables x1..x{self.n}:\n"
+            f"{formula}\n"
+            "Provide your answer as comma-separated assignments like `x1=True, x2=False, ...`, "
+            "or respond `UNSAT` if it has no solution."
+        )
+        return af.Challenge(env=self, prompt=prompt, extra={"sol": sol, "cls": cls})        
 
     async def evaluate(self, challenge: af.Challenge, response: af.Response):
-        expected = challenge.extra["ans"]
-        # extract first number in reply
-        m = re.search(r"-?\d+(?:\.\d+)?", response.response or "")
-        got = float(m.group()) if m else _math.nan
-        score = float(abs(got - expected) <= self.tol)
-        return af.Evaluation(env=self, score=score, extra={"expected": expected, "got": got}) 
+        sol, cls = challenge.extra["sol"], challenge.extra["cls"]
+        got = {int(v): val.lower() in ("true","1")
+               for v, val in re.findall(r"x(\d+)=(True|False|1|0)", (response.response or ""))}
+        ok = all(any((lit>0)==got.get(abs(lit), None) for lit in c) for c in cls)
+        return af.Evaluation(env=self, score=float(ok), extra={"expected": sol, "got": got})
