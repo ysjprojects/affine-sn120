@@ -130,7 +130,8 @@ class Response(BaseModel):
 class BaseEnv(BaseModel, ABC):
     @property
     def name(self) -> str:return self.__class__.__name__
-    class Config: arbitrary_types_allowed = True
+    class Config: 
+        arbitrary_types_allowed = True
     def __hash__(self): return hash(self.name)
     def __repr__(self): return self.name
     async def many(self, n: int) -> List["Challenge"]:
@@ -144,6 +145,9 @@ class Challenge(BaseModel):
     env: BaseEnv
     prompt: str
     extra: Dict[str, Any] = Field(default_factory=dict)
+    def json(self, **kwargs): # Hack to get name of env.
+        dd = self.dict(**kwargs); dd['env'] = self.env.name;
+        return json.dumps(dd)
     async def evaluate(self, response: Response) -> "Evaluation":
         return await self.env.evaluate(self, response)
     def __repr__(self) -> str:
@@ -155,6 +159,9 @@ class Evaluation(BaseModel):
     env: BaseEnv
     score: float
     extra: Dict[str, Any] = Field(default_factory=dict)
+    def json(self, **kwargs): # Hack to get name of env.
+        dd = self.dict(**kwargs); dd['env'] = self.env.name;
+        return json.dumps(dd)
     def __repr__(self) -> str:
         ex = {k: _truncate(str(v)) for k, v in self.extra.items()}
         return f"<Evaluation env={self.env.name!r} score={self.score:.4f} extra={ex!r}>"
