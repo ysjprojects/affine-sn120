@@ -183,12 +183,18 @@ async def get_client():
         ).__aenter__()
     return CLIENT
 
-# ── S3 helpers ───────────────────────────────────────────────────────
-
 async def _json_bytes(obj: Any) -> bytes:
+    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
     return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
 
 async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
+    """Upload an object to the configured S3 bucket.
+
+    If *content_type* is ``application/json`` the object is JSON-serialised
+    using the same pydantic-aware encoder as before; otherwise *obj* must be
+    bytes-like.  This generalisation allows us to persist arbitrary state
+    such as numpy arrays or pickles.
+    """
     client = await get_client()
     body = await _json_bytes(obj) if content_type == "application/json" else obj
     await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
@@ -351,26 +357,12 @@ from .envs.math import MATH
 # Registry of active environments
 ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "MATH": MATH}
 
-# ── Snapshot helpers ────────────────────────────────────────────────────
+# ── Snapshot helper ────────────────────────────────────────────────────
 
-async def _json_bytes(obj: Any) -> bytes:
-    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
-    return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
+# Using sink() defined above (generalised version)
 
-async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    """Upload an object to the configured S3 bucket.
-
-    If *content_type* is ``application/json`` the object is JSON-serialised
-    using the same pydantic-aware encoder as before; otherwise *obj* must be
-    bytes-like.  This generalisation allows us to persist arbitrary state
-    such as numpy arrays or pickles.
-    """
-    client = await get_client()
-    body = await _json_bytes(obj) if content_type == "application/json" else obj
-    await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
-
-# convenience wrapper for validator
 async def snapshot_scores(window: int, scores_table: Dict[str, Any]):
+    """Persist the score matrix without duplicating metadata."""
     await sink(f"snapshots/scores/{window:08d}.json", scores_table)
 
 @cli.command("validate")
@@ -454,15 +446,17 @@ def validate():
             # — Prepare weights
             weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
             
-            # Sink snapshot to s3.
-            snap_key = f"snapshots/{window_start:08d}.json"
-            await sink(snap_key, {
-                "window_start": window_start,
-                "blocks":       blocks,
-                "weights":      weights
-            })
+            # Persist snapshot meta (window & weights) every window
+            await sink(
+                f"snapshots/{window_start:08d}.json",
+                {
+                    "window_start": window_start,
+                    "blocks":       blocks,
+                    "weights":      weights,
+                },
+            )
 
-            # Periodically snapshot the detailed score matrix
+            # Detailed score matrix saved less frequently to reduce object spam
             if window_start % (K * 5) == 0:  # every 5 windows
                 await snapshot_scores(window_start, {hk: dict(scores[hk]) for hk in hotkeys})
 
