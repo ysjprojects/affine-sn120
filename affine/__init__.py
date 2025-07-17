@@ -27,6 +27,7 @@ from alive_progress import alive_bar
 from pydantic import BaseModel, Field
 from aiobotocore.session import get_session
 from botocore.exceptions import ClientError
+from huggingface_hub import snapshot_download
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
 
 NETUID = 120
@@ -87,6 +88,7 @@ def get_conf(key, default = None) -> Any:
 @click.argument('value')
 def set_config(key: str, value: str):
     """Set a key-value pair in ~/.affine/config.env."""
+    print ('set again')
     path = os.path.expanduser("~/.affine/config.env")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lines = [l for l in open(path).readlines() if not l.startswith(f"{key}=")] if os.path.exists(path) else []
@@ -483,11 +485,45 @@ def validate(coldkey:str, hotkey:str):
             window_start += K
 
     asyncio.run(main())
+    
+    
+@cli.command("pull")
+@click.argument("uid", type=int)
+@click.option("--path", "-p", required=True, type=click.Path(), help="Local directory to save the model")
+@click.option('--hf-token', default=None, help="Hugging Face API token (env HF_TOKEN if unset)")
+def pull(uid: int, path: str, hf_token: str):
+ 
+    # 1. Ensure HF token
+    hf_token     = hf_token or get_conf("HF_TOKEN")
 
-# -----------------------------------------------------------------------------
-# CLI command
-# -----------------------------------------------------------------------------
-@cli.command("mine")
+    # 2. Lookup miner on‑chain
+    miner_map = asyncio.run(miners(uids=uid, no_null=True))
+    print (miner_map)
+    miner = miner_map.get(uid)
+    print(miner)
+    
+    if miner is None:
+        click.echo(f"No miner found for UID {uid}", err=True)
+        sys.exit(1)
+    repo_name = miner.model
+    logger.info("Pulling model %s for UID %d into %s", repo_name, uid, path)
+
+    # 3. Download snapshot
+    try:
+        snapshot_download(
+            repo_id=repo_name,
+            repo_type="model",
+            local_dir=path,
+            token=hf_token,
+            resume_download=True
+        )
+        click.echo(f"Model {repo_name} pulled to {path}")
+    except Exception as e:
+        logger.error("Failed to download %s: %s", repo_name, e)
+        click.echo(f"Error pulling model: {e}", err=True)
+        sys.exit(1)
+
+@cli.command("push")
 @click.option('--model_path',  default=None, help='Local path to model artifacts.')
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
