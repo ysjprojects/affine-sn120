@@ -183,18 +183,12 @@ async def get_client():
         ).__aenter__()
     return CLIENT
 
+# ── S3 helpers ───────────────────────────────────────────────────────
+
 async def _json_bytes(obj: Any) -> bytes:
-    """Serialise *obj* to JSON UTF-8 bytes using pydantic-aware default."""
     return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
 
 async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    """Upload an object to the configured S3 bucket.
-
-    If *content_type* is ``application/json`` the object is JSON-serialised
-    using the same pydantic-aware encoder as before; otherwise *obj* must be
-    bytes-like.  This generalisation allows us to persist arbitrary state
-    such as numpy arrays or pickles.
-    """
     client = await get_client()
     body = await _json_bytes(obj) if content_type == "application/json" else obj
     await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
@@ -464,7 +458,6 @@ def validate():
             snap_key = f"snapshots/{window_start:08d}.json"
             await sink(snap_key, {
                 "window_start": window_start,
-                "scores":       {hk: dict(scores[hk]) for hk in hotkeys},
                 "blocks":       blocks,
                 "weights":      weights
             })
