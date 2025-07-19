@@ -1,3 +1,5 @@
+# ToDo: Update dataset
+
 import random
 import re
 from datasets import load_dataset
@@ -5,36 +7,36 @@ from typing import Any
 import affine as af
 from ..utils.program_executor import ProgramExecutor
 
-PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
+PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its input, you need to determine the exact output that would be produced when the program runs with this input.
 
 Program:
 ```python
 {program}
 ```
 
-Expected Output:
+Input:
 ```
-{output}
+{input}
 ```
 
-Task: Analyze the program to understand what input format it expects from stdin, then provide the input data that would produce the expected output.
+Task: Analyze the program step by step to understand its logic, then trace through the execution with the given input to determine what output it would produce.
 
-You can provide any explanations, analysis, or reasoning you want. However, you MUST include the input data within <INPUT> </INPUT> tags.
+You can provide any explanations, analysis, or reasoning you want. However, you MUST include the output within <OUTPUT> </OUTPUT> tags.
 
-Format the input data like this:
-<INPUT>
-[input data here - each line on a separate line as the program expects]
-</INPUT>
+Format the output like this:
+<OUTPUT>
+[program output here - each line on a separate line as the program would produce]
+</OUTPUT>
 
 I will extract only the content between these tags.
 
-Requirements for the input data within the tags:
-1. Each line of input should be on a separate line
-2. Use the exact format the program expects  
-3. Provide the raw input values that should be fed to stdin
-4. Do not include any prefixes or extra formatting within the INPUT tags
+Requirements for the output data within the tags:
+1. Each line of output should be on a separate line
+2. Use the exact format the program would produce to stdout
+3. Provide the raw output values that the program would print
+4. Do not include any prefixes or extra formatting within the OUTPUT tags
 
-Please analyze the program and provide the required input:"""
+Please analyze the program and provide the expected output:"""
 
 INPUT_GENERATION_PROMPT = """Given this Python program and an example of how it works, generate a NEW valid input that would be accepted by the program:
 
@@ -64,7 +66,7 @@ Format your response with <INPUT> </INPUT> tags like this:
 Please generate a valid input:"""
 
 
-class ABDUCTION(af.BaseEnv):
+class DEDUCTION(af.BaseEnv):
     dataset_name: str
     
     def __init__(self, dataset_name="satpalsr/rl-python"):
@@ -153,7 +155,7 @@ class ABDUCTION(af.BaseEnv):
         return input_lines >= input_calls
     
     async def _create_challenge_from_sample(self, sample):
-        """Create a challenge from a sample by generating LLM input and running the program"""
+        """Create a challenge by generating new input first, then running program to get expected output"""
         program = sample['program']
         
         # Use the sample's existing input-output as example (if available)
@@ -167,7 +169,7 @@ class ABDUCTION(af.BaseEnv):
         # Try multiple LLM-generated inputs until we get a valid output
         for _ in range(5):  # Try up to 5 different LLM attempts
             try:
-                # Generate input using LLM with example
+                # Generate NEW input using LLM with example
                 llm_prompt = INPUT_GENERATION_PROMPT.format(
                     program=program,
                     example_input=example_input,
@@ -189,14 +191,14 @@ class ABDUCTION(af.BaseEnv):
                     af.logger.debug(f"Generated input appears insufficient for program (attempt {_+1})")
                     continue
                 
-                # Run the program with generated input
-                output, error = self.executor.execute_program(program, generated_input)
+                # Run the program with generated input to get EXPECTED output
+                expected_output, error = self.executor.execute_program(program, generated_input)
                 
-                if not error and output and output.strip():
+                if not error and expected_output and expected_output.strip():
                     return {
                         'program': program,
                         'input': generated_input,
-                        'output': output
+                        'expected_output': expected_output
                     }
             except Exception as e:
                 af.logger.debug(f"Error in challenge creation: {e}")
@@ -215,7 +217,7 @@ class ABDUCTION(af.BaseEnv):
             if challenge_data:
                 prompt = PROMPT_TEMPLATE.format(
                     program=challenge_data['program'],
-                    output=challenge_data['output']
+                    input=challenge_data['input']
                 )
                 
                 return af.Challenge(
@@ -223,7 +225,8 @@ class ABDUCTION(af.BaseEnv):
                     prompt=prompt,
                     extra={
                         "program": challenge_data['program'],
-                        "expected_output": challenge_data['output'],
+                        "input": challenge_data['input'],
+                        "expected_output": challenge_data['expected_output'],
                     }
                 )
         
@@ -244,6 +247,35 @@ class ABDUCTION(af.BaseEnv):
             input_data = matches[-1].strip()
             # Clean up the input data
             lines = input_data.split('\n')
+            cleaned_lines = []
+            
+            for line in lines:
+                cleaned_line = line.rstrip()
+                cleaned_lines.append(cleaned_line)
+            
+            # Remove empty lines at the end
+            while cleaned_lines and not cleaned_lines[-1].strip():
+                cleaned_lines.pop()
+            
+            return '\n'.join(cleaned_lines)
+        
+        return ""
+
+    def extract_output_from_response(self, response: str) -> str:
+        """Extract output data from <OUTPUT> </OUTPUT> tags"""
+        # Remove thinking tags first
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+        response = re.sub(r'<thinking>.*?</thinking>', '', response, flags=re.DOTALL)
+        
+        # Look for <OUTPUT> </OUTPUT> tags - case insensitive
+        output_pattern = r'<OUTPUT>(.*?)</OUTPUT>'
+        matches = re.findall(output_pattern, response, re.DOTALL | re.IGNORECASE)
+        
+        if matches:
+            # Take the last match if multiple exist
+            output_data = matches[-1].strip()
+            # Clean up the output data
+            lines = output_data.split('\n')
             cleaned_lines = []
             
             for line in lines:
@@ -278,41 +310,28 @@ class ABDUCTION(af.BaseEnv):
         return expected_lines == actual_lines
     
     async def evaluate(self, challenge: af.Challenge, response: af.Response) -> af.Evaluation:
-        """Evaluate the response by extracting input and running the program"""
+        """Evaluate the response by extracting output and comparing with expected output"""
         program = challenge.extra["program"]
+        input_data = challenge.extra["input"]
         expected_output = challenge.extra["expected_output"]
         
-        # Extract input from the LLM response
-        generated_input = self.extract_input_from_response(response.response or "")
+        # Extract output from the LLM response
+        generated_output = self.extract_output_from_response(response.response or "")
         
-        if not generated_input:
+        if not generated_output:
             return af.Evaluation(
                 env=self,
                 score=0.0,
                 extra={
-                    "expected_output": expected_output,
-                    "generated_input": generated_input,
-                    "error": "No input found in response"
-                }
-            )
-        
-        # Execute the program with the extracted input
-        generated_output, error = self.executor.execute_program(program, generated_input)
-        
-        if error:
-            return af.Evaluation(
-                env=self,
-                score=0.0,
-                extra={
-                    "expected_output": expected_output,
-                    "generated_input": generated_input,
-                    "generated_output": generated_output,
                     "program": program,
-                    "error": error
+                    "input": input_data,
+                    "expected_output": expected_output,
+                    "generated_output": generated_output,
+                    "error": "No output found in response"
                 }
             )
         
-        # Compare the actual output with expected output
+        # Compare the generated output with expected output
         outputs_match = self.compare_outputs(expected_output, generated_output)
         score = 1.0 if outputs_match else 0.0
         
@@ -320,10 +339,10 @@ class ABDUCTION(af.BaseEnv):
             env=self,
             score=score,
             extra={
-                "expected_output": expected_output,
-                "generated_input": generated_input,
-                "generated_output": generated_output,
                 "program": program,
+                "input": input_data,
+                "expected_output": expected_output,
+                "generated_output": generated_output,
                 "outputs_match": outputs_match,
                 "error": None
             }

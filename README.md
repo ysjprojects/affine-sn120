@@ -46,7 +46,7 @@ af -vvv validate --coldkey <your coldkey> --hotkey <your hotkey>
 
 # Mining
 
-Unfortunately, miners need a chutes developer account to deploy models and this requires an upfront 5k USD in TAO (which you get this back later).
+Miners need a chutes developer account to deploy models and this requires an upfront 5k USD in TAO (which you get this back later).
 Visit `chutes.ai` set your account up. You will also need a Huggingface account to deploy new models. Once you have all of these requirements do the following: 
 ```bash
 # Register to chutes.

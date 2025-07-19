@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from aiobotocore.session import get_session
 from botocore.exceptions import ClientError
 from huggingface_hub import snapshot_download
+from bittensor.core.errors import MetadataError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
 
 NETUID = 120
@@ -344,8 +345,18 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
         async def proc(m, chal):
             resp = await _run_one(chal, m.model)
-            ev = await chal.evaluate(resp)
-            logger.trace("Evaluation done for %s: %r", m.model, ev)
+            try:
+                ev = await chal.evaluate(resp)
+                logger.trace("Evaluation done for %s: %r", m.model, ev)
+            except Exception as e:
+                logger.warning("Evaluation failed for miner %s on %s: %s", 
+                              m.uid, chal.env.name, str(e))
+                # Create fallback evaluation with zero score
+                ev = Evaluation(
+                    env=chal.env,
+                    score=0.0,
+                    extra={"error": str(e), "evaluation_failed": True}
+                )
             return Result(miner=m, challenge=chal, response=resp, evaluation=ev)
 
         tasks = [asyncio.create_task(proc(m, chal))
@@ -365,11 +376,11 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
 # Import environments
 from .envs.sat import SAT
 from .envs.abduction import ABDUCTION
-from .envs.math import MATH
+from .envs.deduction import DEDUCTION
 from .envs.gpqa import GPQA
 
 # Registry of active environments
-ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "MATH": MATH, "GPQA": GPQA}
+ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION, "GPQA": GPQA}
 
 @cli.command("validate")
 @click.option('--coldkey', default=None, help='Cold wallet name')
@@ -385,6 +396,8 @@ def validate(coldkey: str, hotkey: str):
         K, alpha = 10, 0.999
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
+
+        env_instances = {name: env() for name, env in ENVS.items()}
 
         # — Initial state
         miners_map   = await miners(no_null=True, metagraph=meta)
@@ -423,9 +436,10 @@ def validate(coldkey: str, hotkey: str):
                     results    = await run(challenges=challenges, miners=miners_map)
                     await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk:08d}.json", [r.json() for r in results])
                     for r in results:
-                        e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
-                        prev = scores[hk][e]
-                        scores[hk][e] = raw * (1 - alpha) + prev * alpha
+                        if r.response.success:
+                            e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
+                            prev = scores[hk][e]
+                            scores[hk][e] = raw * (1 - alpha) + prev * alpha
 
                 # — Compute dense ranks & custom dominance counts
                 ranks, counts = {}, defaultdict(int)
@@ -540,10 +554,11 @@ def pull(uid: int, model_path: str, hf_token: str):
         sys.exit(1)
 
 @cli.command("push")
-@click.option('--model_path',  default = './model_path', help='Local path to model artifacts.')
+@click.option('--model_path',  default='./model_path', help='Local path to model artifacts.')
+@click.option('--existing-repo', default=None, help='Use an existing HF repo instead of uploading (format <user>/<repo>)')
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
-def push(model_path: str, coldkey: str, hotkey: str):
+def push(model_path: str, existing_repo: str, coldkey: str, hotkey: str):
     """Pushes a model to be hosted by your miner."""
     # -----------------------------------------------------------------------------
     # 1. Wallet & config
@@ -562,23 +577,22 @@ def push(model_path: str, coldkey: str, hotkey: str):
 
     # -----------------------------------------------------------------------------
     # 2. Prepare HF repo name
+    #    - If --existing-repo provided, use it directly and skip local upload
     # -----------------------------------------------------------------------------
-    address   = wallet.hotkey.ss58_address
-    repo_name = f"{hf_user}/Affine-{address}"
-    logger.debug("Hugging Face repo: %s", repo_name)
+    repo_name = existing_repo or f"{hf_user}/Affine-{wallet.hotkey.ss58_address}"
+    logger.debug("Using existing HF repo: %s" if existing_repo else "Hugging Face repo: %s", repo_name)
 
     # -----------------------------------------------------------------------------
     # 3. Create & secure HF repo
     # -----------------------------------------------------------------------------
     api = HfApi(token=hf_token)
-    api.create_repo(repo_id=repo_name, repo_type="model", private=True, exist_ok=True)
-    try:
-        api.update_repo_visibility(repo_id=repo_name, private=True)
-    except Exception:
-        logger.trace("Repo already private or visibility update failed")
+    if not existing_repo:
+        api.create_repo(repo_id=repo_name, repo_type="model", private=True, exist_ok=True)
+        try: api.update_repo_visibility(repo_id=repo_name, private=True)
+        except Exception: logger.debug("Repo already private or visibility update failed")
 
     # -----------------------------------------------------------------------------
-    # 4. Upload model files to HF
+    # 4. Upload model files to HF (skip if using existing repo)
     # -----------------------------------------------------------------------------
     async def deploy_model_to_hf():
         logger.debug("Starting model upload from %s", model_path)
@@ -610,7 +624,7 @@ def push(model_path: str, coldkey: str, hotkey: str):
         await asyncio.gather(*(_upload(p) for p in files))
         logger.debug("Model upload complete (%d files)", len(files))
 
-    asyncio.run(deploy_model_to_hf())
+    asyncio.run(deploy_model_to_hf()) if not existing_repo else logger.debug("Skipping model upload because --existing-repo was provided")
 
     # -----------------------------------------------------------------------------
     # 5. Fetch latest revision hash
@@ -623,16 +637,21 @@ def push(model_path: str, coldkey: str, hotkey: str):
     # 6. Commit model revision on-chain
     # -----------------------------------------------------------------------------
     async def commit_to_chain():
+        """Submit the model commitment, retrying if the subnet space quota is full."""
         logger.debug("Preparing on-chain commitment")
         sub     = await get_subtensor()
         payload = json.dumps({"model": repo_name, "revision": revision})
-        await sub.set_reveal_commitment(
-            wallet=wallet,
-            netuid=NETUID,
-            data=payload,
-            blocks_until_reveal=1
-        )
-        logger.debug("On-chain commitment submitted")
+        while True:
+            try:
+                await sub.set_reveal_commitment(wallet=wallet, netuid=NETUID, data=payload, blocks_until_reveal=1)
+                logger.debug("On-chain commitment submitted")
+                break
+            except MetadataError as e:
+                if "SpaceLimitExceeded" in str(e):
+                    logger.debug("SpaceLimitExceeded – waiting one block before retrying")
+                    await sub.wait_for_block()
+                else:
+                    raise
 
     asyncio.run(commit_to_chain())
 
@@ -652,9 +671,9 @@ def push(model_path: str, coldkey: str, hotkey: str):
         logger.debug("Building Chute config")
         rev_flag = f"--revision {revision} " if revision else ""
         chutes_config = textwrap.dedent(f"""
+import os
 from chutes.chute import NodeSelector
 from chutes.chute.template.sglang import build_sglang_chute
-import os
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
 chute = build_sglang_chute(
@@ -664,8 +683,10 @@ chute = build_sglang_chute(
     image="chutes/sglang:0.4.6.post5b",
     concurrency=20,
     node_selector=NodeSelector(
-        gpu_count=8,
-        min_vram_gb_per_gpu=40,
+        gpu_count=4,
+        min_vram_gb_per_gpu=24,
+        include=["4090", "l40s", "a6000_ada"],
+        exclude=["h200", "b200", "mi300x"],
     ),
     engine_args=(
         "--trust-remote-code "
@@ -677,6 +698,7 @@ chute = build_sglang_chute(
         tmp_file = Path("tmp_chute.py")
         tmp_file.write_text(chutes_config)
         logger.debug("Wrote Chute config to %s", tmp_file)
+        logger.debug("=== chute file ===\n%s", tmp_file.read_text())
 
         cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--public"]
         env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
@@ -713,10 +735,10 @@ chute = build_sglang_chute(
 
         while not (miner.chute or {}).get("hot", False):
             challenge = await SAT().generate()
-            await run(challenges=challenge, miners=miner)
+            await run(challenges=challenge, miners=[miner])
             await sub.wait_for_block()
             miner = (await miners(uids=my_uid))[my_uid]
-            logger.trace("Checked hot status: %s", miner.chute.hot)
+            logger.trace("Checked hot status: %s", (miner.chute or {}).get("hot"))
 
         logger.debug("Model is now hot and ready")
 
