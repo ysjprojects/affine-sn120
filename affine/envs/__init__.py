@@ -4,12 +4,11 @@ from pathlib import Path
 
 # Local environment imports
 from .sat import SAT
-from .abduction import ABDUCTION
-from .gpqa import GPQA
-from .deduction import DEDUCTION
+from .abd import ABDUCTION
+from .ded import DEDUCTION
 
 # Public re-exports
-__all__ = ["SAT", "ABDUCTION", "GPQA", "DEDUCTION"]
+__all__ = ["SAT", "ABDUCTION", "DEDUCTION"]
 
 # Auto-import all env modules in this package
 pkg_path = str(Path(__file__).parent)

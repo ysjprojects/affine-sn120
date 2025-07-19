@@ -1,9 +1,26 @@
 import random
 import re
 from datasets import load_dataset
-from typing import Any
+from typing import Any, List, Dict
 import affine as af
-from ..utils.program_executor import ProgramExecutor
+from .affine.utils.program_executor import ProgramExecutor
+
+_abduction_dataset_cache: List[Dict[str, Any]] = []
+
+def get_abduction_dataset(dataset_name: str) -> List[Dict[str, Any]]:
+    """Load the abduction dataset into a module-level cache if not already loaded"""
+    global _abduction_dataset_cache
+    if not _abduction_dataset_cache:
+        try:
+            dataset = load_dataset(dataset_name)
+            if 'train' in dataset:
+                _abduction_dataset_cache = list(dataset['train'])
+            else:
+                split_name = list(dataset.keys())[0]
+                _abduction_dataset_cache = list(dataset[split_name])
+        except Exception as e:
+            raise RuntimeError(f"Failed to load abduction dataset: {str(e)}")
+    return _abduction_dataset_cache
 
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
 
@@ -70,43 +87,11 @@ class ABDUCTION(af.BaseEnv):
     def __init__(self, dataset_name="satpalsr/rl-python"):
         super().__init__(dataset_name=dataset_name)
         self._executor = ProgramExecutor()
-        self._dataset = None
-        self._dataset_iterator = None
         
     @property
     def executor(self):
         return self._executor
         
-    def _get_dataset(self):
-        """Load dataset as an iterator"""
-        if self._dataset is None:
-            try:
-                self._dataset = load_dataset(self.dataset_name, streaming=True)
-                if 'train' in self._dataset:
-                    self._dataset_iterator = iter(self._dataset['train'])
-                else:
-                    split_name = list(self._dataset.keys())[0]
-                    self._dataset_iterator = iter(self._dataset[split_name])
-            except Exception as e:
-                raise RuntimeError(f"Failed to load dataset: {str(e)}")
-        return self._dataset
-
-    def _get_random_sample(self):
-        """Get a random sample from the dataset"""
-        if not self._dataset_iterator:
-            self._get_dataset()
-            
-        try:
-            return next(self._dataset_iterator)
-        except StopIteration:
-            # Reset iterator and try again
-            if 'train' in self._dataset:
-                self._dataset_iterator = iter(self._dataset['train'])
-            else:
-                split_name = list(self._dataset.keys())[0]
-                self._dataset_iterator = iter(self._dataset[split_name])
-            return next(self._dataset_iterator)
-
     async def _llm_generate_input(self, prompt: str) -> str:
         """Generate input using LLM API"""
         url = "https://llm.chutes.ai/v1/chat/completions"
@@ -206,9 +191,10 @@ class ABDUCTION(af.BaseEnv):
 
     async def generate(self) -> af.Challenge:
         """Generate a single challenge"""
+        dataset = get_abduction_dataset(self.dataset_name)
         # Try multiple samples until we get a valid challenge
         for _ in range(10):  # Try up to 10 samples
-            sample = self._get_random_sample()
+            sample = random.choice(dataset)
             af.logger.info(f"Selected sample for challenge generation: {sample}")
             challenge_data = await self._create_challenge_from_sample(sample)
             

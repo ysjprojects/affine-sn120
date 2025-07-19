@@ -5,7 +5,7 @@ import re
 from datasets import load_dataset
 from typing import Any
 import affine as af
-from ..utils.program_executor import ProgramExecutor
+from .affine.utils.program_executor import ProgramExecutor
 
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its input, you need to determine the exact output that would be produced when the program runs with this input.
 

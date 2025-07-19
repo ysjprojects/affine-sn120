@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+
+# --------------------------------------------------------------------------- #
+#                             Imports                                         #
+# --------------------------------------------------------------------------- #
 import os
 import io
 import sys
@@ -13,6 +18,7 @@ import asyncio
 import logging
 import textwrap
 import botocore
+import traceback
 import numpy as np
 import bittensor as bt
 import botocore.config
@@ -33,7 +39,9 @@ from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
 
 NETUID = 120
 
-# ── LOGGING ─────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#                               Logging                                       #
+# --------------------------------------------------------------------------- #
 TRACE = 5
 logging.addLevelName(TRACE, "TRACE")
 def _trace(self, msg, *args, **kwargs):
@@ -54,7 +62,9 @@ def setup_logging(verbosity: int):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     
-# ── SUBTENSOR ─────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#                               Subtensor                                     #
+# --------------------------------------------------------------------------- #
 SUBTENSOR = None
 async def get_subtensor():
     global SUBTENSOR
@@ -65,14 +75,18 @@ async def get_subtensor():
         logger.debug("Connected")
     return SUBTENSOR
 
-# ── CLI ─────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#                               CLI                                           #
+# --------------------------------------------------------------------------- #
 @click.group()
 @click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
 def cli(verbose):
     """Affine CLI"""
     setup_logging(verbose)
     
-# ── Config. ─────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#                               Config                                        #
+# --------------------------------------------------------------------------- #
 load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True)
 load_dotenv(override=True)
 def get_conf(key, default = None) -> Any:
@@ -97,7 +111,9 @@ def set_config(key: str, value: str):
     logger.info("Set %s in %s", key, path)
     click.echo(f"Set {key} in {path}")
     
-# ── Models ───────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#                               Model                                         #
+# --------------------------------------------------------------------------- #
 def _truncate(text: Optional[str], max_length: int = 80) -> str:
     if not text:
         return ""
@@ -175,46 +191,55 @@ class Result(BaseModel):
     evaluation: Evaluation
     
     
-# ── S3 ─────────────────────────────────────────────────────────────────
-async def get_client():
-    ACCOUNT    = get_conf("R2_ACCOUNT_ID")
-    KEY_ID     = get_conf("R2_WRITE_ACCESS_KEY_ID")
-    SECRET     = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
-    ENDPOINT   = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
-    CLIENT_CFG = botocore.config.Config(max_pool_connections=256)
+# --------------------------------------------------------------------------- #
+#                              S3 Operations                                  #
+# --------------------------------------------------------------------------- #
+def get_client_ctx():
+    ACCOUNT  = get_conf("R2_ACCOUNT_ID")
+    KEY_ID   = get_conf("R2_WRITE_ACCESS_KEY_ID")
+    SECRET   = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
+    endpoint = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
+    cfg      = botocore.config.Config(max_pool_connections=256)
     session = get_session()
-    CLIENT = await session.create_client(
+    return session.create_client(
         "s3",
-        endpoint_url=ENDPOINT,
+        endpoint_url=endpoint,
         aws_access_key_id=KEY_ID,
         aws_secret_access_key=SECRET,
-        config=CLIENT_CFG,
-    ).__aenter__()
-    return CLIENT
+        config=cfg,
+    )
 
 async def _json_bytes(obj: Any) -> bytes:
     return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
 
 async def get(key: str) -> Any:
-    client = await get_client()
-    BUCKET     = get_conf("R2_BUCKET_ID")
-    response = await client.get_object(Bucket=BUCKET, Key=key)
-    body = await response["Body"].read()
-    content_type = response.get("ContentType", "")
-    if content_type == "application/json": return json.loads(body.decode("utf-8"))
-    else: return body
+    async with get_client_ctx() as client:
+        bucket = get_conf("R2_BUCKET_ID")
+        resp   = await client.get_object(Bucket=bucket, Key=key)
+        body   = await resp["Body"].read()
+        ctype  = resp.get("ContentType", "")
+        if ctype == "application/json":
+            return json.loads(body.decode("utf-8"))
+        return body
 
 async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
     try:
-        client = await get_client()
-        BUCKET     = get_conf("R2_BUCKET_ID")
-        body = await _json_bytes(obj) if content_type == "application/json" else obj
-        await client.put_object(Bucket=BUCKET, Key=key, Body=body, ContentType=content_type)
-    except:
-        logger.trace('R2 bucket is not set cannot sink. Continuing...')
-        pass
+        async with get_client_ctx() as client:
+            bucket = get_conf("R2_BUCKET_ID")
+            body   = await _json_bytes(obj) if content_type == "application/json" else obj
+            await client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=body,
+                ContentType=content_type
+            )
+    except Exception:
+        logger.error("Unexpected error writing to R2", exc_info=True)
+        raise
 
-# ── API ───────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+#                               API                                           #
+# --------------------------------------------------------------------------- #
 async def get_chute(model: str) -> Dict[str, Any]:
     url = f"https://api.chutes.ai/chutes/{model}"
     token = os.getenv("CHUTES_API_KEY", "")
@@ -228,14 +253,9 @@ async def get_chute(model: str) -> Dict[str, Any]:
             for k in ('readme','cords','tagline','instances'):
                 info.pop(k, None)
             info.get('image', {}).pop('readme', None)
-            logger.trace("Fetched chute info for %s", model)
             return info
         
 async def get_chute_code(identifier: str) -> Optional[str]:
-    """Return raw chute Python code for *identifier* or ``None``.
-
-    The endpoint is `https://api.chutes.ai/chutes/code/{identifier}`.
-    """
     url = f"https://api.chutes.ai/chutes/code/{identifier}"
     token = os.getenv("CHUTES_API_KEY", "")
     headers = {"Authorization": token}
@@ -252,61 +272,125 @@ def _extract_revision(code: str) -> Optional[str]:
     return m.group(1) if m else None
 
 async def miners(
-        uids: Optional[Union[int, List[int]]] = None, 
-        no_null: bool = False, 
-        netuid: int = NETUID,
-        min_block: int = 0,
-        metagraph: object = None,
-    ) -> Dict[int, Miner]:
+    uids: Optional[Union[int, List[int]]] = None,
+    no_null: bool = False,
+    netuid: int = NETUID,
+    min_block: int = 0,
+    metagraph: object = None,
+) -> Dict[int, Miner]:
+    # Preamble
     subtensor = await get_subtensor()
-    if metagraph is None:
-        metagraph = await subtensor.metagraph(netuid)
+    metagraph = metagraph or await subtensor.metagraph(netuid)
+    hotkeys = metagraph.hotkeys
     revs = await subtensor.get_all_revealed_commitments(netuid)
-    if uids is None: uids = list(range(len(metagraph.hotkeys)))
+    if uids is None:uids = list(range(len(hotkeys)))
     elif isinstance(uids, int): uids = [uids]
-    async def _get_miner(uid: int) -> Optional[Miner]:
-        if not (0 <= uid < len(metagraph.hotkeys)): return None
-        hotkey = metagraph.hotkeys[uid]
-        commits = revs.get(hotkey) or []
-        if not commits: return None # Filter on null.
-        block, model_data = commits[-1]
-        revision = None
-        # Nouveau format JSON {"model":..., "revision":...}
-        if isinstance(model_data, str) and model_data.strip().startswith("{"):
+
+    # Single async fetch,
+    async def fetch(uid: int) -> Optional[Miner]:
+        # Check exists.
+        if not (0 <= uid < len(hotkeys)): return None
+
+        hk = hotkeys[uid]
+        commits = revs.get(hk) or []
+        if not commits: return None
+
+        # Check revision.
+        block, data = commits[-1]
+        rev = None
+        if isinstance(data, str) and data.strip().startswith("{"):
             try:
-                parsed = json.loads(model_data)
-                model_data = parsed.get("model")
-                revision = parsed.get("revision")
-            except Exception:
+                parsed = json.loads(data)
+                data, rev = parsed.get("model"), parsed.get("revision")
+            except json.JSONDecodeError:
                 pass
-        model = model_data
-        if no_null and block is None: return None # Filter on null.
-        if no_null and model is None: return None # Filter on null.
-        if block < min_block: return None # Filter on block.
+
+        # Filer non block.
+        model = data
+        if no_null and (block is None or model is None or block < min_block): return None
+
+        # fetch chute info
         chute = await get_chute(str(model))
-        if chute is None:
-            # fall back to code endpoint using model as identifier
-            code = await get_chute_code(str(model))
-            revision = _extract_revision(code or "") if code else None
+        if chute:
+            rev = chute.get("revision") or rev
+            if rev is None and (cid := chute.get("id") or chute.get("uuid")):
+                code = await get_chute_code(cid)
+                rev = _extract_revision(code or "")
         else:
-            # Try extract revision from returned info first
-            if 'revision' in chute and chute['revision']:
-                revision = str(chute['revision'])
-            else:
-                # fallback: fetch code via uuid if available
-                cid = chute.get('id') or chute.get('uuid')
-                if cid:
-                    code = await get_chute_code(cid)
-                    revision = _extract_revision(code or "") if code else None
-        if no_null and chute is None: return None # Filter on no chute.
-        miner = Miner(uid=uid, hotkey=hotkey, model=str(model), revision=revision, block=int(block), chute=chute)
+            code = await get_chute_code(str(model))
+            rev = _extract_revision(code or "")
+
+        if no_null and chute is None: return None
+        miner = Miner(
+            uid=uid,
+            hotkey=hk,
+            model=str(model),
+            revision=rev,
+            block=int(block),
+            chute=chute,
+        )
         return miner
-    miners = {uid: miner for uid in uids if (miner := await _get_miner(uid)) is not None}
-    return miners
+    results = await asyncio.gather(*(fetch(uid) for uid in uids))
+    output = {uid: m for uid, m in zip(uids, results) if m is not None}
+    return output
+
 
 # ── run challenges ────────────────────────────────────────────────────────────
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
+
+async def query(prompt:str, model:str = "unsloth/gemma-3-27b-it", timeout=120, retries=0, backoff=1):
+    url = "https://llm.chutes.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    start = time.monotonic()
+    logger.trace("Starting %r on model=%s", prompt[:30], model)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
+        for attempt in range(1, retries + 2):
+            try:
+                async with HTTP_SEM, sess.post(
+                    url,
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+                    headers=headers,
+                    timeout=timeout
+                ) as resp:
+                    text = await resp.text(errors="ignore")
+                    if resp.status in TERMINAL:
+                        return Response(
+                            response=None,
+                            latency_seconds=time.monotonic() - start,
+                            attempts=attempt,
+                            model=model,
+                            error=f"{resp.status}:{text}",
+                            success=False
+                        )
+                    if resp.status != 200:
+                        raise RuntimeError(f"{resp.status}:{text}")
+                    body = await resp.json()
+                    content = body["choices"][0]["message"]["content"]
+                    return Response(
+                        response=content,
+                        latency_seconds=time.monotonic() - start,
+                        attempts=attempt,
+                        model=model,
+                        error=None,
+                        success=True
+                    )
+
+            except Exception as e:
+                if attempt > retries:
+                    return Response(
+                        response=None,
+                        latency_seconds=time.monotonic() - start,
+                        attempts=attempt,
+                        model=model,
+                        error=str(e),
+                        success=False
+                    )
+                await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
+
 
 async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=True):
     if not isinstance(challenges, list): challenges = [challenges]
@@ -315,73 +399,43 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
     elif isinstance(miners, list) and all(hasattr(m, "uid") for m in miners):  mmap = {m.uid: m for m in miners}
     else: mmap = await miners(miners)
     logger.trace("Running challenges: %s on miners: %s", [chal.prompt[:30] for chal in challenges], list(mmap.keys()))
-
-    async def _run_one(chal, model):
-        url = "https://llm.chutes.ai/v1/chat/completions"
-        hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
-        start = time.monotonic()
-        logger.trace("Starting %r on model=%s", chal.prompt[:30], model)
-        for attempt in range(1, retries + 2):
-            try:
-                async with HTTP_SEM, sess.post(url, json={"model": model, "messages":[{"role":"user","content":chal.prompt}]}, headers=hdr, timeout=timeout) as r:
-                    text = await r.text(errors="ignore")
-                    logger.trace("HTTP %d on attempt %d for %s", r.status, attempt, model)
-                    if r.status in TERMINAL:
-                        err = f"{r.status}:{text}"
-                        logger.debug("Terminal error for %s: %s", model, err)
-                        return Response(response=None, latency_seconds=time.monotonic()-start, attempts=attempt, model=model, error=err, success=False)
-                    if r.status != 200:
-                        raise RuntimeError(f"{r.status}:{text}")
-                    body = await r.json()
-                    res = body["choices"][0]["message"]["content"]
-                    logger.trace("Success for %s in %.2fs (attempt %d)", model, time.monotonic()-start, attempt)
-                    return Response(response=res, latency_seconds=time.monotonic()-start, attempts=attempt, model=model, error=None, success=True)
-            except Exception as e:
-                logger.debug("Error on attempt %d for %s: %s", attempt, model, e)
-                if attempt > retries:
-                    return Response(response=None, latency_seconds=time.monotonic()-start, attempts=attempt, model=model, error=str(e), success=False)
-                await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-.1, .1)))
-
     results = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        async def proc(m, chal):
-            resp = await _run_one(chal, m.model)
-            try:
-                ev = await chal.evaluate(resp)
-                logger.trace("Evaluation done for %s: %r", m.model, ev)
-            except Exception as e:
-                logger.warning("Evaluation failed for miner %s on %s: %s", 
-                              m.uid, chal.env.name, str(e))
-                # Create fallback evaluation with zero score
-                ev = Evaluation(
-                    env=chal.env,
-                    score=0.0,
-                    extra={"error": str(e), "evaluation_failed": True}
-                )
-            return Result(miner=m, challenge=chal, response=resp, evaluation=ev)
+    async def proc(miner, chal):
+        resp = await query(chal.prompt, miner.model, timeout, retries, backoff)
+        try:
+            ev = await chal.evaluate(resp)
+            logger.trace("Evaluation done for %s: %r", miner.model, ev)
+        except Exception as e:
+            logger.warning("Evaluation failed for miner %s on %s: %s", miner.uid, chal.env.name, e)
+            ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
+        return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
 
-        tasks = [asyncio.create_task(proc(m, chal))
-                 for m in mmap.values() if m.model for chal in challenges]
-        if progress:
-            with alive_bar(len(tasks), title="Running challenges") as bar:
-                for task in asyncio.as_completed(tasks):
-                    results.append(await task); bar()
-        else:
+    tasks = [
+        asyncio.create_task(proc(m, chal))
+        for m in mmap.values() if m.model for chal in challenges
+    ]
+    if progress:
+        with alive_bar(len(tasks), title="Running challenges") as bar:
             for task in asyncio.as_completed(tasks):
                 results.append(await task)
+                bar()
+    else:
+        for task in asyncio.as_completed(tasks):
+            results.append(await task)
+
     logger.trace("Finished all runs (%d results)", len(results))
     return results
 
 
-# ── CLI & commands ────────────────────────────────────────────────────────────
-# Import environments
+# --------------------------------------------------------------------------- #
+#                               Validator                                     #
+# --------------------------------------------------------------------------- #
 from .envs.sat import SAT
-from .envs.abduction import ABDUCTION
-from .envs.deduction import DEDUCTION
-from .envs.gpqa import GPQA
+from .envs.abd import ABDUCTION
+from .envs.ded import DEDUCTION
 
 # Registry of active environments
-ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION, "GPQA": GPQA}
+ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION}
 
 @cli.command("validate")
 @click.option('--coldkey', default=None, help='Cold wallet name')
@@ -398,11 +452,8 @@ def validate(coldkey: str, hotkey: str):
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
 
-        env_instances = {name: env() for name, env in ENVS.items()}
-
         # — Initial state
         miners_map   = await miners(no_null=True, metagraph=meta)
-        hotkeys      = [m.hotkey for m in miners_map.values()]
         blocks       = {m.hotkey: m.block for m in miners_map.values()}
         scores       = {m.hotkey: defaultdict(float) for m in miners_map.values()}
         window_start = await subtensor.get_current_block()
@@ -419,70 +470,87 @@ def validate(coldkey: str, hotkey: str):
                 for m in miners_map.values():
                     if blocks.get(m.hotkey) != m.block:
                         blocks[m.hotkey], scores[m.hotkey] = m.block, defaultdict(float)
-
-                # - Remove miners if m.chute is None or m.chute['hot'] is False
-                miners_map = {hk: m for hk, m in miners_map.items() if m.chute and m.chute.get('hot', False)}
-
-                # - Dedupe same‑model hotkeys, keeping the earliest block first.
-                # You can't submit someone elses model (there is only one Kimi2)
-                hotkeys = list(
-                    {m.model: m.hotkey for m in sorted(miners_map.values(), key=lambda m: blocks[m.hotkey])}
-                    .values()
-                )
-                miners_map = {hk: miners_map[hk] for hk in hotkeys}
-                blocks     = {hk: blocks[hk]     for hk in hotkeys}
-                scores     = {hk: scores[hk]     for hk in hotkeys}
-
+                hotkeys = [ m.hotkey for m in miners_map.values() ]
+                miners_map = { m.hotkey: m for m in miners_map.values() }
+                if len(miners_map.values()) == 0:
+                    logger.debug('no valid miners, waiting...')
+                    await asyncio.sleep(10)
+                    continue
+               
                 # — Collect scores for K blocks
-                while await subtensor.get_current_block() < window_start + K:
-                    blk = await subtensor.get_current_block()
-                    challenges = [await env().generate() for env in ENVS.values()]
-                    results    = await run(challenges=challenges, miners=miners_map)
-                    await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk:08d}.json", [r.json() for r in results])
-                    for r in results:
-                        if r.response.success:
-                            e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
-                            prev = scores[hk][e]
-                            scores[hk][e] = raw * (1 - alpha) + prev * alpha
+                blk = await subtensor.get_current_block()
+                all_results = []
+                while blk < window_start + K:
+                    try:
+                        challenges = [await env().generate() for env in ENVS.values()]
+                        results    = await run(challenges=challenges, miners=miners_map, timeout=90)
+                        all_results.extend( results )
+                        for r in results:
+                            # Only update moving average for successful responses.
+                            e, hk, raw, resp = r.challenge.env.name, r.miner.hotkey, r.evaluation.score, r.response.response
+                            if r.response.success:
+                                scores[hk][e] = raw * (1 - alpha) + scores[hk][e] * alpha
+                            logger.info(
+                                f"Environment: {e}, "
+                                f"Miner: {hk[:10]}, "
+                                f"Model: {r.miner.model}, "
+                                f"Score: {raw}, "
+                                f"Current: {scores[hk][e]}, "
+                                f"Response: {resp[:10] if resp != None else 'Empty'}, "
+                                f"Success: {r.response.success} "
+                            )
+                    except Exception as e:
+                        # Error in evals.
+                        traceback.print_exc()
+                        logger.info(f"[yellow]Transient error during eval:[/yellow] {e}. Continuing validator loop…")
+                        continue
+                    finally:
+                        # Update block.
+                        blk = await subtensor.get_current_block()
+                        break
+                # Sink all results.
+                await sink(f"affine/results/{wallet.hotkey.ss58_address}/{window_start}.json", [r.json() for r in results])
 
-                # — Compute dense ranks & custom dominance counts
+
+                # — Compute dense ranks & dominance
                 ranks, counts = {}, defaultdict(int)
                 for e in ENVS:
                     uniq = sorted({scores[h][e] for h in hotkeys}, reverse=True)
-                    rank_of = {score: i+1 for i, score in enumerate(uniq)}
+                    rank_of = {score: i + 1 for i, score in enumerate(uniq)}
                     ranks[e] = {h: rank_of[scores[h][e]] for h in hotkeys}
 
-                # - Compute pareto dominance scores.
-                env_list = list(ENVS)
+                # - Compute dominance counts.
                 for a in hotkeys:
                     for b in hotkeys:
-                        if a == b: continue
-                        better = sum(ranks[e][a] < ranks[e][b] for e in env_list)
-                        not_worse = all(ranks[e][a] <= ranks[e][b] for e in env_list)
+                        if a == b:
+                            continue
+                        better = sum(ranks[e][a] < ranks[e][b] for e in ENVS)
+                        not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
                         if not_worse and better >= 1:
                             counts[a] += 1
 
-                # — Pick best (most wins), tie-break by oldest block
+                # — Pick best miner by dominance then earliest block
                 best_key, best = (-1, None), None
                 for h in hotkeys:
                     key = (counts.get(h, 0), -blocks.get(h, 0))
                     if key > best_key:
                         best_key, best = key, h
 
-                # — Prepare weights
                 weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
 
                 # — Sink snapshot
-                snap_key = f"affine/snapshots/{wallet.hotkey.ss58_address}/{window_start:08d}.json"
-                await sink(snap_key, {
+                await sink(f"affine/snapshots/{wallet.hotkey.ss58_address}/{window_start:08d}.json", {
                     "window_start": window_start,
                     "scores":       {hk: dict(scores[hk]) for hk in hotkeys},
                     "blocks":       blocks,
                     "weights":      weights,
-                    "miners":       {hk: {'uid': miner.uid, 'model': miner.model} for hk, miner in miners_map.items()}
+                    "miners":       {
+                        hk: {'uid': miner.uid, 'model': miner.model}
+                        for hk, miner in miners_map.items()
+                    }
                 })
 
-                # — Render Rich table
+                # — Render table
                 table = Table(title=f"Window {window_start}–{window_start+K}")
                 table.add_column("Miner UID", style="bold")
                 table.add_column("Block", justify="right")
@@ -493,14 +561,14 @@ def validate(coldkey: str, hotkey: str):
                 table.add_column("Weight", justify="right")
                 for hk in hotkeys:
                     miner = miners_map.get(hk)
-                    if not miner:continue
+                    if not miner: continue
                     row = [str(miner.uid), str(miner.block), miner.model]
                     for e in ENVS: row.extend([f"{scores[hk][e]:.4f}", str(ranks[e][hk])])
                     row.append(f"{weights[meta.hotkeys.index(hk)]:.2f}")
                     table.add_row(*row)
                 console.print(table)
 
-                # — Submit weights on chain
+                # — Submit weights to chain
                 await subtensor.set_weights(
                     wallet=wallet,
                     netuid=NETUID,
@@ -509,18 +577,22 @@ def validate(coldkey: str, hotkey: str):
                     wait_for_inclusion=False
                 )
 
-                # — Slide window
                 window_start += K
 
             except KeyboardInterrupt:
                 sys.exit()
             except Exception as e:
+                traceback.print_exc()
                 console.log(f"[yellow]Transient error:[/yellow] {e}. Continuing validator loop…")
                 continue
 
     asyncio.run(main())
     
     
+
+# --------------------------------------------------------------------------- #
+#                              Pull Model                                     #
+# --------------------------------------------------------------------------- #
 @cli.command("pull")
 @click.argument("uid", type=int)
 @click.option("--model_path", "-p", default = './model_path', required=True, type=click.Path(), help="Local directory to save the model")
@@ -557,6 +629,10 @@ def pull(uid: int, model_path: str, hf_token: str):
         click.echo(f"Error pulling model: {e}", err=True)
         sys.exit(1)
 
+
+# --------------------------------------------------------------------------- #
+#                              Push Model                                     #
+# --------------------------------------------------------------------------- #
 @cli.command("push")
 @click.option('--model_path',  default='./model_path', help='Local path to model artifacts.')
 @click.option('--existing-repo', default=None, help='Use an existing HF repo instead of uploading (format <user>/<repo>)')
