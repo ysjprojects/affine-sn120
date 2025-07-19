@@ -387,6 +387,8 @@ def validate(coldkey:str, hotkey:str):
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
 
+        env_instances = {name: env() for name, env in ENVS.items()}
+
         # — Initial state
         miners_map   = await miners(no_null=True, metagraph=meta)
         hotkeys      = [m.hotkey for m in miners_map.values()]
@@ -411,7 +413,7 @@ def validate(coldkey:str, hotkey:str):
             # — Collect for K blocks
             while await subtensor.get_current_block() < window_start + K:
                 blk = await subtensor.get_current_block()
-                challenges = [await env().generate() for env in ENVS.values()]
+                challenges = [await env_inst.generate() for env_inst in env_instances.values()]
                 results    = await run(challenges=challenges, miners=miners_map)
                 await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk:08d}.json",
                            [r.json() for r in results])
