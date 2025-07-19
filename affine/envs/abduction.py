@@ -4,9 +4,6 @@ from datasets import load_dataset
 from typing import Any
 import affine as af
 from ..utils.program_executor import ProgramExecutor
-import logging
-
-logger = logging.getLogger(__name__)
 
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
 
@@ -130,9 +127,9 @@ class ABDUCTION(af.BaseEnv):
                         body = await r.json()
                         return body["choices"][0]["message"]["content"]
                     else:
-                        logger.debug(f"LLM HTTP error: {r.status}")
+                        af.logger.debug(f"LLM HTTP error: {r.status}")
             except Exception as e:
-                logger.debug(f"LLM call error: {e}")
+                af.logger.debug(f"LLM call error: {e}")
         
         return ""  # fallback
     
@@ -189,7 +186,7 @@ class ABDUCTION(af.BaseEnv):
                 
                 # Validate input before running program
                 if not self._validate_input_for_program(program, generated_input):
-                    logger.debug(f"Generated input appears insufficient for program (attempt {_+1})")
+                    af.logger.debug(f"Generated input appears insufficient for program (attempt {_+1})")
                     continue
                 
                 # Run the program with generated input
@@ -202,7 +199,7 @@ class ABDUCTION(af.BaseEnv):
                         'output': output
                     }
             except Exception as e:
-                logger.debug(f"Error in challenge creation: {e}")
+                af.logger.debug(f"Error in challenge creation: {e}")
                 continue
         
         return None
@@ -212,6 +209,7 @@ class ABDUCTION(af.BaseEnv):
         # Try multiple samples until we get a valid challenge
         for _ in range(10):  # Try up to 10 samples
             sample = self._get_random_sample()
+            af.logger.info(f"Selected sample for challenge generation: {sample}")
             challenge_data = await self._create_challenge_from_sample(sample)
             
             if challenge_data:

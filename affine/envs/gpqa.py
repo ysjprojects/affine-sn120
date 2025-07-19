@@ -25,7 +25,7 @@ Provide your answer in <ANSWER></ANSWER> tags."""
             
         prompt = f"""Compare these two answers to determine if they are equivalent:
 
-Question: {question[:200]}...
+Question: {question}
 
 Reference Answer: {correct}
 Student Answer: {miner_answer}
@@ -40,20 +40,36 @@ Reply ONLY with "YES" or "NO"."""
         url = "https://llm.chutes.ai/v1/chat/completions"
         hdr = {"Authorization": f"Bearer {af.get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
         
+        # Retry parameters from main init file
+        retries = 2
+        backoff = 1
+        TERMINAL = {400, 404, 410}
+        
         async with af.aiohttp.ClientSession() as sess:
-            try:
-                async with sess.post(url, json={"model": "Qwen/Qwen2.5-72B-Instruct", "messages":[{"role":"user","content":prompt}]}, headers=hdr, timeout=600) as r:
-                    if r.status == 200:
-                        body = await r.json()
-                        llm_response = body["choices"][0]["message"]["content"]
-                        if llm_response:
-                            clean_response = llm_response.strip().upper()
-                            af.logger.debug(f"GPQA LLM response: '{clean_response}'")
-                            return "YES" in clean_response
-                    else:
-                        af.logger.debug(f"GPQA HTTP error: {r.status}")
-            except Exception as e:
-                af.logger.debug(f"GPQA LLM verify error: {e}")
+            for attempt in range(1, retries + 2):
+                try:
+                    async with sess.post(url, json={"model": "Qwen/Qwen2.5-72B-Instruct", "messages":[{"role":"user","content":prompt}]}, headers=hdr, timeout=600) as r:
+                        if r.status in TERMINAL:
+                            af.logger.debug(f"GPQA terminal error on attempt {attempt}: {r.status}")
+                            break
+                        if r.status == 200:
+                            body = await r.json()
+                            llm_response = body["choices"][0]["message"]["content"]
+                            if llm_response:
+                                clean_response = llm_response.strip().upper()
+                                af.logger.debug(f"GPQA LLM response: '{clean_response}' (attempt {attempt})")
+                                return "YES" in clean_response
+                        else:
+                            if attempt > retries:
+                                af.logger.debug(f"GPQA HTTP error: {r.status} (final attempt)")
+                            else:
+                                af.logger.debug(f"GPQA HTTP error: {r.status} (attempt {attempt}, retrying)")
+                                raise RuntimeError(f"{r.status}")
+                except Exception as e:
+                    af.logger.debug(f"GPQA LLM verify error on attempt {attempt}: {e}")
+                    if attempt > retries:
+                        break
+                    await af.asyncio.sleep(backoff * 2**(attempt-1) * (1 + af.random.uniform(-.1, .1)))
         
         correct_norm = correct.lower().strip()
         miner_norm = miner_answer.lower().strip()

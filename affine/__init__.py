@@ -345,8 +345,18 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
         async def proc(m, chal):
             resp = await _run_one(chal, m.model)
-            ev = await chal.evaluate(resp)
-            logger.trace("Evaluation done for %s: %r", m.model, ev)
+            try:
+                ev = await chal.evaluate(resp)
+                logger.trace("Evaluation done for %s: %r", m.model, ev)
+            except Exception as e:
+                logger.warning("Evaluation failed for miner %s on %s: %s", 
+                              m.uid, chal.env.name, str(e))
+                # Create fallback evaluation with zero score
+                ev = Evaluation(
+                    env=chal.env,
+                    score=0.0,
+                    extra={"error": str(e), "evaluation_failed": True}
+                )
             return Result(miner=m, challenge=chal, response=resp, evaluation=ev)
 
         tasks = [asyncio.create_task(proc(m, chal))
@@ -413,14 +423,51 @@ def validate(coldkey:str, hotkey:str):
             # — Collect for K blocks
             while await subtensor.get_current_block() < window_start + K:
                 blk = await subtensor.get_current_block()
-                challenges = [await env_inst.generate() for env_inst in env_instances.values()]
+                
+                # Generate challenges with error handling
+                challenges = []
+                failed_envs = []
+                
+                for env_name, env_inst in env_instances.items():
+                    try:
+                        challenge = await env_inst.generate()
+                        challenges.append(challenge)
+                        logger.trace("Generated challenge for %s", env_name)
+                    except Exception as e:
+                        logger.warning("Failed to generate challenge for %s: %s", env_name, str(e))
+                        failed_envs.append(env_name)
+                        # Continue without this environment's challenge
+
+                # Handle complete failure case
+                if not challenges:
+                    logger.error("All environments failed to generate challenges - assigning zero scores for this block")
+                    # Still need to update scores to avoid stale data
+                    for hk in hotkeys:
+                        for env_name in ENVS:
+                            prev = scores[hk][env_name]
+                            scores[hk][env_name] = 0.0 * (1 - alpha) + prev * alpha
+                    continue  # Skip to next validation round
+
+                # Handle partial failure case  
+                if failed_envs:
+                    logger.warning("Environments %s failed - only evaluating: %s", 
+                                   failed_envs, [c.env.name for c in challenges])
+                
                 results    = await run(challenges=challenges, miners=miners_map)
                 await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk:08d}.json",
                            [r.json() for r in results])
+                           
+                # Update scores for successful environments
                 for r in results:
                     e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
                     prev = scores[hk][e]
                     scores[hk][e] = raw * (1 - alpha) + prev * alpha
+                    
+                # Assign zero scores to failed environments
+                for failed_env in failed_envs:
+                    for hk in hotkeys:
+                        prev = scores[hk][failed_env]
+                        scores[hk][failed_env] = 0.0 * (1 - alpha) + prev * alpha
 
             # — Compute dense ranks & custom dominance counts
             ranks, counts = {}, defaultdict(int)
