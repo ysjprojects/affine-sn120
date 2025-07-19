@@ -3,7 +3,8 @@ results/
 tests/
 tmp/
 
-notebooks/
+notebooks
+notebooks/*
 modelpath/
 
 # Byte-compiled / optimized / DLL files
