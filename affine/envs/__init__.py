@@ -6,9 +6,11 @@ from pathlib import Path
 from .sat import SAT
 from .abduction import ABDUCTION
 from .math import MATH
+from .gpqa import GPQA
+from .deduction import DEDUCTION
 
 # Public re-exports
-__all__ = ["SAT", "ABDUCTION", "MATH"]
+__all__ = ["SAT", "ABDUCTION", "MATH", "GPQA", "DEDUCTION"]
 
 # Auto-import all env modules in this package
 pkg_path = str(Path(__file__).parent)
