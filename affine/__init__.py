@@ -310,6 +310,7 @@ TERMINAL = {400, 404, 410}
 
 async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=True):
     if not isinstance(challenges, list): challenges = [challenges]
+    if isinstance(miners, Miner): miners = [miners]
     if isinstance(miners, dict):  mmap = miners
     elif isinstance(miners, list) and all(hasattr(m, "uid") for m in miners):  mmap = {m.uid: m for m in miners}
     else: mmap = await miners(miners)
@@ -418,6 +419,9 @@ def validate(coldkey: str, hotkey: str):
                 for m in miners_map.values():
                     if blocks.get(m.hotkey) != m.block:
                         blocks[m.hotkey], scores[m.hotkey] = m.block, defaultdict(float)
+
+                # - Remove miners if m.chute is None or m.chute['hot'] is False
+                miners_map = {hk: m for hk, m in miners_map.items() if m.chute and m.chute.get('hot', False)}
 
                 # - Dedupe same‑model hotkeys, keeping the earliest block first.
                 # You can't submit someone elses model (there is only one Kimi2)
