@@ -377,11 +377,10 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
 from .envs.sat import SAT
 from .envs.abduction import ABDUCTION
 from .envs.deduction import DEDUCTION
-from .envs.math import MATH
 from .envs.gpqa import GPQA
 
 # Registry of active environments
-ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION, "MATH": MATH, "GPQA": GPQA}
+ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION, "GPQA": GPQA}
 
 @cli.command("validate")
 @click.option('--coldkey', default=None, help='Cold wallet name')
