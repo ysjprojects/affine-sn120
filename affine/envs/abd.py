@@ -11,7 +11,7 @@ from collections import deque
 from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
 
-MODELS = ["unsloth/gemma-3-12b-it", "Qwen/Qwen2.5-Coder-32B-Instruct", "Qwen/Qwen3-32B", "Qwen/Qwen3-30B-A3B"]
+MODELS = ["unsloth/gemma-3-12b-it", "Qwen/Qwen2.5-Coder-32B-Instruct"]
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
 
 Program:
