@@ -11,6 +11,7 @@ import tempfile
 import subprocess
 import affine as af
 from threading import Lock
+from collections import deque
 from contextlib import contextmanager
 from typing import Any, Dict, List, Tuple
 
@@ -24,6 +25,22 @@ DATASET_ROWS_ENDPOINT = (
     "dataset=PrimeIntellect%2FSYNTHETIC-2-Base-Code"
     "&config=default&split=train&offset={offset}&length=1"
 )
+
+# -------------------------------- Helpers -------------------------------- #
+def _to_str(x) -> str:
+    """
+    Canonicalise any JSON‑serialisable test‑case payload to a single
+    newline‑delimited string suitable for feeding to `stdin`.
+    """
+    if isinstance(x, str):
+        return x                     # already a single line
+    if isinstance(x, (bytes, bytearray)):
+        return x.decode()            # rare, but be safe
+    if isinstance(x, list):
+        # Recursively stringify nested lists and join with newlines
+        return "\n".join(_to_str(e) for e in x)
+    # Dicts / numbers / other scalars → JSON text
+    return json.dumps(x, ensure_ascii=False)
 
 # --------------------------------------------------------------------------- #
 #                              Program runner                                 #
@@ -155,23 +172,33 @@ async def _fetch_dataset_row(offset: int) -> Dict[str, Any] | None:
 
 
 class DEDUCTION(af.BaseEnv):
-    """
-    Verifier environment for SYNTHETIC‑2 coding challenges.
-    """
-
     def __init__(self):
         super().__init__()
         self._executor = ProgramExecutor()
+        # --- new buffer logic ---
+        self._buffer: deque[Dict[str, Any]] = deque()
+        self._buffer_size = 10
+        # ------------------------
 
-    # ----------------------------- Sampling ------------------------------ #
-
-    async def random_sample(self) -> Dict[str, Any] | None:
-        for _ in range(5):  # retry a few times in case of transient errors
+    async def _fill_buffer(self) -> None:
+        """
+        Pull rows until we have `buffer_size` in our queue.
+        Skips any failed fetches.
+        """
+        while len(self._buffer) < self._buffer_size:
             offset = random.randint(0, DATASET_SIZE - 1)
             row = await _fetch_dataset_row(offset)
-            if row:
-                return row
-        return None
+            if row is not None:
+                self._buffer.append(row)
+
+    async def random_sample(self) -> Dict[str, Any] | None:
+        """
+        Return one sample from the local buffer.
+        If empty, top up first.
+        """
+        if not self._buffer:
+            await self._fill_buffer()
+        return self._buffer.popleft() if self._buffer else None
 
     # ----------------------------- Env API -------------------------------- #
 
@@ -245,21 +272,26 @@ class DEDUCTION(af.BaseEnv):
         passed, total = 0, len(inputs)
         details: List[Dict[str, Any]] = []
 
-        for i, inp in enumerate(inputs):
-            exp = outputs[i] if outputs else None
-            af.logger.trace(f"Running test case {i+1}/{total} with input: {inp}")
+        for i, raw_inp in enumerate(inputs):
+            raw_exp = outputs[i] if outputs else None
+
+            # 👇 NEW: canonicalise
+            inp = _to_str(raw_inp)
+            if not inp.endswith("\n"):
+                inp += "\n"                  # many user programs rely on a final EOL
+            exp = _to_str(raw_exp) if raw_exp is not None else None
+
             try:
                 out, err = await loop.run_in_executor(
                     None, lambda: self._executor.execute(program, inp)
                 )
             except subprocess.TimeoutExpired:
                 out, err = "", "TIMEOUT"
-                af.logger.trace("Test case execution timed out.")
 
-            ok_run = err.strip() == ""
+            ok_run   = err.strip() == ""
             out_norm = _normalize(out)
             exp_norm = _normalize(exp) if exp is not None else None
-            correct = ok_run and (exp_norm is None or out_norm == exp_norm)
+            correct  = ok_run and (exp_norm is None or out_norm == exp_norm)
             if correct:
                 passed += 1
                 af.logger.trace(f"Test case {i+1} passed.")

@@ -504,7 +504,6 @@ ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION}
 @click.option("--hotkey", default=None, help="Hot wallet key")
 def validate(coldkey: str, hotkey: str):
     """Starts an affine validator with local‑state persistence."""
-    print( get_conf("CHUTES_API_KEY") )
     console = Console()
     coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
     hotkey  = hotkey  or get_conf("BT_WALLET_HOT", "default")
@@ -514,6 +513,9 @@ def validate(coldkey: str, hotkey: str):
         alpha = 0.90
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
+        env_instances = {
+            name: cls() for name, cls in ENVS.items()
+        }
 
         # ---- Load previous state (if any) ---------------------------------
         blocks, revisions, models, scores, last_set = _load_latest_snapshot(
@@ -544,7 +546,6 @@ def validate(coldkey: str, hotkey: str):
                         or revisions.get(m.hotkey) != m.revision
                         or models.get(m.hotkey)    != m.model
                     ):
-                        # Model, revision, *or* block changed – reset stats
                         blocks[m.hotkey]    = m.block
                         revisions[m.hotkey] = m.revision
                         models[m.hotkey]    = m.model
@@ -553,19 +554,25 @@ def validate(coldkey: str, hotkey: str):
                 hotkeys = [m.hotkey for m in miners_map.values()]
                 miners_map = {m.hotkey: m for m in miners_map.values()}
 
-                if len(miners_map) == 0:
+                if not miners_map:
                     logger.debug("No valid miners, waiting …")
                     await asyncio.sleep(10)
                     continue
 
                 # ---------------- Evaluate miners -------------------------
                 try:
-                    challenges = [await env().generate() for env in ENVS.values()]
+                    # use the pre‑instantiated envs here
+                    challenges = [
+                        await env.generate()
+                        for env in env_instances.values()
+                    ]
                     results    = await run(
                         challenges=challenges, miners=miners_map, timeout=90
                     )
                     for r in results:
-                        e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
+                        e = r.challenge.env.name
+                        hk = r.miner.hotkey
+                        raw = r.evaluation.score
                         if r.response.success:
                             scores[hk][e] = raw * (1 - alpha) + scores[hk][e] * alpha
                         logger.info(

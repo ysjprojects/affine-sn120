@@ -2,17 +2,17 @@ import os
 import re
 import sys
 import random
+import asyncio
 import tempfile
 import subprocess
 import affine as af
 from typing import Tuple
 from threading import Lock
 from typing import Any, Dict
-from urllib.parse import quote
+from collections import deque
 from contextlib import contextmanager
 
-MODELS = ["unsloth/gemma-3-12b-it", "Qwen/Qwen3-32B", "unsloth/Mistral-Nemo-Instruct-2407"]
-
+MODELS = ["unsloth/gemma-3-12b-it", "Qwen/Qwen2.5-Coder-32B-Instruct", "Qwen/Qwen3-32B", "Qwen/Qwen3-30B-A3B"]
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
 
 Program:
@@ -150,7 +150,43 @@ class ABDUCTION(af.BaseEnv):
     def __init__(self):
         super().__init__()
         self._executor = ProgramExecutor()
+        self._buffer: deque[Dict[str, Any]] = deque()
+        self._buffer_size: int = 10
         af.logger.trace("ABDUCTION environment initialized.")
+        
+    async def _fill_buffer(self) -> None:
+        """
+        Fetch up to `self._buffer_size` rows from HF and store them locally.
+        """
+        while len(self._buffer) < self._buffer_size:
+            offset = random.randint(0, max(0, 34_824 - 1))
+            rows_url = (
+                f"https://datasets-server.huggingface.co/rows?"
+                f"dataset=satpalsr/rl-python&config=default"
+                f"&split=train&offset={offset}&length=1"
+            )
+            try:
+                async with af.aiohttp.ClientSession() as sess:
+                    async with sess.get(rows_url, timeout=30) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+            except Exception:
+                continue
+
+            for r in data.get("rows", []):
+                row = r.get("row")
+                if row:
+                    self._buffer.append(row)
+                    break  # got one valid, go refill until full
+                
+    async def random_sample(self) -> Dict[str, Any] | None:
+        """
+        Return one row from the local buffer, refilling if empty.
+        """
+        if not self._buffer:
+            await self._fill_buffer()
+        return self._buffer.popleft() if self._buffer else None
         
     async def _create_challenge(
         self, program: str, example_in: str, example_out: str
@@ -188,45 +224,32 @@ class ABDUCTION(af.BaseEnv):
             extra={"program": program, "expected_output": output},
         )
 
-        
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating a new challenge.")
         while True:
-            offset = random.randint(0, max(0, 34_824 - 1))
-            af.logger.trace(f"Selected random offset: {offset}")
-            rows_url = (
-                f"https://datasets-server.huggingface.co/rows?"
-                f"dataset=satpalsr/rl-python&config=default"
-                f"&split=train&offset={offset}&length=1"
-            )
-            af.logger.trace(f"Fetching data from URL: {rows_url}")
-            async with af.aiohttp.ClientSession() as sess:
-                async with sess.get(rows_url, timeout=30) as resp:
-                    data = await resp.json()
-                    af.logger.trace(f"Received data: {str(data)[:50]}...")
-
-            rows = data.get("rows", [])
-            if not rows:
-                af.logger.trace("No rows found, continuing to next iteration.")
+            sample = await self.random_sample()
+            if sample is None:
+                af.logger.trace(f"Failed generation with null sample, continuing...")
+                await asyncio.sleep(5)
                 continue
 
-            sample = rows[0].get("row", {})
-            program = sample.get("program")
-            example_in = sample.get("inputs", "")
+            program     = sample.get("program")
+            example_in  = sample.get("inputs", "")
             example_out = sample.get("output", "")
-            af.logger.trace(f"Sampled program: {program[:50]}..., example input: {example_in}, example output: {example_out}")
+            af.logger.trace(f"Sampled program: {program[:50]}…, example in: {example_in}, example out: {example_out}")
             if not (program and example_in and example_out):
-                af.logger.trace("Incomplete sample data, continuing to next iteration.")
+                await asyncio.sleep(5)
+                af.logger.trace(f"Failed generation with null program, continuing...")
                 continue
 
-            # Try to create a valid challenge from this sample
             challenge = await self._create_challenge(program, example_in, example_out)
-            if challenge != None:
-                break
-            
-        af.logger.trace("Generated challenge successfully.")
-        return challenge
-
+            if challenge is not None:
+                af.logger.trace("Generated challenge successfully.")
+                return challenge 
+            else:
+                af.logger.trace(f"Failed generation with null challenge, continuing...")
+                await asyncio.sleep(5)
+                continue
 
     def extract_input_from_response(self, response: str) -> str:
         """Pull out the last <INPUT>…</INPUT> block."""
