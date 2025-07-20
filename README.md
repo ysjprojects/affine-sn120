@@ -33,7 +33,7 @@ cp .env.validator.example .env
 Recommended: Run the validator with docker.
 ```bash
 # Run the validator with watchtower.
-docker-compose pull && docker-compose up -d
+docker-compose pull && docker-compose up -d && docker-compose logs -f
 ```
 
 Run the validator locally
@@ -90,8 +90,8 @@ miner = await af.miners( 5 )
 chal = await af.SAT.generate() 
 
 # Generate a bunch.
-chals = await af.ABDUCTION.many( 10 )
-chals = await af.DEDUCTION.many( 10 )
+chals = await af.ABDUCTION().many( 10 )
+chals = await af.DEDUCTION().many( 10 )
 
 # Query the model directly.
 response = await af.query( chal.prompt, model = miner.model )
@@ -103,34 +103,3 @@ print( evaluation.score )
 # Query the miner and do the eval all in one go.
 results = await af.run( chals, miners )
 ```
-
-## Docker Deployment
-
-This project includes a Docker setup for running the validator in a containerized environment.
-
-### Prerequisites
-
-- Docker
-- Docker Compose
-
-### Setup
-
-1.  **Environment Variables**:
-    The service requires two environment files:
-    -   `~/.affine/config.env`: For user-specific configurations.
-    -   `.env`: For project-specific variables.
-
-    An example file, `.env.validator.example`, is provided. Copy it to `.env` and customize it as needed:
-    ```bash
-    cp .env.validator.example .env
-    ```
-
-2.  **Build and Run with Docker Compose**:
-    To build and start the `validator` and `watchtower` services, run:
-    ```bash
-    docker-compose up --build -d
-    ```
-    The `-d` flag runs the containers in detached mode.
-
-3.  **Watchtower**:
-    The `watchtower` service will automatically monitor for new versions of the `affine-validator` image and redeploy the service when an update is available. This ensures the validator is always running the latest code.

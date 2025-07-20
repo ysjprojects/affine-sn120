@@ -503,7 +503,6 @@ ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION}
 @click.option("--coldkey", default=None, help="Cold wallet name")
 @click.option("--hotkey", default=None, help="Hot wallet key")
 def validate(coldkey: str, hotkey: str):
-    """Starts an affine validator with local‑state persistence."""
     console = Console()
     coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
     hotkey  = hotkey  or get_conf("BT_WALLET_HOT", "default")
@@ -642,8 +641,8 @@ def validate(coldkey: str, hotkey: str):
                 table.add_column("Model", justify="right")
                 table.add_column("Rev", justify="right")
                 for e in ENVS:
-                    table.add_column(f"{e} Score", justify="right")
-                    table.add_column(f"{e} Rank", justify="right")
+                    table.add_column(f"{e} Score", justify="right")
+                    table.add_column(f"{e} Rank", justify="right")
                 table.add_column("Weight", justify="right")
 
                 for hk in hotkeys:

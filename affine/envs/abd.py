@@ -6,11 +6,10 @@ import asyncio
 import tempfile
 import subprocess
 import affine as af
-from typing import Tuple
 from threading import Lock
-from typing import Any, Dict
 from collections import deque
 from contextlib import contextmanager
+from typing import Any, Dict, Optional, Tuple
 
 MODELS = ["unsloth/gemma-3-12b-it", "Qwen/Qwen2.5-Coder-32B-Instruct", "Qwen/Qwen3-32B", "Qwen/Qwen3-30B-A3B"]
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
@@ -180,7 +179,7 @@ class ABDUCTION(af.BaseEnv):
                     self._buffer.append(row)
                     break  # got one valid, go refill until full
                 
-    async def random_sample(self) -> Dict[str, Any] | None:
+    async def random_sample(self) -> Optional[Dict[str, Any]]:
         """
         Return one row from the local buffer, refilling if empty.
         """
@@ -190,7 +189,7 @@ class ABDUCTION(af.BaseEnv):
         
     async def _create_challenge(
         self, program: str, example_in: str, example_out: str
-    ) -> af.Challenge:
+    ) -> Optional[af.Challenge]:
         """Use the LLM to propose a new input, validate & execute."""
         af.logger.trace("Creating challenge with program, example input, and example output.")
         prompt = INPUT_GENERATION_PROMPT.format(
