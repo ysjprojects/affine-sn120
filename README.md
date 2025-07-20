@@ -24,24 +24,22 @@ af
 
 ## Validating
 
-Before running your validator you need to make a chutes account and get your API key. 
+Set env vars.
 ```bash
-# You need a chutes API key to run the validator.
-af set CHUTES_API_KEY <your chutes API key> 
+# Copy .env and fill out items.
+cp .env.validator.example .env
 ```
 
-Optional: Add an R2 bucket to help telemetry on the network.
+Recommended: Run the validator with docker.
 ```bash
-af set R2_BUCKET_ID <r2 bucket id>
-af set R2_ACCOUNT_ID <r2 account id>
-af set R2_WRITE_ACCESS_KEY_ID <r2 write access key>
-af set R2_WRITE_SECRET_ACCESS_KEY <r2 secret access key>
+# Run the validator with watchtower.
+docker-compose pull && docker-compose up -d
 ```
 
-Run the validator.
+Run the validator locally
 ```bash
-# Start the validator with trace on.
-af -vvv validate --coldkey <your coldkey> --hotkey <your hotkey>
+# Start the validator with debug.
+af -vv validate
 ```
 
 # Mining
@@ -104,4 +102,35 @@ print( evaluation.score )
 
 # Query the miner and do the eval all in one go.
 results = await af.run( chals, miners )
-````
+```
+
+## Docker Deployment
+
+This project includes a Docker setup for running the validator in a containerized environment.
+
+### Prerequisites
+
+- Docker
+- Docker Compose
+
+### Setup
+
+1.  **Environment Variables**:
+    The service requires two environment files:
+    -   `~/.affine/config.env`: For user-specific configurations.
+    -   `.env`: For project-specific variables.
+
+    An example file, `.env.validator.example`, is provided. Copy it to `.env` and customize it as needed:
+    ```bash
+    cp .env.validator.example .env
+    ```
+
+2.  **Build and Run with Docker Compose**:
+    To build and start the `validator` and `watchtower` services, run:
+    ```bash
+    docker-compose up --build -d
+    ```
+    The `-d` flag runs the containers in detached mode.
+
+3.  **Watchtower**:
+    The `watchtower` service will automatically monitor for new versions of the `affine-validator` image and redeploy the service when an update is available. This ensures the validator is always running the latest code.

@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  validator:
+    image: thebes1618/affine-validator:latest
+    container_name: affine-validator
+    restart: unless-stopped
+    env_file:
+      - .env
+      - ~/.affine/config.env
+    volumes:
+      - ./.env:/app/.env
+      - ~/.affine/config.env:/root/.affine/config.env
+      - ~/.bittensor/wallets:/root/.bittensor/wallets
+    command: ["-vvv","validate"]
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: affine-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 30 affine-validator 

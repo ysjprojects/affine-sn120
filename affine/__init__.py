@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-
-
 # --------------------------------------------------------------------------- #
 #                             Imports                                         #
 # --------------------------------------------------------------------------- #
@@ -82,6 +80,8 @@ def cli(verbose):
 # --------------------------------------------------------------------------- #
 #                               Config                                        #
 # --------------------------------------------------------------------------- #
+LOCAL_BASE = Path.home() / ".affine"         # ~/.affine
+LOCAL_BASE.mkdir(parents=True, exist_ok=True)
 load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True)
 load_dotenv(override=True)
 def get_conf(key, default = None) -> Any:
@@ -186,51 +186,6 @@ class Result(BaseModel):
     evaluation: Evaluation
     
     
-# --------------------------------------------------------------------------- #
-#                              S3 Operations                                  #
-# --------------------------------------------------------------------------- #
-def get_client_ctx():
-    ACCOUNT  = get_conf("R2_ACCOUNT_ID")
-    KEY_ID   = get_conf("R2_WRITE_ACCESS_KEY_ID")
-    SECRET   = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
-    endpoint = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
-    cfg      = botocore.config.Config(max_pool_connections=256)
-    session = get_session()
-    return session.create_client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=KEY_ID,
-        aws_secret_access_key=SECRET,
-        config=cfg,
-    )
-
-async def _json_bytes(obj: Any) -> bytes:
-    return json.dumps(obj, default=lambda o: o.json() if hasattr(o, "json") else o).encode()
-
-async def get(key: str) -> Any:
-    async with get_client_ctx() as client:
-        bucket = get_conf("R2_BUCKET_ID")
-        resp   = await client.get_object(Bucket=bucket, Key=key)
-        body   = await resp["Body"].read()
-        ctype  = resp.get("ContentType", "")
-        if ctype == "application/json":
-            return json.loads(body.decode("utf-8"))
-        return body
-
-async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    try:
-        async with get_client_ctx() as client:
-            bucket = get_conf("R2_BUCKET_ID")
-            body   = await _json_bytes(obj) if content_type == "application/json" else obj
-            await client.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=body,
-                ContentType=content_type
-            )
-    except Exception:
-        logger.error("Unexpected error writing to R2", exc_info=True)
-        raise
 
 # --------------------------------------------------------------------------- #
 #                               API                                           #
@@ -266,68 +221,6 @@ def _extract_revision(code: str) -> Optional[str]:
     m = re.search(r"--revision\s+([0-9a-f]{40})", code)
     return m.group(1) if m else None
 
-async def miners(
-    uids: Optional[Union[int, List[int]]] = None,
-    no_null: bool = False,
-    netuid: int = NETUID,
-    min_block: int = 0,
-    metagraph: object = None,
-) -> Dict[int, Miner]:
-    # Preamble
-    subtensor = await get_subtensor()
-    metagraph = metagraph or await subtensor.metagraph(netuid)
-    hotkeys = metagraph.hotkeys
-    revs = await subtensor.get_all_revealed_commitments(netuid)
-    if uids is None:uids = list(range(len(hotkeys)))
-    elif isinstance(uids, int): uids = [uids]
-
-    # Single async fetch,
-    async def fetch(uid: int) -> Optional[Miner]:
-        # Check exists.
-        if not (0 <= uid < len(hotkeys)): return None
-
-        hk = hotkeys[uid]
-        commits = revs.get(hk) or []
-        if not commits: return None
-
-        # Check revision.
-        block, data = commits[-1]
-        rev = None
-        if isinstance(data, str) and data.strip().startswith("{"):
-            try:
-                parsed = json.loads(data)
-                data, rev = parsed.get("model"), parsed.get("revision")
-            except json.JSONDecodeError:
-                pass
-
-        # Filer non block.
-        model = data
-        if no_null and (block is None or model is None or block < min_block): return None
-
-        # fetch chute info
-        chute = await get_chute(str(model))
-        if chute:
-            rev = chute.get("revision") or rev
-            if rev is None and (cid := chute.get("id") or chute.get("uuid")):
-                code = await get_chute_code(cid)
-                rev = _extract_revision(code or "")
-        else:
-            code = await get_chute_code(str(model))
-            rev = _extract_revision(code or "")
-
-        if no_null and chute is None: return None
-        miner = Miner(
-            uid=uid,
-            hotkey=hk,
-            model=str(model),
-            revision=rev,
-            block=int(block),
-            chute=chute,
-        )
-        return miner
-    results = await asyncio.gather(*(fetch(uid) for uid in uids))
-    output = {uid: m for uid, m in zip(uids, results) if m is not None}
-    return output
 
 
 # ── run challenges ────────────────────────────────────────────────────────────
@@ -422,6 +315,181 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
     return results
 
 
+
+# --------------------------------------------------------------------------- #
+#                              Miner                                          #
+# --------------------------------------------------------------------------- #
+async def miners(
+    uids: Optional[Union[int, List[int]]] = None,
+    no_null: bool = False,
+    netuid: int = NETUID,
+    min_block: int = 0,
+    metagraph: object = None,
+) -> Dict[int, Miner]:
+    # Preamble
+    subtensor = await get_subtensor()
+    metagraph = metagraph or await subtensor.metagraph(netuid)
+    hotkeys = metagraph.hotkeys
+    revs = await subtensor.get_all_revealed_commitments(netuid)
+    if uids is None:uids = list(range(len(hotkeys)))
+    elif isinstance(uids, int): uids = [uids]
+
+    # Single async fetch,
+    async def fetch(uid: int) -> Optional[Miner]:
+        # Check exists.
+        if not (0 <= uid < len(hotkeys)): return None
+
+        hk = hotkeys[uid]
+        commits = revs.get(hk) or []
+        if not commits: return None
+
+        # Check revision.
+        block, data = commits[-1]
+        rev = None
+        if isinstance(data, str) and data.strip().startswith("{"):
+            try:
+                parsed = json.loads(data)
+                data, rev = parsed.get("model"), parsed.get("revision")
+            except json.JSONDecodeError:
+                pass
+
+        # Filer non block.
+        model = data
+        if no_null and (block is None or model is None or block < min_block): return None
+
+        # fetch chute info
+        chute = await get_chute(str(model))
+        if chute:
+            rev = chute.get("revision") or rev
+            if rev is None and (cid := chute.get("id") or chute.get("uuid")):
+                code = await get_chute_code(cid)
+                rev = _extract_revision(code or "")
+        else:
+            code = await get_chute_code(str(model))
+            rev = _extract_revision(code or "")
+
+        if no_null and chute is None: return None
+        miner = Miner(
+            uid=uid,
+            hotkey=hk,
+            model=str(model),
+            revision=rev,
+            block=int(block),
+            chute=chute,
+        )
+        return miner
+    results = await asyncio.gather(*(fetch(uid) for uid in uids))
+    output = {uid: m for uid, m in zip(uids, results) if m is not None}
+    return output
+
+
+# --------------------------------------------------------------------------- #
+#                              S3 Operations                                  #
+# --------------------------------------------------------------------------- #
+
+def _local_path(key: str) -> Path:
+    """
+    Map every remote key such as
+        'affine/snapshots/<addr>/<blk>.json'
+    to a local file under ~/.affine/…
+    """
+    p = LOCAL_BASE / key
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+def get_client_ctx():
+    ACCOUNT = get_conf("R2_ACCOUNT_ID")
+    KEY_ID  = get_conf("R2_WRITE_ACCESS_KEY_ID")
+    SECRET  = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
+    endpoint = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
+    cfg      = botocore.config.Config(max_pool_connections=256)
+    session  = get_session()
+    return session.create_client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=KEY_ID,
+        aws_secret_access_key=SECRET,
+        config=cfg,
+    )
+
+
+async def _json_bytes(obj: Any) -> bytes:
+    return json.dumps(
+        obj, default=lambda o: o.json() if hasattr(o, "json") else o
+    ).encode("utf-8")
+    
+
+async def get(key: str) -> Any:
+    async with get_client_ctx() as client:
+        bucket = get_conf("R2_BUCKET_ID")
+        resp   = await client.get_object(Bucket=bucket, Key=key)
+        body   = await resp["Body"].read()
+        ctype  = resp.get("ContentType", "")
+        if ctype == "application/json":
+            return json.loads(body.decode("utf-8"))
+        return body
+
+async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
+    """
+    Write *once* to R2 (best‑effort) and *always* to ~/.affine/…
+    Failure in either path is logged but never aborts the caller.
+    """
+    # Prepare body only once
+    if content_type == "application/json":
+        body = await _json_bytes(obj)
+    else:
+        body = obj if isinstance(obj, (bytes, bytearray)) else bytes(obj)
+
+    # ---- Remote write (best‑effort) ---------------------------------------
+    try:
+        async with get_client_ctx() as client:
+            bucket = get_conf("R2_BUCKET_ID")
+            await client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=body,
+                ContentType=content_type,
+            )
+    except Exception:
+        logger.error("Unexpected error writing to R2", exc_info=True)
+
+    # ---- Local write (must succeed unless fatal) --------------------------
+    try:
+        lp = _local_path(key)
+        await asyncio.to_thread(lp.write_bytes, body)
+    except Exception:
+        logger.error("Unexpected error writing to ~/.affine", exc_info=True)
+
+# --------------------------------------------------------------------------- #
+#                           Snapshot load on startup                          #
+# --------------------------------------------------------------------------- #
+def _load_latest_snapshot(wallet_ss58: str):
+    """
+    Returns tuple:
+        blocks, revisions, models, scores, last_set
+    If no snapshot is found everything is initialised empty.
+    """
+    snap_dir = LOCAL_BASE / "affine" / "snapshots" / wallet_ss58
+    if not snap_dir.exists():
+        return {}, {}, {}, {}, -1
+
+    latest = max(snap_dir.glob("*.json"), default=None)
+    if latest is None:
+        return {}, {}, {}, {}, -1
+
+    with latest.open("r") as fh:
+        data = json.load(fh)
+
+    blocks     = data.get("blocks", {})
+    revisions  = data.get("revisions", {})
+    models     = data.get("models", {})
+    scores_raw = data.get("scores", {})
+    scores     = {
+        hk: defaultdict(float, sc) for hk, sc in scores_raw.items()
+    }
+    last_set   = data.get("blk", -1)
+    return blocks, revisions, models, scores, last_set
+
 # --------------------------------------------------------------------------- #
 #                               Validator                                     #
 # --------------------------------------------------------------------------- #
@@ -431,82 +499,101 @@ from .envs.ded import DEDUCTION
 
 # Registry of active environments
 ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION}
-
 @cli.command("validate")
-@click.option('--coldkey', default=None, help='Cold wallet name')
-@click.option('--hotkey', default=None, help='Hot wallet key')
+@click.option("--coldkey", default=None, help="Cold wallet name")
+@click.option("--hotkey", default=None, help="Hot wallet key")
 def validate(coldkey: str, hotkey: str):
-    """Starts an affine validator"""
+    """Starts an affine validator with local‑state persistence."""
+    print( get_conf("CHUTES_API_KEY") )
     console = Console()
     coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
-    hotkey = hotkey or get_conf("BT_WALLET_HOT", "default")
-    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
+    hotkey  = hotkey  or get_conf("BT_WALLET_HOT", "default")
+    wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
 
     async def main():
-        alpha = 0.999
+        alpha = 0.90
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
 
-        # — Initial state
-        last_set     =  -1
-        miners_map   = await miners(no_null=True, metagraph=meta)
-        blocks       = {m.hotkey: m.block for m in miners_map.values()}
-        scores       = {m.hotkey: defaultdict(float) for m in miners_map.values()}
+        # ---- Load previous state (if any) ---------------------------------
+        blocks, revisions, models, scores, last_set = _load_latest_snapshot(
+            wallet.hotkey.ss58_address
+        )
+
+        # ---- Pull initial list of miners ----------------------------------
+        miners_map = await miners(no_null=True, metagraph=meta)
+
+        # Ensure every current miner has entries, even if snapshot empty
+        for m in miners_map.values():
+            blocks.setdefault(m.hotkey, m.block)
+            revisions.setdefault(m.hotkey, m.revision)
+            models.setdefault(m.hotkey, m.model)
+            scores.setdefault(m.hotkey, defaultdict(float))
 
         while True:
             try:
-                # — Refresh miners and metagraph state.
-                # Pulls new commits from the chain and gets the latest metagraph info.
+                # ---- Refresh chain state & miner list ---------------------
                 blk        = await subtensor.get_current_block()
                 meta       = await subtensor.metagraph(NETUID)
                 miners_map = await miners(no_null=True, metagraph=meta)
-                
-                # - Reset any new/updated miners’ blocks & scores
-                # If you block is increased we zero your score (you need to build it back again.)
+
+                # ---------------- Reset logic -----------------------------
                 for m in miners_map.values():
-                    if blocks.get(m.hotkey) != m.block:
-                        blocks[m.hotkey], scores[m.hotkey] = m.block, defaultdict(float)
-                hotkeys = [ m.hotkey for m in miners_map.values() ]
-                miners_map = { m.hotkey: m for m in miners_map.values() }
-                if len(miners_map.values()) == 0:
-                    logger.debug('no valid miners, waiting...')
+                    if (
+                        blocks.get(m.hotkey)   != m.block
+                        or revisions.get(m.hotkey) != m.revision
+                        or models.get(m.hotkey)    != m.model
+                    ):
+                        # Model, revision, *or* block changed – reset stats
+                        blocks[m.hotkey]    = m.block
+                        revisions[m.hotkey] = m.revision
+                        models[m.hotkey]    = m.model
+                        scores[m.hotkey]    = defaultdict(float)
+
+                hotkeys = [m.hotkey for m in miners_map.values()]
+                miners_map = {m.hotkey: m for m in miners_map.values()}
+
+                if len(miners_map) == 0:
+                    logger.debug("No valid miners, waiting …")
                     await asyncio.sleep(10)
                     continue
-               
-                # — Collect scores on environments.
+
+                # ---------------- Evaluate miners -------------------------
                 try:
                     challenges = [await env().generate() for env in ENVS.values()]
-                    results    = await run(challenges=challenges, miners=miners_map, timeout=90)
+                    results    = await run(
+                        challenges=challenges, miners=miners_map, timeout=90
+                    )
                     for r in results:
-                        # Only update moving average for successful responses.
-                        e, hk, raw, resp = r.challenge.env.name, r.miner.hotkey, r.evaluation.score, r.response.response
+                        e, hk, raw = r.challenge.env.name, r.miner.hotkey, r.evaluation.score
                         if r.response.success:
                             scores[hk][e] = raw * (1 - alpha) + scores[hk][e] * alpha
                         logger.info(
                             f"Environment: {e}, "
                             f"Miner: {hk[:10]}, "
                             f"Model: {r.miner.model}, "
-                            f"Score: {raw}, "
-                            f"Current: {scores[hk][e]}, "
-                            f"Response: {resp[:10] if resp != None else 'Empty'}, "
-                            f"Success: {r.response.success} "
+                            f"Score: {raw:.4f}, "
+                            f"Current: {scores[hk][e]:.4f}, "
+                            f"Success: {r.response.success}"
                         )
                 except Exception as e:
-                    # Error in evals.
                     traceback.print_exc()
                     logger.info(f"[yellow]Transient error during eval:[/yellow] {e}. Continuing validator loop…")
                     continue
-                # Sink all results.
-                await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk}.json", [r.json() for r in results])
 
-                # — Compute dense ranks & dominance
+                # ---- Persist raw results ---------------------------------
+                await sink(
+                    f"affine/results/{wallet.hotkey.ss58_address}/{blk}.json",
+                    [r.json() for r in results],
+                )
+
+                # ---------------- Rank & dominance ------------------------
                 ranks, counts = {}, defaultdict(int)
                 for e in ENVS:
                     uniq = sorted({scores[h][e] for h in hotkeys}, reverse=True)
                     rank_of = {score: i + 1 for i, score in enumerate(uniq)}
                     ranks[e] = {h: rank_of[scores[h][e]] for h in hotkeys}
 
-                # - Compute dominance counts.
                 for a in hotkeys:
                     for b in hotkeys:
                         if a == b:
@@ -516,7 +603,6 @@ def validate(coldkey: str, hotkey: str):
                         if not_worse and better >= 1:
                             counts[a] += 1
 
-                # — Pick best miner by dominance then earliest block
                 best_key, best = (-1, None), None
                 for h in hotkeys:
                     key = (counts.get(h, 0), -blocks.get(h, 0))
@@ -525,50 +611,63 @@ def validate(coldkey: str, hotkey: str):
 
                 weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
 
-                # — Sink snapshot
-                await sink(f"affine/snapshots/{wallet.hotkey.ss58_address}/{blk:08d}.json", {
-                    "blk": blk,
-                    "scores":       {hk: dict(scores[hk]) for hk in hotkeys},
-                    "blocks":       blocks,
-                    "weights":      weights,
-                    "miners":       {
-                        hk: {'uid': miner.uid, 'model': miner.model}
-                        for hk, miner in miners_map.items()
-                    }
-                })
+                # ---- Persist snapshot (remote + local) -------------------
+                await sink(
+                    f"affine/snapshots/{wallet.hotkey.ss58_address}/{blk:08d}.json",
+                    {
+                        "blk":        blk,
+                        "scores":     {hk: dict(scores[hk]) for hk in hotkeys},
+                        "blocks":     blocks,
+                        "revisions":  revisions,
+                        "models":     models,
+                        "weights":    weights,
+                        "miners": {
+                            hk: {"uid": miner.uid, "model": miner.model, "revision": miner.revision}
+                            for hk, miner in miners_map.items()
+                        },
+                    },
+                )
 
-                # — Render table
-                table = Table(title=f"Block {blk}")
-                table.add_column("Miner UID", style="bold")
+                # ---- Render live table -----------------------------------
+                table = Table(title=f"Block {blk}")
+                table.add_column("UID", style="bold")
                 table.add_column("Block", justify="right")
                 table.add_column("Model", justify="right")
+                table.add_column("Rev", justify="right")
                 for e in ENVS:
-                    table.add_column(f"{e} Score", justify="right")
-                    table.add_column(f"{e} Rank", justify="right")
+                    table.add_column(f"{e} Score", justify="right")
+                    table.add_column(f"{e} Rank", justify="right")
                 table.add_column("Weight", justify="right")
+
                 for hk in hotkeys:
                     miner = miners_map.get(hk)
-                    if not miner: continue
-                    row = [str(miner.uid), str(miner.block), miner.model]
-                    for e in ENVS: row.extend([f"{scores[hk][e]:.4f}", str(ranks[e][hk])])
+                    if not miner:
+                        continue
+                    row = [
+                        str(miner.uid),
+                        str(miner.block),
+                        miner.model,
+                        str(miner.revision),
+                    ]
+                    for e in ENVS:
+                        row.extend([f"{scores[hk][e]:.4f}", str(ranks[e][hk])])
                     row.append(f"{weights[meta.hotkeys.index(hk)]:.2f}")
                     table.add_row(*row)
                 console.print(table)
 
-                # — Submit weights to chain
-                if blk - last_set > 100: 
+                # ---- Submit weights periodically -------------------------
+                if blk - last_set > 100:
                     await subtensor.set_weights(
                         wallet=wallet,
                         netuid=NETUID,
                         uids=meta.uids,
                         weights=weights,
-                        wait_for_inclusion=False
+                        wait_for_inclusion=False,
                     )
                     last_set = blk
 
-
             except KeyboardInterrupt:
-                sys.exit()
+                sys.exit(0)
             except Exception as e:
                 traceback.print_exc()
                 console.log(f"[yellow]Transient error:[/yellow] {e}. Continuing validator loop…")
