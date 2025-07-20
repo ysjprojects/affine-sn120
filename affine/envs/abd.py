@@ -11,6 +11,8 @@ from typing import Any, Dict
 from urllib.parse import quote
 from contextlib import contextmanager
 
+MODELS = ["unsloth/gemma-3-12b-it", "Qwen/Qwen3-32B", "unsloth/Mistral-Nemo-Instruct-2407"]
+
 PROMPT_TEMPLATE = """You are a programming expert. Given a Python program and its expected output, you need to determine the exact input that would produce this output.
 
 Program:
@@ -161,9 +163,10 @@ class ABDUCTION(af.BaseEnv):
             example_output=example_out
         )
         af.logger.trace(f"Generated prompt for LLM: {prompt[:10]}...")
-        llm_resp = (await af.query(prompt)).response
+        resp = await af.query(prompt, model=random.choice( MODELS ))
+        llm_resp = resp.response
         if not llm_resp:
-            af.logger.trace("No response from LLM, continuing to next iteration.")
+            af.logger.trace(f"No response from LLM error: {resp.error}, continuing to next iteration.")
             return None
 
         gen_input = self.extract_input_from_response(llm_resp)

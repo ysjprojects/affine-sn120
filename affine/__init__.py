@@ -227,7 +227,7 @@ def _extract_revision(code: str) -> Optional[str]:
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
 
-async def query(prompt:str, model:str = "unsloth/gemma-3-27b-it", timeout=120, retries=0, backoff=1) -> Response:
+async def query(prompt:str, model:str = "unsloth/gemma-3-12b-it", timeout=120, retries=0, backoff=1) -> Response:
     url = "https://llm.chutes.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}",
