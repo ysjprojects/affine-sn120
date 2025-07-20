@@ -3,6 +3,7 @@ version: '3.8'
 services:
   validator:
     image: thebes1618/affine-validator:latest
+    pull_policy: always
     container_name: affine-validator
     restart: unless-stopped
     env_file:
@@ -16,6 +17,7 @@ services:
 
   watchtower:
     image: containrrr/watchtower
+    pull_policy: always
     container_name: affine-watchtower
     restart: unless-stopped
     volumes:
