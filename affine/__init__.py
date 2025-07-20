@@ -339,7 +339,7 @@ async def miners(
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
 
-async def query(prompt:str, model:str = "unsloth/gemma-3-27b-it", timeout=120, retries=0, backoff=1):
+async def query(prompt:str, model:str = "unsloth/gemma-3-27b-it", timeout=120, retries=0, backoff=1) -> Response:
     url = "https://llm.chutes.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}",
@@ -392,7 +392,7 @@ async def query(prompt:str, model:str = "unsloth/gemma-3-27b-it", timeout=120, r
                 await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
 
 
-async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=True):
+async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=True) -> List[Result]:
     if not isinstance(challenges, list): challenges = [challenges]
     if isinstance(miners, Miner): miners = [miners]
     if isinstance(miners, dict):  mmap = miners
@@ -448,20 +448,21 @@ def validate(coldkey: str, hotkey: str):
     wallet = bt.wallet(name=coldkey, hotkey=hotkey)
 
     async def main():
-        K, alpha = 10, 0.999
+        alpha = 0.999
         subtensor = await get_subtensor()
         meta      = await subtensor.metagraph(NETUID)
 
         # — Initial state
+        last_set     =  -1
         miners_map   = await miners(no_null=True, metagraph=meta)
         blocks       = {m.hotkey: m.block for m in miners_map.values()}
         scores       = {m.hotkey: defaultdict(float) for m in miners_map.values()}
-        window_start = await subtensor.get_current_block()
 
         while True:
             try:
                 # — Refresh miners and metagraph state.
                 # Pulls new commits from the chain and gets the latest metagraph info.
+                blk        = await subtensor.get_current_block()
                 meta       = await subtensor.metagraph(NETUID)
                 miners_map = await miners(no_null=True, metagraph=meta)
                 
@@ -477,40 +478,31 @@ def validate(coldkey: str, hotkey: str):
                     await asyncio.sleep(10)
                     continue
                
-                # — Collect scores for K blocks
-                blk = await subtensor.get_current_block()
-                all_results = []
-                while blk < window_start + K:
-                    try:
-                        challenges = [await env().generate() for env in ENVS.values()]
-                        results    = await run(challenges=challenges, miners=miners_map, timeout=90)
-                        all_results.extend( results )
-                        for r in results:
-                            # Only update moving average for successful responses.
-                            e, hk, raw, resp = r.challenge.env.name, r.miner.hotkey, r.evaluation.score, r.response.response
-                            if r.response.success:
-                                scores[hk][e] = raw * (1 - alpha) + scores[hk][e] * alpha
-                            logger.info(
-                                f"Environment: {e}, "
-                                f"Miner: {hk[:10]}, "
-                                f"Model: {r.miner.model}, "
-                                f"Score: {raw}, "
-                                f"Current: {scores[hk][e]}, "
-                                f"Response: {resp[:10] if resp != None else 'Empty'}, "
-                                f"Success: {r.response.success} "
-                            )
-                    except Exception as e:
-                        # Error in evals.
-                        traceback.print_exc()
-                        logger.info(f"[yellow]Transient error during eval:[/yellow] {e}. Continuing validator loop…")
-                        continue
-                    finally:
-                        # Update block.
-                        blk = await subtensor.get_current_block()
-                        break
+                # — Collect scores on environments.
+                try:
+                    challenges = [await env().generate() for env in ENVS.values()]
+                    results    = await run(challenges=challenges, miners=miners_map, timeout=90)
+                    for r in results:
+                        # Only update moving average for successful responses.
+                        e, hk, raw, resp = r.challenge.env.name, r.miner.hotkey, r.evaluation.score, r.response.response
+                        if r.response.success:
+                            scores[hk][e] = raw * (1 - alpha) + scores[hk][e] * alpha
+                        logger.info(
+                            f"Environment: {e}, "
+                            f"Miner: {hk[:10]}, "
+                            f"Model: {r.miner.model}, "
+                            f"Score: {raw}, "
+                            f"Current: {scores[hk][e]}, "
+                            f"Response: {resp[:10] if resp != None else 'Empty'}, "
+                            f"Success: {r.response.success} "
+                        )
+                except Exception as e:
+                    # Error in evals.
+                    traceback.print_exc()
+                    logger.info(f"[yellow]Transient error during eval:[/yellow] {e}. Continuing validator loop…")
+                    continue
                 # Sink all results.
-                await sink(f"affine/results/{wallet.hotkey.ss58_address}/{window_start}.json", [r.json() for r in results])
-
+                await sink(f"affine/results/{wallet.hotkey.ss58_address}/{blk}.json", [r.json() for r in results])
 
                 # — Compute dense ranks & dominance
                 ranks, counts = {}, defaultdict(int)
@@ -539,8 +531,8 @@ def validate(coldkey: str, hotkey: str):
                 weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
 
                 # — Sink snapshot
-                await sink(f"affine/snapshots/{wallet.hotkey.ss58_address}/{window_start:08d}.json", {
-                    "window_start": window_start,
+                await sink(f"affine/snapshots/{wallet.hotkey.ss58_address}/{blk:08d}.json", {
+                    "blk": blk,
                     "scores":       {hk: dict(scores[hk]) for hk in hotkeys},
                     "blocks":       blocks,
                     "weights":      weights,
@@ -551,7 +543,7 @@ def validate(coldkey: str, hotkey: str):
                 })
 
                 # — Render table
-                table = Table(title=f"Window {window_start}–{window_start+K}")
+                table = Table(title=f"Block {blk}")
                 table.add_column("Miner UID", style="bold")
                 table.add_column("Block", justify="right")
                 table.add_column("Model", justify="right")
@@ -569,15 +561,16 @@ def validate(coldkey: str, hotkey: str):
                 console.print(table)
 
                 # — Submit weights to chain
-                await subtensor.set_weights(
-                    wallet=wallet,
-                    netuid=NETUID,
-                    uids=meta.uids,
-                    weights=weights,
-                    wait_for_inclusion=False
-                )
+                if blk - last_set > 100: 
+                    await subtensor.set_weights(
+                        wallet=wallet,
+                        netuid=NETUID,
+                        uids=meta.uids,
+                        weights=weights,
+                        wait_for_inclusion=False
+                    )
+                    last_set = blk
 
-                window_start += K
 
             except KeyboardInterrupt:
                 sys.exit()
