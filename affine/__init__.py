@@ -675,7 +675,7 @@ def validate(coldkey: str, hotkey: str):
 
     asyncio.run(main())
     
-    
+
 
 # --------------------------------------------------------------------------- #
 #                              Pull Model                                     #

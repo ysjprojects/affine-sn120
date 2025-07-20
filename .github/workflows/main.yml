@@ -22,6 +22,6 @@ jobs:
         uses: docker/build-push-action@v4
         with:
           context: .
-          dockerfile: validator.Dockerfile
+          file: validator.Dockerfile
           push: true
           tags: thebes1618/affine-validator:latest,thebes1618/affine-validator:${{ github.sha }} 
