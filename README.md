@@ -91,9 +91,17 @@ miner = await af.miners( 5 )
 # Generate a SAT challenge
 chal = await af.SAT.generate() 
 
-# Generate a bunch (ABD = abduction, DED = deduction, SAT = satisfiability)
-chals = await af.ABD.many( 10 )
+# Generate a bunch.
+chals = await af.ABDUCTION.many( 10 )
+chals = await af.DEDUCTION.many( 10 )
 
-# Query a set of miners (or one) on a challenge.
+# Query the model directly.
+response = await af.query( chal.prompt, model = miner.model )
+
+# Evaluate the response
+evaluation = chal.evaluate( response ) 
+print( evaluation.score )
+
+# Query the miner and do the eval all in one go.
 results = await af.run( chals, miners )
 ````
