@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import random
 import re
-import subprocess
 import sys
-import tempfile
-from contextlib import contextmanager
-from threading import Lock
-from typing import Any, Dict, List, Tuple
-
+import json
+import random
 import aiohttp
+import asyncio
+import tempfile
+import subprocess
 import affine as af
+from threading import Lock
+from contextlib import contextmanager
+from typing import Any, Dict, List, Tuple
 
 # --------------------------------------------------------------------------- #
 #                         Tunables and constants                              #

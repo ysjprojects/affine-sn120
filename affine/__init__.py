@@ -5,12 +5,9 @@
 #                             Imports                                         #
 # --------------------------------------------------------------------------- #
 import os
-import io
 import sys
 import json
 import time
-import math
-import types 
 import click
 import random
 import aiohttp
@@ -19,7 +16,6 @@ import logging
 import textwrap
 import botocore
 import traceback
-import numpy as np
 import bittensor as bt
 import botocore.config
 from pathlib import Path
@@ -32,7 +28,6 @@ from abc import ABC, abstractmethod
 from alive_progress import alive_bar
 from pydantic import BaseModel, Field
 from aiobotocore.session import get_session
-from botocore.exceptions import ClientError
 from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
