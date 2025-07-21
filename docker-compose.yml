@@ -13,7 +13,7 @@ services:
       - ./.env:/app/.env
       - ~/.affine/config.env:/root/.affine/config.env
       - ~/.bittensor/wallets:/root/.bittensor/wallets
-    command: ["-vvv","validate"]
+    command: ["-vv","validate"]
 
   watchtower:
     image: containrrr/watchtower

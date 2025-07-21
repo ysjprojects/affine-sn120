@@ -47,15 +47,16 @@ class DEDUCTION(af.BaseEnv):
         super().__init__()
         self._executor = af.utils.ProgramExecutor()
         self._data = af.utils.BufferedDataset(
-            dataset_name="PrimeIntellect%2FSYNTHETIC-2-Base-Code",
+            dataset_name="PrimeIntellect/SYNTHETIC-2-Base-Code",
             total_size=57_300,
+            buffer_size=5,
+            max_batch=5,
         )
 
     # ----------------------------- Env API -------------------------------- #
-
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating new SYNTHETIC‑2 coding challenge")
-        sample = await self.random_sample()
+        sample = await self._data.get()
         if sample is None:
             raise RuntimeError("Failed to fetch dataset row")
 

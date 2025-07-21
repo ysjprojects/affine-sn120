@@ -66,8 +66,7 @@ class BufferedDataset:
     async def _fill_buffer(self) -> None:
         af.logger.debug("Starting buffer fill")
         while len(self._buffer) < self.buffer_size:
-            need  = self.buffer_size - len(self._buffer)
-            batch = min(need, self.max_batch)
+            batch = self.max_batch
             offset = self._rng.randint(0, max(0, self.total_size - batch))
             try:
                 rows = await self.fetch_hf(offset, batch)

@@ -77,8 +77,46 @@ class ABDUCTION(af.BaseEnv):
         self._data = af.utils.BufferedDataset(
             dataset_name="satpalsr/rl-python",
             total_size=20_000,
+            buffer_size=5,
+            max_batch=5,
         )
         af.logger.trace("ABDUCTION environment initialized.")
+        
+    async def _create_challenge(
+        self, program: str, example_in: str, example_out: str
+    ) -> Optional[af.Challenge]:
+        """Use the LLM to propose a new input, validate & execute."""
+        af.logger.trace("Creating challenge with program, example input, and example output.")
+        prompt = INPUT_GENERATION_PROMPT.format(
+            program=program,
+            example_input=example_in,
+            example_output=example_out
+        )
+        af.logger.trace(f"Generated prompt for LLM: {prompt[:10]}...")
+        resp = await af.query(prompt, model=random.choice( MODELS ))
+        llm_resp = resp.response
+        if not llm_resp:
+            af.logger.trace(f"No response from LLM error: {resp.error}, continuing to next iteration.")
+            return None
+
+        gen_input = self.extract_input_from_response(llm_resp)
+        af.logger.trace(f"Extracted input from LLM response: {gen_input}")
+        if not self._validate_input_for_program(program, gen_input):
+            af.logger.trace("Generated input insufficient, retrying")
+            return None
+
+        output, error = self._executor.execute(program, gen_input)
+        af.logger.trace(f"Executed program with generated input. Output: {output}, Error: {error}, program: {program}")
+        if error or not output.strip():
+            af.logger.trace("Generated input contains error")
+            return None            
+
+        af.logger.trace("Challenge created successfully.")
+        return af.Challenge(
+            env=self,
+            prompt=PROMPT_TEMPLATE.format(program=program, output=output),
+            extra={"program": program, "expected_output": output},
+        )
 
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating a new challenge.")
@@ -98,8 +136,6 @@ class ABDUCTION(af.BaseEnv):
 
     def extract_input_from_response(self, response: str) -> str:
         """Pull out the last <INPUT>…</INPUT> block."""
-        af.logger.trace(f"Extracting input from response: {response[:50]}...")
-        # strip any think tags
         response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
         response = re.sub(r"<thinking>.*?</thinking>", "", response, flags=re.DOTALL)
         matches = re.findall(r"<INPUT>(.*?)</INPUT>", response, re.IGNORECASE | re.DOTALL)
@@ -110,12 +146,10 @@ class ABDUCTION(af.BaseEnv):
         while lines and not lines[-1].strip():
             lines.pop()
         extracted_input = "\n".join(lines)
-        af.logger.trace(f"Extracted input: {extracted_input}")
         return extracted_input
 
     def _validate_input_for_program(self, program: str, inp: str) -> bool:
         """Heuristic: ensure at least as many lines as input() calls."""
-        af.logger.trace(f"Validating input for program. Program: {program[:50]}..., Input: {inp}")
         calls = program.count("input()")
         lines = inp.splitlines() if inp else []
         if "for _ in range(int(input()))" in program and lines and lines[0].isdigit():
@@ -123,7 +157,6 @@ class ABDUCTION(af.BaseEnv):
             af.logger.trace(f"Validation result for loop-based input: {valid}")
             return valid
         valid = len(lines) >= calls
-        af.logger.trace(f"Validation result: {valid}")
         return valid
 
     def compare_outputs(self, expected: str, actual: str) -> bool:
@@ -152,7 +185,7 @@ class ABDUCTION(af.BaseEnv):
                 env=self, score=0.0,
                 extra={"error": "No input found", "expected_output": expected}
             )
-        out, err = self._executor.execute_program(prog, gen_in)
+        out, err = self._executor.execute(prog, gen_in)
         af.logger.trace(f"Executed program with generated input. Output: {out}, Error: {err}")
         if err:
             af.logger.trace("Error occurred during program execution.")

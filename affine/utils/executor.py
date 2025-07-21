@@ -1,4 +1,3 @@
-    
 from __future__ import annotations
 
 import os
@@ -14,34 +13,29 @@ from typing import List, Tuple, Optional
 
 try:
     import resource  # POSIX only
-except ImportError:  # pragma: no cover
+except ImportError:
     resource = None  # type: ignore
 
 # --------------------------------------------------------------------------- #
 #                              Configuration                                  #
 # --------------------------------------------------------------------------- #
-DEFAULT_TIMEOUT_SEC   = 30          # wall‑clock limit
-CPU_TIME_SEC          = 10          # hard CPU seconds (POSIX only)
-MEM_LIMIT_BYTES       = 512 * 2**20 # 512 MiB address‑space cap
-MAX_OUTPUT_BYTES      = 1_000_000   # 1 MB per stream before truncation
+DEFAULT_TIMEOUT_SEC   = 30           # wall‑clock limit
+CPU_TIME_SEC          = 10           # hard CPU seconds (POSIX only)
+MEM_LIMIT_BYTES       = 512 * 2**20  # 512 MiB
+MAX_OUTPUT_BYTES      = 1_000_000    # 1 MB per stream before truncation
 _FENCE_RE  = re.compile(r"```(?:python)?\s*([\s\S]*?)```", re.IGNORECASE)
 _HAS_MAIN  = re.compile(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]')
 
-# --------------------------------------------------------------------------- #
-#                       Safe / Unified Program Executor                       #
-# --------------------------------------------------------------------------- #
+
 class ProgramExecutor:
     """
-    A hardened, featurerich Python runner for *ABDUCTION* and *DEDUCTION* tasks.
+    A hardened, feature‑rich Python runner for *ABDUCTION* and *DEDUCTION* tasks.
 
-    Highlights
-    ----------
-    • Fencestripping, autorunner (`solve()`), twostage execution  
-    • Wallclock **and** CPU/memory/output limits  
+    • Strips fences, autoruns solve(), two‑stage execution
+    • Wallclock, CPU/time, memory, and output limits
     • Cleans up temp files & stray child processes
     """
 
-    # --------------- Construction / helpers ----------------------------- #
     def __init__(
         self,
         timeout: int = DEFAULT_TIMEOUT_SEC,
@@ -82,20 +76,32 @@ class ProgramExecutor:
                         if path in self._tmp_files:
                             self._tmp_files.remove(path)
 
-    # --------------- Sandboxing primitives ------------------------------ #
-    def _posix_rlimits(self):
+    def _posix_rlimits(self) -> None:
+        """Best‑effort resource limits; never raise."""
         if resource is None:
             return
-        # CPU time (seconds)
-        if self.cpu_time:
-            resource.setrlimit(resource.RLIMIT_CPU, (self.cpu_time, self.cpu_time + 1))
-        # Address space
-        if self.mem_bytes:
-            resource.setrlimit(resource.RLIMIT_AS, (self.mem_bytes, self.mem_bytes))
-        # Prevent core files
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
-    # --------------- Core execution logic ------------------------------- #
+        def _try_set(res, vals):
+            try:
+                resource.setrlimit(res, vals)
+            except Exception:
+                pass
+
+        # CPU seconds
+        if self.cpu_time and hasattr(resource, "RLIMIT_CPU"):
+            _try_set(resource.RLIMIT_CPU, (self.cpu_time, self.cpu_time + 1))
+
+        # Memory: prefer RLIMIT_AS, fallback to RLIMIT_DATA
+        if self.mem_bytes:
+            if hasattr(resource, "RLIMIT_AS"):
+                _try_set(resource.RLIMIT_AS, (self.mem_bytes, self.mem_bytes))
+            elif hasattr(resource, "RLIMIT_DATA"):
+                _try_set(resource.RLIMIT_DATA, (self.mem_bytes, self.mem_bytes))
+
+        # Disable core dumps
+        if hasattr(resource, "RLIMIT_CORE"):
+            _try_set(resource.RLIMIT_CORE, (0, 0))
+
     def _run_once(
         self,
         script: str,
@@ -103,7 +109,7 @@ class ProgramExecutor:
     ) -> Tuple[str, str]:
         """
         Low‑level runner with incremental read and hard caps.
-        Returns (**stdout**, **stderr**) – each possibly truncated.
+        Returns (stdout, stderr)—each possibly truncated.
         """
         start = time.time()
         proc = subprocess.Popen(
@@ -113,21 +119,19 @@ class ProgramExecutor:
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            bufsize=1,                   # line‑buffered
-            preexec_fn=(
-                self._posix_rlimits       # sets rlimits & starts new pgid
-                if resource is not None else None
-            ),
+            bufsize=1,  # line‑buffered
+            preexec_fn=(lambda: self._posix_rlimits()) if resource else None,
             close_fds=True,
         )
-        try:
-            if os.name != "nt":
-                # New process‑group so we can kill children too
-                os.setpgid(proc.pid, proc.pid)
-        except Exception:
-            pass  # best‑effort
 
-        # Feed stdin immediately then close
+        # On POSIX, start a new process‑group so we can kill children too
+        if os.name != "nt":
+            try:
+                os.setpgid(proc.pid, proc.pid)
+            except Exception:
+                pass
+
+        # Feed stdin then close
         if proc.stdin:
             proc.stdin.write(stdin_data)
             proc.stdin.close()
@@ -136,8 +140,7 @@ class ProgramExecutor:
         sel.register(proc.stdout, selectors.EVENT_READ)
         sel.register(proc.stderr, selectors.EVENT_READ)
 
-        out_buf: List[str] = []
-        err_buf: List[str] = []
+        out_buf, err_buf = [], []
         out_size = err_size = 0
         truncated = False
 
@@ -148,7 +151,7 @@ class ProgramExecutor:
                 break
             for key, _ in sel.select(timeout=0.1):
                 chunk = key.fileobj.readline()
-                if not chunk:  # EOF
+                if not chunk:
                     sel.unregister(key.fileobj)
                     continue
                 if key.fileobj is proc.stdout:
@@ -165,30 +168,29 @@ class ProgramExecutor:
                         break
             if truncated:
                 break
-            # Exit when the process is dead *and* pipes drained/EOF‑ed
             if proc.poll() is not None and not sel.get_map():
                 break
 
-        # Time / size overflow – terminate group
+        # If truncated or timed out, kill the whole group
         if truncated and proc.poll() is None:
             try:
                 if os.name != "nt":
-                    os.killpg(proc.pid, 15)  # TERM
+                    os.killpg(proc.pid, 15)
                     time.sleep(0.2)
                     if proc.poll() is None:
-                        os.killpg(proc.pid, 9)  # KILL
+                        os.killpg(proc.pid, 9)
                 else:
                     proc.kill()
             except Exception:
-                proc.kill()
+                pass
 
-        # Drain any remaining
+        # Drain any remaining output
         try:
             rest_out, rest_err = proc.communicate(timeout=0.2)
             out_buf.append(rest_out or "")
             err_buf.append(rest_err or "")
         except Exception:
-            pass  # child already gone
+            pass
 
         out_text = "".join(out_buf)
         err_text = "".join(err_buf)
@@ -200,53 +202,51 @@ class ProgramExecutor:
                 err_text = err_text[: self.max_output] + suffix
             if time.time() - start > self.timeout:
                 err_text += "\n[TIMEOUT]"
+
         return out_text, err_text
 
-    # --------------- Public API  ---------------------------------------- #
     def execute(self, raw_code: str, stdin: str | bytes = "") -> Tuple[str, str]:
         """
-        Run *raw_code* with *stdin*.  
-        • Strips ``` fences automatically.  
-        • If the first run yields **no output** and no error but the script
-          defines a `solve()` function *without* a mainguard, a tiny runner
-          is appended and the code is run a second time.
+        Run *raw_code* with *stdin*.
+        • Strips ``` fences.
+        • If no output/error and a solve() exists without a guard, append a small runner and re‑run.
         """
         code = self._strip_fences(raw_code)
-        def _auto_run_needed(src: str, out: str, err: str) -> bool:
+
+        def _need_auto(src: str, out: str, err: str) -> bool:
             return (
-                (not out.strip() and not err.strip())
+                not out.strip() and not err.strip()
                 and "def solve" in src
                 and not _HAS_MAIN.search(src)
             )
-        with self._tempfile(code) as script_path:
+
+        with self._tempfile(code) as script:
             try:
-                out, err = self._run_once(script_path, stdin)
+                out, err = self._run_once(script, stdin)
             except subprocess.SubprocessError as e:
-                # catch any low‑level subprocess failure and return it as stderr
                 return "", f"Execution error: {e}"
 
-            # if no output/error but there’s a solve() without main guard, re‑run with auto‑runner
-            if _auto_run_needed(code, out, err):
+            if _need_auto(code, out, err):
                 runner = (
                     "\n\nif __name__ == \"__main__\":\n"
                     "    res = solve()\n"
                     "    if res is not None:\n"
                     "        import sys\n"
                     "        if isinstance(res, (list, tuple)):\n"
-                    "            print(*res, sep=\" \")\n"
+                    "            print(*res)\n"
                     "        else:\n"
                     "            print(res)\n"
                 )
-                with self._tempfile(code + runner) as auto_path:
+                with self._tempfile(code + runner) as auto_script:
                     try:
-                        out, err = self._run_once(auto_path, stdin)
+                        out, err = self._run_once(auto_script, stdin)
                     except subprocess.SubprocessError as e:
                         return "", f"Execution error: {e}"
 
         return out, err
 
-    # --------------- Manual cleanup (rarely needed) ---------------------- #
     def cleanup(self) -> None:
+        """Remove any lingering temp files."""
         with self._lock:
             for f in list(self._tmp_files):
                 try:
