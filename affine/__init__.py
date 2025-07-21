@@ -3,6 +3,7 @@
 #                             Imports                                         #
 # --------------------------------------------------------------------------- #
 import os
+import re
 import sys
 import json
 import time
@@ -14,10 +15,12 @@ import logging
 import textwrap
 import botocore
 import traceback
+from tqdm import tqdm
 import bittensor as bt
 import botocore.config
 from pathlib import Path
 from rich.table import Table
+from functools import partial
 from dotenv import load_dotenv
 from rich.console import Console
 from huggingface_hub import HfApi
@@ -461,6 +464,35 @@ async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
         await asyncio.to_thread(lp.write_bytes, body)
     except Exception:
         logger.error("Unexpected error writing to ~/.affine", exc_info=True)
+        
+async def dataset(tail: int = 1000):
+    sub = await get_subtensor()
+    cur = await sub.get_current_block()
+    cutoff = cur - tail
+
+    # 2. list all keys under affine/results and keep those > cutoff
+    bucket = get_conf("R2_BUCKET_ID")
+    client = get_client_ctx()
+    prefix = "affine/results/"
+    keys: list[str] = []
+
+    async with client as s3:
+        paginator = s3.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                # assume filenames are .../<block>.json
+                blk = int(key.rsplit("/", 1)[-1].removesuffix(".json"))
+                if blk > cutoff:
+                    keys.append(key)
+
+    # 3. pull each file sequentially (tqdm gives us a nice bar)
+    results: list[dict] = []
+    for key in tqdm(keys, desc="Downloading results"):
+        batch = await get(key)   # uses your existing get() helper
+        results.extend(batch)     # each file is a list of result‐dicts
+
+    return results
 
 # --------------------------------------------------------------------------- #
 #                           Snapshot load on startup                          #
