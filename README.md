@@ -105,4 +105,7 @@ print( evaluation.score )
 
 # Query the miner and do the eval all in one go.
 results = await af.run( chals, miners )
+
+# Pull data from trials 1000 blocks in the past.
+validator_results = af.dataset( tail = 1000 )
 ```
