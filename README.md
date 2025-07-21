@@ -1,5 +1,7 @@
 # Affine
 
+We will mine reasoning for the world.
+
 ## Introduction
 
 Affine is a an incentivized RL environment which pays miners which make incremental improvements on a set of tasks (for instance, program abduction or coding). The mechanism is sybil-proof (you cant cheat by deploying multiple miners), decoy-proof (you cant cheat by packing models into certain environments), copy-proof (you cant win by simply stealing the best model), overfitting-proof (you can't cheat by overfitting to the a single benchmark). 
