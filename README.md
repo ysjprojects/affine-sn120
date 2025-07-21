@@ -24,13 +24,13 @@ af
 
 ## Validating
 
-Set env vars.
+Set env vars, chutes api key.
 ```bash
 # Copy .env and fill out items.
 cp .env.validator.example .env
 ```
 
-Recommended: Run the validator with docker.
+(Recommended): Run the validator with docker and watchtower autoupdate.
 ```bash
 # Run the validator with watchtower.
 docker-compose pull && docker-compose up -d && docker-compose logs -f
@@ -44,39 +44,40 @@ af -vv validate
 
 # Mining
 
-Miners need a chutes developer account to deploy models and this requires an upfront 5k USD in TAO (which you get this back later).
-Visit `chutes.ai` set your account up. You will also need a Huggingface account to deploy new models. Once you have all of these requirements do the following: 
+1. Miners need a chutes developer account ( `chutes.ai` )
 ```bash
-# Register to chutes.
-chutes register 
-
-# Set your chutes api key information.
-af set CHUTES_API_KEY <your chutes API key> 
-af set CHUTE_USER <your chutes username> 
-
-# Set your HF account/token.
-af set HF_TOKEN <your hf token>
-af set HF_USER <your hf user> 
+chutes register
 ```
 
-Pull a model off the network.
+2. Set env vars.
 ```bash
-af -vvv pull <uid to pull> --model_path <model_location>
+# Copy .env and fill out items.
+cp .env.validator.example .env
 ```
 
-Improve the model
+3. Register your miner to Affine (S120).
+```bash
+btcli subnet register --wallet.name <your cold> --wallet.hotkey <your hot>
+```
+
+4. Pull a model off the network.
+```bash
+af -vvv pull <uid to pull> --model_path <i.e. ./my_model>
+```
+
+5. Improve the model
 ```bash
 ... magic RL stuff ...
 ```
 
-Push the model to my key.
+6. Push the model to your miner.
 ```bash
-af -vvv push  --coldkey <your coldkey> --hotkey <your hotkey> --model_path <model_location>
+af -vvv push  --coldkey <your cold> --hotkey <your hot> --model_path <i.e. ./my_model>
 ```
 
 
 # SDK
-Affine is also an SDK you can use to generate and evaluate envs.
+Affine is also an SDK you can use to generate and evaluate models envs.
 ```python
 import affine as af
 
