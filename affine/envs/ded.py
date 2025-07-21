@@ -47,8 +47,8 @@ class DEDUCTION(af.BaseEnv):
         super().__init__()
         self._executor = af.utils.ProgramExecutor()
         self._data = af.utils.BufferedDataset(
-            dataset_name="PrimeIntellect/SYNTHETIC-2-Base-Code",
-            total_size=57_300,
+            dataset_name="satpalsr/rl-python",
+            total_size=20_000,
             buffer_size=5,
             max_batch=5,
         )

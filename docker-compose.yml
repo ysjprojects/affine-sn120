@@ -11,7 +11,7 @@ services:
       - ~/.affine/config.env
     volumes:
       - ./.env:/app/.env
-      - ~/.affine/config.env:/root/.affine/config.env
+      - ~/.affine:/root/.affine
       - ~/.bittensor/wallets:/root/.bittensor/wallets
     command: ["-vv","validate"]
 
