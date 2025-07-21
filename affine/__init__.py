@@ -465,32 +465,40 @@ async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
     except Exception:
         logger.error("Unexpected error writing to ~/.affine", exc_info=True)
         
-async def dataset(tail: int = 1000):
+async def dataset(tail: int = 1000, max_concurrency: int = 10):
     sub = await get_subtensor()
     cur = await sub.get_current_block()
     cutoff = cur - tail
 
-    # 2. list all keys under affine/results and keep those > cutoff
     bucket = get_conf("R2_BUCKET_ID")
     client = get_client_ctx()
     prefix = "affine/results/"
     keys: list[str] = []
 
+    # 1. collect keys
     async with client as s3:
         paginator = s3.get_paginator("list_objects_v2")
         async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
-                key = obj["Key"]
-                # assume filenames are .../<block>.json
-                blk = int(key.rsplit("/", 1)[-1].removesuffix(".json"))
+                blk = int(obj["Key"].rsplit("/", 1)[-1].removesuffix(".json"))
                 if blk > cutoff:
-                    keys.append(key)
+                    keys.append(obj["Key"])
 
-    # 3. pull each file sequentially (tqdm gives us a nice bar)
+    # 2. prepare a semaphore to limit simultaneous fetches
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def fetch(key: str):
+        async with sem:
+            return await get(key)
+
+    # 3. schedule all fetches
+    tasks = [asyncio.create_task(fetch(key)) for key in keys]
+
+    # 4. gather results as they complete, updating a tqdm bar
     results: list[dict] = []
-    for key in tqdm(keys, desc="Downloading results"):
-        batch = await get(key)   # uses your existing get() helper
-        results.extend(batch)     # each file is a list of result‐dicts
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Downloading results"):
+        batch = await coro
+        results.extend(batch)
 
     return results
 
