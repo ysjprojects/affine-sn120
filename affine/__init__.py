@@ -30,6 +30,8 @@ from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
 
+from .utils import *
+
 NETUID = 120
 
 # --------------------------------------------------------------------------- #

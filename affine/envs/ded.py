@@ -15,17 +15,6 @@ from collections import deque
 from contextlib import contextmanager
 from typing import Any, Dict, List, Tuple
 
-# --------------------------------------------------------------------------- #
-#                         Tunables and constants                              #
-# --------------------------------------------------------------------------- #
-DEFAULT_PROGRAM_EXECUTION_TIMEOUT = 5  # seconds
-DATASET_SIZE = 57_300  # rows in the *train* split (July 2025 snapshot) :contentReference[oaicite:1]{index=1}
-DATASET_ROWS_ENDPOINT = (
-    "https://datasets-server.huggingface.co/rows?"
-    "dataset=PrimeIntellect%2FSYNTHETIC-2-Base-Code"
-    "&config=default&split=train&offset={offset}&length=1"
-)
-
 # -------------------------------- Helpers -------------------------------- #
 def _to_str(x) -> str:
     """
@@ -43,162 +32,24 @@ def _to_str(x) -> str:
     return json.dumps(x, ensure_ascii=False)
 
 # --------------------------------------------------------------------------- #
-#                              Program runner                                 #
-# --------------------------------------------------------------------------- #
-class ProgramExecutor:
-    """
-    Executes untrusted Python programs with controlled stdin/stdout.
-
-    Twostage strategy
-    ------------------
-    1) Run the user's script verbatim.
-    2) If that yields **no output** *and* the script defines a   `solve()`
-       function but has no mainguard, append a tiny runner:
-
-           if __name__ == "__main__":
-               import sys, json
-               res = solve()
-               if res is not None:
-                   if isinstance(res, (list, tuple)):
-                       print(*res, sep=" ")
-                   else:
-                       print(res)
-
-       Then rerun.
-    """
-
-    _FENCE_RE = re.compile(r"```(?:python)?\s*([\s\S]*?)```", re.IGNORECASE)
-    _HAS_MAIN_RE = re.compile(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]')
-
-    def __init__(self, timeout: int = DEFAULT_PROGRAM_EXECUTION_TIMEOUT) -> None:
-        self.timeout = timeout
-        self._temp_files: List[str] = []
-        self._lock = Lock()
-
-    # -------------------------- Helpers ---------------------------------- #
-
-    @staticmethod
-    def _strip_fences(text: str) -> str:
-        m = ProgramExecutor._FENCE_RE.search(text)
-        return (m.group(1) if m else text).strip()
-
-    @contextmanager
-    def _tempfile(self, content: str, suffix: str = ".py"):
-        path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=suffix, delete=False, encoding="utf-8"
-            ) as fh:
-                fh.write(content)
-                path = fh.name
-            with self._lock:
-                self._temp_files.append(path)
-            yield path
-        finally:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                finally:
-                    with self._lock:
-                        self._temp_files.remove(path)
-
-    # ------------------------- Internal run ------------------------------ #
-
-    def _run(self, code: str, stdin: str) -> Tuple[str, str]:
-        with self._tempfile(code) as script:
-            completed = subprocess.run(
-                [sys.executable, script],
-                input=stdin,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout,
-                encoding="utf-8",
-            )
-        return completed.stdout, completed.stderr
-
-    # ------------------------- Public API -------------------------------- #
-
-    def execute(self, raw_program: str, stdin: str) -> Tuple[str, str]:
-        """Run *raw_program* with *stdin*; possibly add an auto‑runner."""
-        program = self._strip_fences(raw_program)
-        out, err = self._run(program, stdin)
-        if out.strip() or err.strip():
-            return out, err  # success or runtime error – but at least we saw output
-
-        # Stage‑2: no output – try auto‑runner if `solve()` exists
-        if "def solve" in program and not self._HAS_MAIN_RE.search(program):
-            runner = (
-                "\n\nif __name__ == \"__main__\":\n"
-                "    res = solve()\n"
-                "    if res is not None:\n"
-                "        import sys\n"
-                "        if isinstance(res, (list, tuple)):\n"
-                "            print(*res, sep=\" \")\n"
-                "        else:\n"
-                "            print(res)\n"
-            )
-            out, err = self._run(program + runner, stdin)
-        return out, err
-
-
-# --------------------------------------------------------------------------- #
 #                           Utility functions                                 #
 # --------------------------------------------------------------------------- #
-
-
 def _normalize(text: str) -> str:
     """Trim trailing blank lines and per‑line trailing spaces."""
     return "\n".join(line.rstrip() for line in text.rstrip().splitlines())
 
 
-async def _fetch_dataset_row(offset: int) -> Dict[str, Any] | None:
-    url = DATASET_ROWS_ENDPOINT.format(offset=offset)
-    async with aiohttp.ClientSession() as sess:
-        try:
-            async with sess.get(url, timeout=30) as resp:
-                if resp.status != 200:
-                    return None
-                payload = await resp.json()
-        except Exception:
-            return None
-    rows = payload.get("rows", [])
-    return rows[0]["row"] if rows else None
-
-
 # --------------------------------------------------------------------------- #
 #                              Affine Env                                     #
 # --------------------------------------------------------------------------- #
-
-
 class DEDUCTION(af.BaseEnv):
     def __init__(self):
         super().__init__()
-        self._executor = ProgramExecutor()
-        # --- new buffer logic ---
-        self._buffer: deque[Dict[str, Any]] = deque()
-        self._buffer_size = 10
-        # ------------------------
-
-    async def _fill_buffer(self) -> None:
-        """
-        Pull rows until we have `buffer_size` in our queue.
-        Skips any failed fetches.
-        """
-        while len(self._buffer) < self._buffer_size:
-            offset = random.randint(0, DATASET_SIZE - 1)
-            row = await _fetch_dataset_row(offset)
-            if row is not None:
-                self._buffer.append(row)
-
-    async def random_sample(self) -> Dict[str, Any] | None:
-        """
-        Return one sample from the local buffer.
-        If empty, top up first.
-        """
-        if not self._buffer:
-            await self._fill_buffer()
-        return self._buffer.popleft() if self._buffer else None
+        self._executor = af.utils.ProgramExecutor()
+        self._data = af.utils.BufferedDataset(
+            dataset_name="PrimeIntellect%2FSYNTHETIC-2-Base-Code",
+            total_size=57_300,
+        )
 
     # ----------------------------- Env API -------------------------------- #
 
@@ -226,7 +77,7 @@ class DEDUCTION(af.BaseEnv):
     ) -> af.Evaluation:
         af.logger.trace("Starting evaluation of the challenge.")
         raw_reply = response.response
-        program = ProgramExecutor._strip_fences(raw_reply)
+        program = self._executor._strip_fences(raw_reply)
         af.logger.trace(f"Stripped program from response: {program[:50]}...")
 
         # ---------------- Verification info ---------------------------- #
