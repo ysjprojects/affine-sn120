@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import ast
 import json
 import random
 import aiohttp
@@ -55,7 +56,7 @@ class DEDUCTION(af.BaseEnv):
 
     # ----------------------------- Env API -------------------------------- #
     async def generate(self) -> af.Challenge:
-        af.logger.trace("Generating new SYNTHETIC‑2 coding challenge")
+        af.logger.trace("Generating new coding challenge")
         sample = await self._data.get()
         if sample is None:
             raise RuntimeError("Failed to fetch dataset row")
@@ -84,71 +85,88 @@ class DEDUCTION(af.BaseEnv):
         # ---------------- Verification info ---------------------------- #
         sample = challenge.extra or {}
         ver_raw = sample.get("verification_info") or sample.get("test_cases")
-        af.logger.trace(f"Verification raw data: {ver_raw[:50]}...")
+        af.logger.trace(f"Verification raw data: {str(ver_raw)[:50]}...")
+
+        # try JSON first, then Python‐literal
         try:
-            ver_json = json.loads(ver_raw) if isinstance(ver_raw, str) else ver_raw
-            af.logger.trace("Parsed verification info JSON successfully.")
+            if isinstance(ver_raw, str):
+                try:
+                    ver_json = json.loads(ver_raw)
+                    af.logger.trace("Parsed verification info via json.loads")
+                except json.JSONDecodeError:
+                    ver_json = ast.literal_eval(ver_raw)
+                    af.logger.trace("Parsed verification info via ast.literal_eval")
+            else:
+                ver_json = ver_raw
         except Exception as err:
-            af.logger.trace(f"Failed to parse verification info JSON: {err}")
+            af.logger.trace(f"Failed to parse verification info: {err}")
             return af.Evaluation(
                 env=self,
                 score=0.0,
-                feedback=f"Invalid verification_info JSON: {err}",
+                feedback=f"Invalid verification_info format: {err}",
             )
 
-        # Some rows nest the actual data under 'test_cases'
-        if "test_cases" in ver_json:
-            nested = ver_json["test_cases"]
-            ver_json = json.loads(nested) if isinstance(nested, str) else nested
-            af.logger.trace("Extracted nested test cases from verification info.")
-
-        inputs: List[str] = ver_json.get("inputs") or []
-        outputs: List[str] = ver_json.get("outputs") or []
-        af.logger.trace(f"Extracted {len(inputs)} inputs and {len(outputs)} outputs.")
-
-        if not inputs:
-            af.logger.trace("No public test cases available.")
+        # extract test cases list
+        cases = ver_json.get("test_cases")
+        if not cases:
+            af.logger.trace("No test_cases found in verification info.")
             return af.Evaluation(
                 env=self, score=0.0, feedback="No public test cases available"
             )
-        if outputs and len(inputs) != len(outputs):
-            af.logger.trace("Mismatch between number of inputs and outputs.")
-            return af.Evaluation(
-                env=self,
-                score=0.0,
-                feedback="Mismatch between #inputs and #outputs in verification data",
-            )
+        af.logger.trace(f"Found {len(cases)} test cases.")
 
-        # ----------------- Run programme on tests ---------------------- #
         loop = asyncio.get_running_loop()
-        passed, total = 0, len(inputs)
-        details: List[Dict[str, Any]] = []
+        passed, total = 0, len(cases)
+        details = []
 
-        for i, raw_inp in enumerate(inputs):
-            raw_exp = outputs[i] if outputs else None
+        for i, case in enumerate(cases, start=1):
+            ctype = case.get("type")
+            raw_inp = case.get("input")
+            raw_exp = case.get("output")
 
-            # 👇 NEW: canonicalise
-            inp = _to_str(raw_inp)
-            if not inp.endswith("\n"):
-                inp += "\n"                  # many user programs rely on a final EOL
-            exp = _to_str(raw_exp) if raw_exp is not None else None
+            if ctype == "stdin_stdout":
+                inp = _to_str(raw_inp)
+                if not inp.endswith("\n"):
+                    inp += "\n"
+                exec_prog = program
+                exp = _to_str(raw_exp)
+            elif ctype == "function_call":
+                fn = case.get("fn_name")
+                # input is a list of args
+                args = case.get("input", [])
+                # wrap program with a call to fn(...) and print its result
+                exec_prog = (
+                    program
+                    + "\n"
+                    + f"if __name__ == '__main__':\n"
+                    + f"    result = {fn}(*{args!r})\n"
+                    + "    print(result)"
+                )
+                inp = ""  # no stdin
+                exp = _to_str(raw_exp[0]) if isinstance(raw_exp, list) and raw_exp else _to_str(raw_exp)
+            else:
+                af.logger.trace(f"Unknown test case type '{ctype}', skipping.")
+                total -= 1
+                continue
 
             try:
                 out, err = await loop.run_in_executor(
-                    None, lambda: self._executor.execute(program, inp)
+                    None, lambda: self._executor.execute(exec_prog, inp)
                 )
             except subprocess.TimeoutExpired:
                 out, err = "", "TIMEOUT"
 
-            ok_run   = err.strip() == ""
+            ok_run = not err.strip()
             out_norm = _normalize(out)
             exp_norm = _normalize(exp) if exp is not None else None
-            correct  = ok_run and (exp_norm is None or out_norm == exp_norm)
+            correct = ok_run and (exp_norm is None or out_norm == exp_norm)
             if correct:
                 passed += 1
-                af.logger.trace(f"Test case {i+1} passed.")
+                af.logger.trace(f"Test case {i} passed.")
             else:
-                af.logger.trace(f"Test case {i+1} failed. Output: {out_norm}, Expected: {exp_norm}")
+                af.logger.trace(
+                    f"Test case {i} failed. Got: {out_norm!r}, Expected: {exp_norm!r}"
+                )
 
             details.append(
                 {
@@ -160,9 +178,11 @@ class DEDUCTION(af.BaseEnv):
                 }
             )
 
-        score = passed / total
+        score = passed / total if total else 0.0
         feedback = json.dumps(
             {"passed": passed, "total": total, "tests": details}, ensure_ascii=False
         )
         af.logger.trace(f"Evaluation completed with score: {score}")
         return af.Evaluation(env=self, score=score, feedback=feedback)
+
+
