@@ -1,14 +1,7 @@
-import os
 import re
-import sys
 import random
 import asyncio
-import tempfile
-import subprocess
 import affine as af
-from threading import Lock
-from collections import deque
-from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
 
 MODELS = ["unsloth/gemma-3-12b-it"]
@@ -70,7 +63,8 @@ Format your response with <INPUT> </INPUT> tags like this:
 
 Please generate a valid input:"""
 
-class ABDUCTION(af.BaseEnv):
+class ABD(af.BaseEnv):
+    __version__: int = "0.0.0"
     def __init__(self):
         super().__init__()
         self._executor = af.utils.ProgramExecutor()

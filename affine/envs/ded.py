@@ -1,19 +1,9 @@
 from __future__ import annotations
-
-import os
-import re
-import sys
 import ast
 import json
-import random
-import aiohttp
 import asyncio
-import tempfile
 import subprocess
 import affine as af
-from threading import Lock
-from collections import deque
-from contextlib import contextmanager
 from typing import Any, Dict, List, Tuple
 
 # -------------------------------- Helpers -------------------------------- #
@@ -43,7 +33,8 @@ def _normalize(text: str) -> str:
 # --------------------------------------------------------------------------- #
 #                              Affine Env                                     #
 # --------------------------------------------------------------------------- #
-class DEDUCTION(af.BaseEnv):
+class DED(af.BaseEnv):
+    __version__: int = "0.0.0"
     def __init__(self):
         super().__init__()
         self._executor = af.utils.ProgramExecutor()

@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------- #
 #                             Imports                                         #
@@ -27,39 +28,50 @@ from huggingface_hub import HfApi
 from collections import defaultdict
 from abc import ABC, abstractmethod
 from alive_progress import alive_bar
-from pydantic import BaseModel, Field
 from aiobotocore.session import get_session
 from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
+from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
 
 from .utils import *
 
+__version__ = "0.0.0"
+
+# --------------------------------------------------------------------------- #
+#                       Constants & global singletons                         #
+# --------------------------------------------------------------------------- #
 NETUID = 120
+TRACE  = 5
+logging.addLevelName(TRACE, "TRACE")
 
 # --------------------------------------------------------------------------- #
 #                               Logging                                       #
 # --------------------------------------------------------------------------- #
-TRACE = 5
-logging.addLevelName(TRACE, "TRACE")
 def _trace(self, msg, *args, **kwargs):
     if self.isEnabledFor(TRACE):
         self._log(TRACE, msg, args, **kwargs)
 logging.Logger.trace = _trace
 logger = logging.getLogger("affine")
 def setup_logging(verbosity: int):
-    if verbosity >= 3: level = TRACE
-    elif verbosity == 2: level = logging.DEBUG
-    elif verbosity == 1: level = logging.INFO
-    else: level = logging.CRITICAL + 1
-    for noisy_logger in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions"]:
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    
+    level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
+    for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions"]:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.basicConfig(level=level,
+                        format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+
+# --------------------------------------------------------------------------- #
+#                             Utility helpers                                 #
+# --------------------------------------------------------------------------- #
+LOCAL_BASE = Path.home() / ".affine"; LOCAL_BASE.mkdir(parents=True, exist_ok=True)
+load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True); load_dotenv(override=True)
+def get_conf(key, default=None) -> Any:
+    v = os.getenv(key); 
+    if not v and default is None:
+        click.echo(f"{key} not set.\nRun:\n\taf set {key} <value>", err=True); sys.exit(1)
+    return v or default
+
 # --------------------------------------------------------------------------- #
 #                               Subtensor                                     #
 # --------------------------------------------------------------------------- #
@@ -67,65 +79,76 @@ SUBTENSOR = None
 async def get_subtensor():
     global SUBTENSOR
     if SUBTENSOR == None:
-        logger.debug("Making Bittensor connection...")
+        logger.trace("Making Bittensor connection...")
         SUBTENSOR = bt.async_subtensor()
         await SUBTENSOR.initialize()
-        logger.debug("Connected")
+        logger.trace("Connected")
     return SUBTENSOR
 
 # --------------------------------------------------------------------------- #
-#                               CLI                                           #
+#                           Base‑level data models                            #
 # --------------------------------------------------------------------------- #
-@click.group()
-@click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
-def cli(verbose):
-    """Affine CLI"""
-    setup_logging(verbose)
-    
-# --------------------------------------------------------------------------- #
-#                               Config                                        #
-# --------------------------------------------------------------------------- #
-LOCAL_BASE = Path.home() / ".affine"         # ~/.affine
-LOCAL_BASE.mkdir(parents=True, exist_ok=True)
-load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True)
-load_dotenv(override=True)
-def get_conf(key, default = None) -> Any:
-    value = os.getenv(key)
-    if not value and default == None:
-        click.echo(f"{key} not set.\nRun:\n\taf set {key} <value>", err=True)
-        sys.exit(1)
-    elif not value:
-        return default
-    return value
+def _truncate(t: Optional[str], max_len: int = 80) -> str:
+    return "" if not t else textwrap.shorten(t, width=max_len, placeholder="…")
 
-@cli.command('set')
-@click.argument('key')
-@click.argument('value')
-def set_config(key: str, value: str):
-    """Set a key-value pair in ~/.affine/config.env."""
-    path = os.path.expanduser("~/.affine/config.env")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    lines = [l for l in open(path).readlines() if not l.startswith(f"{key}=")] if os.path.exists(path) else []
-    lines.append(f"{key}={value}\n")
-    open(path, "w").writelines(lines)
-    logger.info("Set %s in %s", key, path)
-    click.echo(f"Set {key} in {path}")
+class BaseEnv(BaseModel, ABC):
+    """Abstract competition environment."""
+    __version__: int = __version__
+    class Config: arbitrary_types_allowed = True
+    @property
+    def name(self) -> str: return self.__class__.__name__
+    def __hash__(self):     return hash(self.name)
+    def __repr__(self):     return self.name
+    # API expected from concrete envs
+    @abstractmethod
+    async def generate(self) -> "Challenge": ...
+    @abstractmethod
+    async def evaluate(self, challenge: "Challenge", response: "Response") -> "Evaluation": ...
     
-# --------------------------------------------------------------------------- #
-#                               Model                                         #
-# --------------------------------------------------------------------------- #
-def _truncate(text: Optional[str], max_length: int = 80) -> str:
-    if not text:
-        return ""
-    return textwrap.shorten(text, width=max_length, placeholder="...")
 
-class Miner(BaseModel):
-    uid: int
-    hotkey: str
-    model: Optional[str] = None
-    revision: Optional[str] = None
-    block: Optional[int] = None
-    chute: Optional[Dict[str, Any]] = None
+# --------------------------------------------------------------------------- #
+#                         Models with new (de)serialisation                   #
+# --------------------------------------------------------------------------- #
+class Challenge(BaseModel):
+    env:  BaseEnv
+    prompt: str
+    extra: Dict[str, Any] = Field(default_factory=dict)
+    @validator("env", pre=True)
+    def _parse_env(cls, v):
+        from .envs.sat import SAT
+        from .envs.abd import ABD
+        from .envs.ded import DED
+        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+        return ENVS[v]() if isinstance(v, str) else v
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {BaseEnv: lambda v: v.name}
+    def json(self, **kw): return json.dumps(self.dict(**kw))
+    async def evaluate(self, resp: "Response") -> "Evaluation":
+        return await self.env.evaluate(self, resp)
+    def __repr__(self):
+        return f"<Challenge env={self.env.name!r} prompt={_truncate(self.prompt)!r}>"
+    __str__ = __repr__
+
+class Evaluation(BaseModel):
+    env: BaseEnv
+    score: float
+    extra: Dict[str, Any] = Field(default_factory=dict)
+    @validator("env", pre=True)
+    def _parse_env(cls, v):
+        from .envs.sat import SAT
+        from .envs.abd import ABD
+        from .envs.ded import DED
+        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+        return ENVS[v]() if isinstance(v, str) else v
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {BaseEnv: lambda v: v.name}
+    def json(self, **kw): return json.dumps(self.dict(**kw))
+    def __repr__(self):
+        ex = {k: _truncate(str(v)) for k, v in self.extra.items()}
+        return f"<Evaluation env={self.env.name!r} score={self.score:.4f} extra={ex!r}>"
+    __str__ = __repr__
 
 class Response(BaseModel):
     response: Optional[str]
@@ -134,63 +157,128 @@ class Response(BaseModel):
     model: str
     error: Optional[str]
     success: bool
-    def __repr__(self) -> str:
-        resp = _truncate(self.response)
-        err  = _truncate(self.error)
-        return (
-            f"<Response model={self.model!r} success={self.success} "
-            f"latency={self.latency_seconds:.3f}s attempts={self.attempts} "
-            f"response={resp!r} error={err!r}>"
-        )
+    def __repr__(self):
+        return (f"<Response model={self.model!r} success={self.success} "
+                f"latency={self.latency_seconds:.3f}s attempts={self.attempts} "
+                f"response={_truncate(self.response)!r} error={_truncate(self.error)!r}>")
     __str__ = __repr__
 
-class BaseEnv(BaseModel, ABC):
-    @property
-    def name(self) -> str:return self.__class__.__name__
-    class Config: 
-        arbitrary_types_allowed = True
-    def __hash__(self): return hash(self.name)
-    def __repr__(self): return self.name
-    async def many(self, n: int) -> List["Challenge"]:
-        return await asyncio.gather(*(self.generate() for _ in range(n)))
-    @abstractmethod
-    async def generate(self) -> "Challenge": ...
-    @abstractmethod
-    async def evaluate(self, challenge: "Challenge", response: Response) -> "Evaluation": ...
-
-class Challenge(BaseModel):
-    env: BaseEnv
-    prompt: str
-    extra: Dict[str, Any] = Field(default_factory=dict)
-    def json(self, **kwargs): # Hack to get name of env.
-        dd = self.dict(**kwargs); dd['env'] = self.env.name;
-        return json.dumps(dd)
-    async def evaluate(self, response: Response) -> "Evaluation":
-        return await self.env.evaluate(self, response)
-    def __repr__(self) -> str:
-        pr = _truncate(self.prompt)
-        return f"<Challenge env={self.env.name!r} prompt={pr!r}>"
-    __str__ = __repr__
-
-class Evaluation(BaseModel):
-    env: BaseEnv
-    score: float
-    extra: Dict[str, Any] = Field(default_factory=dict)
-    def json(self, **kwargs): # Hack to get name of env.
-        dd = self.dict(**kwargs); dd['env'] = self.env.name;
-        return json.dumps(dd)
-    def __repr__(self) -> str:
-        ex = {k: _truncate(str(v)) for k, v in self.extra.items()}
-        return f"<Evaluation env={self.env.name!r} score={self.score:.4f} extra={ex!r}>"
-    __str__ = __repr__
+class Miner(BaseModel):
+    uid: int; hotkey: str; model: Optional[str] = None
+    revision: Optional[str] = None; block: Optional[int] = None
+    chute: Optional[Dict[str, Any]] = None
 
 class Result(BaseModel):
     miner: Miner
     challenge: Challenge
     response: Response
     evaluation: Evaluation
-    
-    
+    class Config:
+        arbitrary_types_allowed = True
+        json_encoders = {BaseEnv: lambda v: v.name}
+    def json(self, **kw): return json.dumps(self.dict(**kw))
+    def __repr__(self): return f"<Result {self.miner.uid=} {self.challenge.env.name=} score={self.evaluation.score:.4f}>"
+    __str__ = __repr__
+
+# Real import.    
+from .envs.sat import SAT
+from .envs.abd import ABD
+from .envs.ded import DED
+ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+
+# --------------------------------------------------------------------------- #
+#                   S3 helpers (unchanged apart from serialisation)           #
+# --------------------------------------------------------------------------- #
+def get_client_ctx():
+    ACCOUNT = get_conf("R2_ACCOUNT_ID"); KEY_ID = get_conf("R2_WRITE_ACCESS_KEY_ID"); SECRET = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
+    endpoint = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
+    cfg = botocore.config.Config(max_pool_connections=256)
+    return get_session().create_client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=KEY_ID,
+        aws_secret_access_key=SECRET,
+        config=cfg
+    )
+
+async def sink(
+    wallet: bt.wallet,
+    block: int,
+    results: List[Result],
+):
+    """
+    Write a list of Result objects to Cloudflare R2 under
+    affine/results/<hotkey>/<block>.json, using our JSON encoders.
+    """
+    key = f"affine/results/{wallet.hotkey.ss58_address}/{block}.json"
+    # --- use Pydantic JSON dump so that env => "SAT"/"ABD"/"DED" instead of {}
+    raw: List[dict] = [r.model_dump(mode="json") for r in results]
+    body = json.dumps(raw).encode("utf-8")
+    print(f"[sink] block={block} → key={key}")
+    try:
+        async with get_client_ctx() as client:
+            await client.put_object(
+                Bucket = get_conf("R2_BUCKET_ID"),
+                Key    = key,
+                Body   = body
+            )
+    except Exception:
+        logger.error("R2 write failed for %s", key, exc_info=True)
+
+async def get(key: str) -> Any:
+    async with get_client_ctx() as client:
+        resp = await client.get_object(Bucket=get_conf("R2_BUCKET_ID"), Key=key)
+        body = await resp["Body"].read()
+        return json.loads(body) if resp.get("ContentType") == "application/json" else body
+
+
+async def dataset(
+    tail: int = 1000,
+    max_concurrency: int = 10
+) -> List[Result]:
+    """
+    Fetch all result‑files newer than (current_block – tail) from R2,
+    parse each JSON blob into Result instances, and return the full list.
+    """
+    sub    = await get_subtensor()
+    cur    = await sub.get_current_block()
+    cutoff = cur - tail
+    bucket, prefix = get_conf("R2_BUCKET_ID"), "affine/results/"
+    keys: List[str] = []
+
+    # 1) list candidate objects
+    async with get_client_ctx() as s3:
+        paginator = s3.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                k = obj["Key"]
+                try:
+                    blk = int(k.rsplit("/", 1)[-1].removesuffix(".json"))
+                    if blk > cutoff:
+                        keys.append(k)
+                except ValueError:continue
+
+    # 2) concurrent fetch + JSON‐decode
+    sem = asyncio.Semaphore(max_concurrency)
+    async def fetch_and_load(key: str) -> Any:
+        async with sem:
+            data = await get(key)
+            if isinstance(data, (bytes, bytearray)):
+                try: data = json.loads(data)
+                except Exception as e: return None
+            return data
+
+    # Rehydrate.
+    tasks = [asyncio.create_task(fetch_and_load(k)) for k in sorted(keys)]
+    results: List[Result] = []
+    for coro in asyncio.as_completed(tasks):
+        batch = await coro
+        if not isinstance(batch, list):continue
+        for item in batch:
+            try: results.append(Result.model_validate(item))
+            except Exception as e: logger.trace(f'Deserialize error:{e}')
+    return results
+
 
 # --------------------------------------------------------------------------- #
 #                               API                                           #
@@ -285,6 +373,14 @@ async def query(prompt:str, model:str = "unsloth/gemma-3-12b-it", timeout=120, r
                 await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
 
 
+LOG_TEMPLATE = (
+    "U{uid:>3d} │ "
+    "{model:<50s} │ "
+    "{env:<3} │ "
+    "{success:^4s} │ "
+    "{score:>6.4f} │ "
+    "{latency:>6.3f}s"
+)
 async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=True) -> List[Result]:
     if not isinstance(challenges, list): challenges = [challenges]
     if isinstance(miners, Miner): miners = [miners]
@@ -292,33 +388,27 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
     elif isinstance(miners, list) and all(hasattr(m, "uid") for m in miners):  mmap = {m.uid: m for m in miners}
     else: mmap = await miners(miners)
     logger.trace("Running challenges: %s on miners: %s", [chal.prompt[:30] for chal in challenges], list(mmap.keys()))
-    results = []
+    response = []
     async def proc(miner, chal):
         resp = await query(chal.prompt, miner.model, timeout, retries, backoff)
-        try:
-            ev = await chal.evaluate(resp)
-            logger.trace("Evaluation done for %s: %r", miner.model, ev)
-        except Exception as e:
-            logger.warning("Evaluation failed for miner %s on %s: %s", miner.uid, chal.env.name, e)
-            ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
+        try: ev = await chal.evaluate(resp)
+        except Exception as e: ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
         return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
-
-    tasks = [
-        asyncio.create_task(proc(m, chal))
-        for m in mmap.values() if m.model for chal in challenges
-    ]
-    if progress:
-        with alive_bar(len(tasks), title="Running challenges") as bar:
-            for task in asyncio.as_completed(tasks):
-                results.append(await task)
-                bar()
-    else:
-        for task in asyncio.as_completed(tasks):
-            results.append(await task)
-
-    logger.trace("Finished all runs (%d results)", len(results))
-    return results
-
+    tasks = [ asyncio.create_task(proc(m, chal)) for m in mmap.values() if m.model for chal in challenges]  
+    for task in asyncio.as_completed(tasks): 
+        result: Result = await task
+        response.append(result)
+        logger.debug(
+            LOG_TEMPLATE.format(
+                env    = result.challenge.env.name,                   
+                uid    = result.miner.uid,                 
+                model  = result.miner.model[:50] or "",         
+                success= "RECV" if result.response.success else "NULL",
+                score  = result.evaluation.score,
+                latency= result.response.latency_seconds
+            )
+        )
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -389,341 +479,117 @@ async def miners(
 
 
 # --------------------------------------------------------------------------- #
-#                              S3 Operations                                  #
+#                               CLI                                           #
 # --------------------------------------------------------------------------- #
+@click.group()
+@click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
+def cli(verbose):
+    """Affine CLI"""
+    setup_logging(verbose)
 
-def _local_path(key: str) -> Path:
-    """
-    Map every remote key such as
-        'affine/snapshots/<addr>/<blk>.json'
-    to a local file under ~/.affine/…
-    """
-    p = LOCAL_BASE / key
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
+@cli.command('set')
+@click.argument('key')
+@click.argument('value')
+def set_config(key: str, value: str):
+    """Set a key-value pair in ~/.affine/config.env."""
+    path = os.path.expanduser("~/.affine/config.env")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lines = [l for l in open(path).readlines() if not l.startswith(f"{key}=")] if os.path.exists(path) else []
+    lines.append(f"{key}={value}\n")
+    open(path, "w").writelines(lines)
+    logger.info("Set %s in %s", key, path)
+    click.echo(f"Set {key} in {path}")
 
-def get_client_ctx():
-    ACCOUNT = get_conf("R2_ACCOUNT_ID")
-    KEY_ID  = get_conf("R2_WRITE_ACCESS_KEY_ID")
-    SECRET  = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
-    endpoint = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
-    cfg      = botocore.config.Config(max_pool_connections=256)
-    session  = get_session()
-    return session.create_client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=KEY_ID,
-        aws_secret_access_key=SECRET,
-        config=cfg,
-    )
-
-
-async def _json_bytes(obj: Any) -> bytes:
-    return json.dumps(
-        obj, default=lambda o: o.json() if hasattr(o, "json") else o
-    ).encode("utf-8")
-    
-
-async def get(key: str) -> Any:
-    async with get_client_ctx() as client:
-        bucket = get_conf("R2_BUCKET_ID")
-        resp   = await client.get_object(Bucket=bucket, Key=key)
-        body   = await resp["Body"].read()
-        ctype  = resp.get("ContentType", "")
-        if ctype == "application/json":
-            return json.loads(body.decode("utf-8"))
-        return body
-
-async def sink(key: str, obj: Any, *, content_type: str = "application/json"):
-    """
-    Write *once* to R2 (best‑effort) and *always* to ~/.affine/…
-    Failure in either path is logged but never aborts the caller.
-    """
-    # Prepare body only once
-    if content_type == "application/json":
-        body = await _json_bytes(obj)
-    else:
-        body = obj if isinstance(obj, (bytes, bytearray)) else bytes(obj)
-
-    # ---- Remote write (best‑effort) ---------------------------------------
-    try:
-        async with get_client_ctx() as client:
-            bucket = get_conf("R2_BUCKET_ID")
-            await client.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=body,
-                ContentType=content_type,
-            )
-    except Exception:
-        logger.error("Unexpected error writing to R2", exc_info=True)
-
-    # ---- Local write (must succeed unless fatal) --------------------------
-    try:
-        lp = _local_path(key)
-        await asyncio.to_thread(lp.write_bytes, body)
-    except Exception:
-        logger.error("Unexpected error writing to ~/.affine", exc_info=True)
-        
-async def dataset(tail: int = 1000, max_concurrency: int = 10):
-    sub = await get_subtensor()
-    cur = await sub.get_current_block()
-    cutoff = cur - tail
-
-    bucket = get_conf("R2_BUCKET_ID")
-    client = get_client_ctx()
-    prefix = "affine/results/"
-    keys: list[str] = []
-
-    # 1. collect keys
-    async with client as s3:
-        paginator = s3.get_paginator("list_objects_v2")
-        async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                blk = int(obj["Key"].rsplit("/", 1)[-1].removesuffix(".json"))
-                if blk > cutoff:
-                    keys.append(obj["Key"])
-
-    # 2. prepare a semaphore to limit simultaneous fetches
-    sem = asyncio.Semaphore(max_concurrency)
-
-    async def fetch(key: str):
-        async with sem:
-            return await get(key)
-
-    # 3. schedule all fetches
-    tasks = [asyncio.create_task(fetch(key)) for key in keys]
-
-    # 4. gather results as they complete, updating a tqdm bar
-    results: list[dict] = []
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Downloading results"):
-        batch = await coro
-        results.extend(batch)
-
-    return results
-
-# --------------------------------------------------------------------------- #
-#                           Snapshot load on startup                          #
-# --------------------------------------------------------------------------- #
-def _load_latest_snapshot(wallet_ss58: str):
-    """
-    Returns tuple:
-        blocks, revisions, models, scores, last_set
-    If no snapshot is found everything is initialised empty.
-    """
-    snap_dir = LOCAL_BASE / "affine" / "snapshots" / wallet_ss58
-    if not snap_dir.exists():
-        return {}, {}, {}, {}, -1
-
-    latest = max(snap_dir.glob("*.json"), default=None)
-    if latest is None:
-        return {}, {}, {}, {}, -1
-
-    with latest.open("r") as fh:
-        data = json.load(fh)
-
-    blocks     = data.get("blocks", {})
-    revisions  = data.get("revisions", {})
-    models     = data.get("models", {})
-    scores_raw = data.get("scores", {})
-    scores     = {
-        hk: defaultdict(float, sc) for hk, sc in scores_raw.items()
-    }
-    last_set   = data.get("blk", -1)
-    return blocks, revisions, models, scores, last_set
-
-# --------------------------------------------------------------------------- #
-#                               Validator                                     #
-# --------------------------------------------------------------------------- #
-from .envs.sat import SAT
-from .envs.abd import ABDUCTION
-from .envs.ded import DEDUCTION
-
-# Registry of active environments
-ENVS = {"SAT": SAT, "ABDUCTION": ABDUCTION, "DEDUCTION": DEDUCTION}
 @cli.command("validate")
 @click.option("--coldkey", default=None, help="Cold wallet name")
 @click.option("--hotkey", default=None, help="Hot wallet key")
 def validate(coldkey: str, hotkey: str):
-    console = Console()
+    
+    # ---------------- Init Wallet ------------------------
     coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
     hotkey  = hotkey  or get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
+    
+    # ---------------- Set weights. ------------------------
+    LAST = 0
+    ALPHA = 0.9
+    TEMPO = 100
+    RESULTS: List[Result] = []
+    async def maybe_set_weights( sub, meta, block ): 
+        nonlocal LAST, RESULTS       
+        if block - LAST < TEMPO: return
+        next_results = await dataset( tail = min(block - LAST, 1000) )
+        print(next_results)
+        RESULTS.extend( next_results )
+        LAST = block
 
-    async def main():
-        alpha = 0.90
-        subtensor = await get_subtensor()
-        meta      = await subtensor.metagraph(NETUID)
-        env_instances = {
-            name: cls() for name, cls in ENVS.items()
-        }
+        # ---------------- Compute scores ------------------------
+        prev = { } 
+        scores = { hk: 0 for hk in meta.hotkeys } 
+        for rc in RESULTS:
+            hk = rc.miner.hotkey
+            env = rc.challenge.env.name
+            scr = rc.evaluation.score
+            if hk in prev:
+                pr = prev[ hk ]
+                reset = pr.miner.block != rc.miner.block
+                reset = pr.miner.model != rc.miner.model
+                reset = pr.miner.chute.revision != pr.miner.chute.revision
+                if reset:
+                    scores[hk][env] = 0
+            prev[ hk ] = rc
+            if rc.response.success:
+                scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
 
-        # ---- Load previous state (if any) ---------------------------------
-        blocks, revisions, models, scores, last_set = _load_latest_snapshot(
-            wallet.hotkey.ss58_address
+        # ---------------- Compute Pairwise Dominance -----------------
+        ranks, counts = {}, defaultdict(int)
+        for e in ENVS:
+            uniq = sorted({scores[h][e] for h in meta.hotkeys}, reverse=True)
+            rank_of = {score: i + 1 for i, score in enumerate(uniq)}
+            ranks[e] = {h: rank_of[scores[h][e]] for h in meta.hotkeys}
+        for a in meta.hotkeys:
+            for b in meta.hotkeys:
+                if a == b: continue
+                better    = sum(ranks[e][a] < ranks[e][b] for e in ENVS)
+                not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
+                if not_worse and better >= 1:
+                    counts[a] += 1
+
+        # ---------------- Set weights. ------------------------
+        best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[ hk ].miner.block ) )                
+        weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
+        await sub.set_weights(
+            wallet=wallet,
+            netuid=NETUID,
+            uids=meta.uids,
+            weights=weights,
+            wait_for_inclusion=False
         )
-
-        # ---- Pull initial list of miners ----------------------------------
-        miners_map = await miners(no_null=True, metagraph=meta)
-
-        # Ensure every current miner has entries, even if snapshot empty
-        for m in miners_map.values():
-            blocks.setdefault(m.hotkey, m.block)
-            revisions.setdefault(m.hotkey, m.revision)
-            models.setdefault(m.hotkey, m.model)
-            scores.setdefault(m.hotkey, defaultdict(float))
-
+        
+    # ---------------- Main loop. ------------------------
+    async def loop():
+        subtensor = None
+        envs = { name: cls() for name, cls in ENVS.items() }
         while True:
             try:
-                # ---- Refresh chain state & miner list ---------------------
-                blk        = await subtensor.get_current_block()
-                meta       = await subtensor.metagraph(NETUID)
+                if subtensor is None: subtensor = await get_subtensor()
+                meta = await subtensor.metagraph( NETUID )
+                blk = await subtensor.get_current_block()
                 miners_map = await miners(no_null=True, metagraph=meta)
-
-                # ---------------- Reset logic -----------------------------
-                for m in miners_map.values():
-                    if (
-                        blocks.get(m.hotkey)   != m.block
-                        or revisions.get(m.hotkey) != m.revision
-                        or models.get(m.hotkey)    != m.model
-                    ):
-                        blocks[m.hotkey]    = m.block
-                        revisions[m.hotkey] = m.revision
-                        models[m.hotkey]    = m.model
-                        scores[m.hotkey]    = defaultdict(float)
-
-                hotkeys = [m.hotkey for m in miners_map.values()]
-                miners_map = {m.hotkey: m for m in miners_map.values()}
-
-                if not miners_map:
-                    logger.debug("No valid miners, waiting …")
-                    await asyncio.sleep(10)
-                    continue
-
-                # ---------------- Evaluate miners -------------------------
-                try:
-                    # use the pre‑instantiated envs here
-                    challenges = [
-                        await env.generate()
-                        for env in env_instances.values()
-                    ]
-                    results    = await run(
-                        challenges=challenges, miners=miners_map, timeout=90
-                    )
-                    for r in results:
-                        e = r.challenge.env.name
-                        hk = r.miner.hotkey
-                        raw = r.evaluation.score
-                        if r.response.success:
-                            scores[hk][e] = raw * (1 - alpha) + scores[hk][e] * alpha
-                        logger.info(
-                            f"Environment: {e}, "
-                            f"Miner: {hk[:10]}, "
-                            f"Model: {r.miner.model}, "
-                            f"Score: {raw:.4f}, "
-                            f"Current: {scores[hk][e]:.4f}, "
-                            f"Success: {r.response.success}"
-                        )
-                except Exception as e:
-                    traceback.print_exc()
-                    logger.info(f"[yellow]Transient error during eval:[/yellow] {e}. Continuing validator loop…")
-                    continue
-
-                # ---- Persist raw results ---------------------------------
-                await sink(
-                    f"affine/results/{wallet.hotkey.ss58_address}/{blk}.json",
-                    [r.json() for r in results],
-                )
-
-                # ---------------- Rank & dominance ------------------------
-                ranks, counts = {}, defaultdict(int)
-                for e in ENVS:
-                    uniq = sorted({scores[h][e] for h in hotkeys}, reverse=True)
-                    rank_of = {score: i + 1 for i, score in enumerate(uniq)}
-                    ranks[e] = {h: rank_of[scores[h][e]] for h in hotkeys}
-
-                for a in hotkeys:
-                    for b in hotkeys:
-                        if a == b:
-                            continue
-                        better = sum(ranks[e][a] < ranks[e][b] for e in ENVS)
-                        not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
-                        if not_worse and better >= 1:
-                            counts[a] += 1
-
-                best_key, best = (-1, None), None
-                for h in hotkeys:
-                    key = (counts.get(h, 0), -blocks.get(h, 0))
-                    if key > best_key:
-                        best_key, best = key, h
-
-                weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
-
-                # ---- Persist snapshot (remote + local) -------------------
-                await sink(
-                    f"affine/snapshots/{wallet.hotkey.ss58_address}/{blk:08d}.json",
-                    {
-                        "blk":        blk,
-                        "scores":     {hk: dict(scores[hk]) for hk in hotkeys},
-                        "blocks":     blocks,
-                        "revisions":  revisions,
-                        "models":     models,
-                        "weights":    weights,
-                        "miners": {
-                            hk: {"uid": miner.uid, "model": miner.model, "revision": miner.revision}
-                            for hk, miner in miners_map.items()
-                        },
-                    },
-                )
-
-                # ---- Render live table -----------------------------------
-                table = Table(title=f"Block {blk}")
-                table.add_column("UID", style="bold")
-                table.add_column("Block", justify="right")
-                table.add_column("Model", justify="right")
-                table.add_column("Rev", justify="right")
-                for e in ENVS:
-                    table.add_column(f"{e} Score", justify="right")
-                    table.add_column(f"{e} Rank", justify="right")
-                table.add_column("Weight", justify="right")
-
-                for hk in hotkeys:
-                    miner = miners_map.get(hk)
-                    if not miner:
-                        continue
-                    row = [
-                        str(miner.uid),
-                        str(miner.block),
-                        miner.model,
-                        str(miner.revision),
-                    ]
-                    for e in ENVS:
-                        row.extend([f"{scores[hk][e]:.4f}", str(ranks[e][hk])])
-                    row.append(f"{weights[meta.hotkeys.index(hk)]:.2f}")
-                    table.add_row(*row)
-                console.print(table)
-
-                # ---- Submit weights periodically -------------------------
-                if blk - last_set > 100:
-                    await subtensor.set_weights(
-                        wallet=wallet,
-                        netuid=NETUID,
-                        uids=meta.uids,
-                        weights=weights,
-                        wait_for_inclusion=False,
-                    )
-                    last_set = blk
-
-            except KeyboardInterrupt:
-                sys.exit(0)
+                challenges = [await e.generate() for e in envs.values()]
+                results    = await run(challenges, miners_map, timeout=90)
+                await sink( wallet = wallet, block = blk, results = results )
+                await maybe_set_weights( subtensor, meta, blk )
+            except asyncio.CancelledError: break
             except Exception as e:
                 traceback.print_exc()
-                console.log(f"[yellow]Transient error:[/yellow] {e}. Continuing validator loop…")
+                logger.info(f"[yellow]Error in producer:[/yellow] {e}. Continuing ...")
+                subtensor = None  # Force reconnection on next iteration
+                await asyncio.sleep(10)  # Wait before retrying
                 continue
-
-    asyncio.run(main())
+            
+    asyncio.run( loop() )
     
-
 
 # --------------------------------------------------------------------------- #
 #                              Pull Model                                     #

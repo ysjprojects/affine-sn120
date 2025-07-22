@@ -48,34 +48,34 @@ class BufferedDataset:
         )
         backoff = self.initial_backoff
         for attempt in range(1, self.max_retries + 1):
-            af.logger.debug(f"HF fetch attempt {attempt}: offset={offset}, len={length}")
+            af.logger.trace(f"HF fetch attempt {attempt}: offset={offset}, len={length}")
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(url, timeout=30) as resp:
                     if resp.status == 429:
-                        af.logger.debug(f"Rate‑limit hit; sleeping {backoff:.1f}s")
+                        af.logger.warning(f"Ratelimit hit; sleeping {backoff:.1f}s")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * self.backoff_factor, self.max_backoff)
                         continue
                     resp.raise_for_status()
                     data = await resp.json()
                     rows = [r["row"] for r in data.get("rows", [])]
-                    af.logger.debug(f"Fetched {len(rows)} rows")
+                    af.logger.trace(f"Fetched {len(rows)} rows")
                     return rows
         raise RuntimeError("HF rate-limit retries exhausted")
 
     async def _fill_buffer(self) -> None:
-        af.logger.debug("Starting buffer fill")
+        af.logger.trace("Starting buffer fill")
         while len(self._buffer) < self.buffer_size:
             batch = self.max_batch
             offset = self._rng.randint(0, max(0, self.total_size - batch))
             try:
                 rows = await self.fetch_hf(offset, batch)
             except Exception as e:
-                af.logger.debug(f"Fetch error: {e!r}")
+                af.logger.warning(f"Fetch error: {e!r}")
                 continue
             for item in rows:
                 self._buffer.append(item)
-        af.logger.debug("Buffer fill complete")
+        af.logger.trace("Buffer fill complete")
 
     async def get(self) -> Any:
         async with self._lock:

@@ -2,10 +2,10 @@ import random, re
 import affine as af
 
 class SAT(af.BaseEnv):
+    __version__: int = "0.0.0"
     n: int
     k: int
     m: int
-    
     def __init__(self, n=3, k=2, m=None):
         super().__init__(n=n, k=k, m=m or int(4.26 * n))
         
