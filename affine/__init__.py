@@ -4,7 +4,6 @@
 #                             Imports                                         #
 # --------------------------------------------------------------------------- #
 import os
-import re
 import sys
 import json
 import time
@@ -14,26 +13,19 @@ import aiohttp
 import asyncio
 import logging
 import textwrap
-import botocore
 import traceback
-from tqdm import tqdm
 import bittensor as bt
-import botocore.config
 from pathlib import Path
-from rich.table import Table
-from functools import partial
 from dotenv import load_dotenv
-from rich.console import Console
 from huggingface_hub import HfApi
+from botocore.config import Config
 from collections import defaultdict
 from abc import ABC, abstractmethod
-from alive_progress import alive_bar
 from aiobotocore.session import get_session
 from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
-
 from .utils import *
 
 __version__ = "0.0.0"
@@ -103,7 +95,6 @@ class BaseEnv(BaseModel, ABC):
     async def generate(self) -> "Challenge": ...
     @abstractmethod
     async def evaluate(self, challenge: "Challenge", response: "Response") -> "Evaluation": ...
-    
 
 # --------------------------------------------------------------------------- #
 #                         Models with new (de)serialisation                   #
@@ -194,195 +185,93 @@ from .envs.ded import DED
 ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
 
 # --------------------------------------------------------------------------- #
-#                   S3 helpers (unchanged apart from serialisation)           #
+#                   S3 helpers                                                #
 # --------------------------------------------------------------------------- #
-def get_client_ctx():
-    ACCOUNT = get_conf("R2_ACCOUNT_ID"); KEY_ID = get_conf("R2_WRITE_ACCESS_KEY_ID"); SECRET = get_conf("R2_WRITE_SECRET_ACCESS_KEY")
-    endpoint = f"https://{ACCOUNT}.r2.cloudflarestorage.com"
-    cfg = botocore.config.Config(max_pool_connections=256)
-    return get_session().create_client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=KEY_ID,
-        aws_secret_access_key=SECRET,
-        config=cfg
-    )
+get_client_ctx = lambda: get_session().create_client(
+    "s3",
+    endpoint_url=f"https://{get_conf('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
+    aws_access_key_id=get_conf("R2_WRITE_ACCESS_KEY_ID"),
+    aws_secret_access_key=get_conf("R2_WRITE_SECRET_ACCESS_KEY"),
+    config=Config(max_pool_connections=256)
+)
 
-async def sink(
-    wallet: bt.wallet,
-    block: int,
-    results: List[Result],
-):
+async def sink(wallet: bt.wallet, block: int, results: list[Result]):
     key = f"affine/results/{wallet.hotkey.ss58_address}/{block}.json"
-    raw: List[dict] = []
-    for r in results:
-        r.sign(wallet)
-        raw.append( r.model_dump(mode="json") )
-    body = json.dumps(raw).encode("utf-8")
+    body = json.dumps([r.sign(wallet) or r.model_dump(mode="json") for r in results]).encode()
     logger.debug(f"[SINK] block={block} → key={key}")
     try:
         async with get_client_ctx() as client:
-            await client.put_object(
-                Bucket = get_conf("R2_BUCKET_ID"),
-                Key    = key,
-                Body   = body
-            )
-    except Exception:
-        logger.error("R2 write failed for %s", key, exc_info=True)
+            await client.put_object(Bucket=get_conf("R2_BUCKET_ID"), Key=key, Body=body)
+    except Exception: logger.error("R2 write failed for %s", key, exc_info=True)
 
-async def get(key: str) -> Any:
+async def get(key: str):
     async with get_client_ctx() as client:
         resp = await client.get_object(Bucket=get_conf("R2_BUCKET_ID"), Key=key)
-        body = await resp["Body"].read()
-        return json.loads(body) if resp.get("ContentType") == "application/json" else body
+        data = await resp["Body"].read()
+    return json.loads(data) if resp.get("ContentType") == "application/json" else data
 
-
-async def dataset(
-    tail: int = 1000,
-    max_concurrency: int = 10
-) -> List[Result]:
-    """
-    Fetch all result‑files newer than (current_block – tail) from R2,
-    parse each JSON blob into Result instances, and return the full list.
-    """
-    sub    = await get_subtensor()
-    cur    = await sub.get_current_block()
-    cutoff = cur - tail
+async def dataset(tail: int = 1000, max_concurrency: int = 10) -> list[Result]:
+    sub = await get_subtensor()
+    cutoff = (await sub.get_current_block()) - tail
     bucket, prefix = get_conf("R2_BUCKET_ID"), "affine/results/"
-    keys: List[str] = []
-
-    # 1) list candidate objects
+    # collect all keys newer than cutoff
+    keys = []
     async with get_client_ctx() as s3:
-        paginator = s3.get_paginator("list_objects_v2")
-        async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                k = obj["Key"]
+        pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+        async for page in pages:
+            for o in page.get("Contents", []):
+                k = o["Key"]
                 try:
-                    blk = int(k.rsplit("/", 1)[-1].removesuffix(".json"))
-                    if blk > cutoff:
-                        keys.append(k)
-                except ValueError:continue
+                    if int(k.rsplit("/", 1)[-1].removesuffix(".json")) > cutoff: keys.append(k)
+                except ValueError: pass
 
-    # 2) concurrent fetch + JSON‐decode
     sem = asyncio.Semaphore(max_concurrency)
-    async def fetch_and_load(key: str) -> Any:
+    async def fetch(k):
         async with sem:
-            data = await get(key)
-            if isinstance(data, (bytes, bytearray)):
-                try: data = json.loads(data)
-                except Exception as e: return None
-            return data
+            d = await get(k)
+            return json.loads(d) if isinstance(d, (bytes, bytearray)) else d
 
-    # Rehydrate.
-    tasks = [asyncio.create_task(fetch_and_load(k)) for k in sorted(keys)]
-    results: List[Result] = []
-    for coro in asyncio.as_completed(tasks):
-        batch = await coro
-        if not isinstance(batch, list):continue
-        for item in batch:
-            try: 
-                result = Result.model_validate(item)
-                if result.verify():
-                    results.append(result)
-            except Exception as e: logger.trace(f'Deserialize error:{e}')
+    results = []
+    # fetch & rehydrate
+    batches = await asyncio.gather(*[fetch(k) for k in sorted(keys)])
+    for batch in batches:
+        if isinstance(batch, list):
+            for item in batch:
+                try:
+                    r = Result.model_validate(item)
+                    if r.verify(): results.append(r)
+                except Exception: logger.trace("Deserialization error", exc_info=True)
     return results
 
 
 # --------------------------------------------------------------------------- #
-#                               API                                           #
+#                               QUERY                                         #
 # --------------------------------------------------------------------------- #
-async def get_chute(model: str) -> Dict[str, Any]:
-    url = f"https://api.chutes.ai/chutes/{model}"
-    token = os.getenv("CHUTES_API_KEY", "")
-    headers = {"Authorization": token}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as r:
-            text = await r.text(errors="ignore")
-            if r.status != 200:
-                return None
-            info = await r.json()
-            for k in ('readme','cords','tagline','instances'):
-                info.pop(k, None)
-            info.get('image', {}).pop('readme', None)
-            return info
-        
-async def get_chute_code(identifier: str) -> Optional[str]:
-    url = f"https://api.chutes.ai/chutes/code/{identifier}"
-    token = os.getenv("CHUTES_API_KEY", "")
-    headers = {"Authorization": token}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as r:
-            if r.status != 200:
-                return None
-            return await r.text(errors="ignore")
-
-def _extract_revision(code: str) -> Optional[str]:
-    """Extract `--revision <sha>` from chute code string."""
-    import re
-    m = re.search(r"--revision\s+([0-9a-f]{40})", code)
-    return m.group(1) if m else None
-
-
-
-# ── run challenges ────────────────────────────────────────────────────────────
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
 
-async def query(prompt:str, model:str = "unsloth/gemma-3-12b-it", timeout=120, retries=0, backoff=1) -> Response:
+async def query(prompt, model="unsloth/gemma-3-12b-it", timeout=120, retries=0, backoff=1) -> Response:
     url = "https://llm.chutes.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}",
-        "Content-Type": "application/json"
-    }
+    hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
     start = time.monotonic()
-    logger.trace("Starting %r on model=%s", prompt[:30], model)
+    R = lambda resp, at, err, ok: Response(response=resp, latency_seconds=time.monotonic()-start,
+                                          attempts=at, model=model, error=err, success=ok)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        for attempt in range(1, retries + 2):
+        for attempt in range(1, retries+2):
             try:
-                async with HTTP_SEM, sess.post(
-                    url,
-                    json={"model": model, "messages": [{"role": "user", "content": prompt}]},
-                    headers=headers,
-                    timeout=timeout
-                ) as resp:
-                    text = await resp.text(errors="ignore")
-                    if resp.status in TERMINAL:
-                        return Response(
-                            response=None,
-                            latency_seconds=time.monotonic() - start,
-                            attempts=attempt,
-                            model=model,
-                            error=f"{resp.status}:{text}",
-                            success=False
-                        )
-                    if resp.status != 200:
-                        raise RuntimeError(f"{resp.status}:{text}")
-                    body = await resp.json()
-                    content = body["choices"][0]["message"]["content"]
-                    return Response(
-                        response=content,
-                        latency_seconds=time.monotonic() - start,
-                        attempts=attempt,
-                        model=model,
-                        error=None,
-                        success=True
-                    )
-
+                async with HTTP_SEM, sess.post(url, json={"model": model, "messages":[{"role":"user","content":prompt}]},
+                                               headers=hdr, timeout=timeout) as r:
+                    txt = await r.text(errors="ignore")
+                    if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
+                    r.raise_for_status()
+                    content = (await r.json())["choices"][0]["message"]["content"]
+                    return R(content, attempt, None, True)
             except Exception as e:
-                if attempt > retries:
-                    return Response(
-                        response=None,
-                        latency_seconds=time.monotonic() - start,
-                        attempts=attempt,
-                        model=model,
-                        error=str(e),
-                        success=False
-                    )
+                if attempt > retries: return R(None, attempt, str(e), False)
                 await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
 
-
 LOG_TEMPLATE = (
-    "[RESULT]"
+    "[RESULT] "
     "{pct:>3.0f}% | "
     "U{uid:>3d} │ "
     "{model:<50s} │ "
@@ -424,71 +313,72 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
 
 
 # --------------------------------------------------------------------------- #
-#                              Miner                                          #
+#                              Miners                                         #
 # --------------------------------------------------------------------------- #
+async def get_chute(model: str) -> Dict[str, Any]:
+    url = f"https://api.chutes.ai/chutes/{model}"
+    token = os.getenv("CHUTES_API_KEY", "")
+    headers = {"Authorization": token}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as r:
+            text = await r.text(errors="ignore")
+            if r.status != 200:
+                return None
+            info = await r.json()
+            for k in ('readme','cords','tagline','instances'):
+                info.pop(k, None)
+            info.get('image', {}).pop('readme', None)
+            return info
+        
+async def get_chute_code(identifier: str) -> Optional[str]:
+    url = f"https://api.chutes.ai/chutes/code/{identifier}"
+    token = os.getenv("CHUTES_API_KEY", "")
+    headers = {"Authorization": token}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as r:
+            if r.status != 200:
+                return None
+            return await r.text(errors="ignore")
+
+def _extract_revision(code: str) -> Optional[str]:
+    """Extract `--revision <sha>` from chute code string."""
+    import re
+    m = re.search(r"--revision\s+([0-9a-f]{40})", code)
+    return m.group(1) if m else None
+
 async def miners(
     uids: Optional[Union[int, List[int]]] = None,
-    no_null: bool = False,
     netuid: int = NETUID,
-    min_block: int = 0,
-    metagraph: object = None,
+    meta: object = None,
 ) -> Dict[int, Miner]:
-    # Preamble
-    subtensor = await get_subtensor()
-    metagraph = metagraph or await subtensor.metagraph(netuid)
-    hotkeys = metagraph.hotkeys
-    revs = await subtensor.get_all_revealed_commitments(netuid)
-    if uids is None:uids = list(range(len(hotkeys)))
-    elif isinstance(uids, int): uids = [uids]
-
-    # Single async fetch,
-    async def fetch(uid: int) -> Optional[Miner]:
-        # Check exists.
-        if not (0 <= uid < len(hotkeys)): return None
-
-        hk = hotkeys[uid]
-        commits = revs.get(hk) or []
-        if not commits: return None
-
-        # Check revision.
-        block, data = commits[-1]
-        rev = None
-        if isinstance(data, str) and data.strip().startswith("{"):
-            try:
-                parsed = json.loads(data)
-                data, rev = parsed.get("model"), parsed.get("revision")
-            except json.JSONDecodeError:
-                pass
-
-        # Filer non block.
-        model = data
-        if no_null and (block is None or model is None or block < min_block): return None
-
-        # fetch chute info
-        chute = await get_chute(str(model))
-        if chute:
-            rev = chute.get("revision") or rev
-            if rev is None and (cid := chute.get("id") or chute.get("uuid")):
-                code = await get_chute_code(cid)
-                rev = _extract_revision(code or "")
-        else:
-            code = await get_chute_code(str(model))
-            rev = _extract_revision(code or "")
-
-        if no_null and chute is None: return None
-        miner = Miner(
-            uid=uid,
-            hotkey=hk,
-            model=str(model),
-            revision=rev,
-            block=int(block),
-            chute=chute,
-        )
-        return miner
+    sub = await get_subtensor()
+    meta = meta or await sub.metagraph(netuid)
+    commits = await sub.get_all_revealed_commitments(netuid)
+    if uids is None:uids = list(range(len(meta.hotkeys)))
+    elif isinstance(uids, int): uids = [uids]    
+    async def fetch(uid: int):
+        try:
+            hotkey = meta.hotkeys[ uid ]
+            if hotkey not in commits: return None
+            commit = commits[hotkey]
+            block, data = commit[-1]        
+            data = json.loads(data)
+            model, miner_revision = data.get("model"), data.get("revision")
+            chute = await get_chute(model)
+            code = await get_chute_code(chute['chute_id'])
+            chutes_revision = _extract_revision(code)
+            if chutes_revision == None or miner_revision == chutes_revision:
+                miner = Miner(
+                    uid=uid, hotkey=hotkey, model=model, block=int(block),
+                    revision = miner_revision,
+                    chute=chute,
+                )
+                return miner
+        except: pass
     results = await asyncio.gather(*(fetch(uid) for uid in uids))
     output = {uid: m for uid, m in zip(uids, results) if m is not None}
     return output
-
+        
 
 # --------------------------------------------------------------------------- #
 #                               CLI                                           #
@@ -570,8 +460,9 @@ def validate(coldkey: str, hotkey: str):
                     counts[a] += 1
 
         # ---------------- Set weights. ------------------------
-        best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[ hk ].miner.block ) )                
+        best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
         weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
+        logger.info(weights)
         await sub.set_weights(
             wallet=wallet,
             netuid=NETUID,
@@ -589,7 +480,7 @@ def validate(coldkey: str, hotkey: str):
                 if subtensor is None: subtensor = await get_subtensor()
                 meta = await subtensor.metagraph( NETUID )
                 blk = await subtensor.get_current_block()
-                miners_map = await miners(no_null=True, metagraph=meta)
+                miners_map = await miners(meta=meta)
                 challenges = [await e.generate() for e in envs.values()]
                 results    = await run(challenges, miners_map, timeout=90)
                 await sink( wallet = wallet, block = blk, results = results )
