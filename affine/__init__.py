@@ -4,6 +4,7 @@
 #                             Imports                                         #
 # --------------------------------------------------------------------------- #
 import os
+import re
 import sys
 import json
 import time
@@ -16,7 +17,9 @@ import textwrap
 import traceback
 import bittensor as bt
 from pathlib import Path
+from rich.table import Table
 from dotenv import load_dotenv
+from rich.console import Console
 from huggingface_hub import HfApi
 from botocore.config import Config
 from collections import defaultdict
@@ -341,10 +344,10 @@ async def get_chute_code(identifier: str) -> Optional[str]:
             return await r.text(errors="ignore")
 
 def _extract_revision(code: str) -> Optional[str]:
-    """Extract `--revision <sha>` from chute code string."""
-    import re
-    m = re.search(r"--revision\s+([0-9a-f]{40})", code)
-    return m.group(1) if m else None
+    matches = re.findall(r"--revision\s+([0-9a-f]{40})", code)
+    # only accept exactly one occurrence
+    if len(matches) == 1: return matches[0]
+    return None
 
 async def miners(
     uids: Optional[Union[int, List[int]]] = None,
@@ -461,10 +464,7 @@ def validate(coldkey: str, hotkey: str):
 
         # ---------------- Set weights. ------------------------
         best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
-        weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
-        logger.info(f'ranks:{ranks}')
-        logger.info(f'counts:{counts}')
-        logger.info(f'weights:{weights}')
+        weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]      
         await sub.set_weights(
             wallet=wallet,
             netuid=NETUID,
@@ -472,6 +472,26 @@ def validate(coldkey: str, hotkey: str):
             weights=weights,
             wait_for_inclusion=False
         )
+        
+        # ---------------- Print State ------------------------
+        console = Console(); table   = Table(title="Validator Summary", show_lines=True)
+        table.add_column("UID", justify="right")
+        table.add_column("Model", no_wrap=True)
+        table.add_column("Rev", justify="center")
+        for env in ENVS:
+            table.add_column(f"{env} Score", justify="right")
+            table.add_column(f"{env} Rank",  justify="center")
+        table.add_column("Count", justify="right")
+        table.add_column("Weight", justify="right")
+        for hk in meta.hotkeys:
+            last = prev.get(hk)
+            if not last or not last.miner.model: continue
+            m = last.miner
+            row = [ str(m.uid), m.model, m.revision or ""]
+            for env in ENVS: row += [f"{scores[hk][env]:.4f}", str(ranks[env][hk])]
+            row += [str(counts.get(hk, 0)), f"{weights[meta.hotkeys.index(hk)]:.1f}"]
+            table.add_row(*row)
+        console.print(table)  
         
     # ---------------- Main loop. ------------------------
     async def loop():
