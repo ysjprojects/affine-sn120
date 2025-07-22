@@ -47,7 +47,7 @@ logging.Logger.trace = _trace
 logger = logging.getLogger("affine")
 def setup_logging(verbosity: int):
     level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
-    for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions"]:
+    for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions", "botocore"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.basicConfig(level=level,
                         format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
@@ -462,7 +462,9 @@ def validate(coldkey: str, hotkey: str):
         # ---------------- Set weights. ------------------------
         best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
         weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
-        logger.info(weights)
+        logger.info('ranks', ranks)
+        logger.info('counts', counts)
+        logger.info('weights', weights)
         await sub.set_weights(
             wallet=wallet,
             netuid=NETUID,

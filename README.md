@@ -35,7 +35,7 @@ cp .env.validator.example .env
 (Recommended): Run the validator with docker and watchtower autoupdate.
 ```bash
 # Run the validator with watchtower.
-docker-compose pull && docker-compose up -d && docker-compose logs -f
+docker-compose down && docker-compose pull && docker-compose up -d && docker-compose logs -f
 ```
 
 Run the validator locally
