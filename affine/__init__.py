@@ -93,7 +93,6 @@ def _truncate(t: Optional[str], max_len: int = 80) -> str:
 
 class BaseEnv(BaseModel, ABC):
     """Abstract competition environment."""
-    __version__: int = __version__
     class Config: arbitrary_types_allowed = True
     @property
     def name(self) -> str: return self.__class__.__name__
@@ -169,10 +168,18 @@ class Miner(BaseModel):
     chute: Optional[Dict[str, Any]] = None
 
 class Result(BaseModel):
+    version: str = __version__
+    signature: str = ""
+    hotkey: str = ""
     miner: Miner
     challenge: Challenge
     response: Response
     evaluation: Evaluation
+    def sign(self, wallet):
+        self.hotkey = wallet.hotkey.ss58_address
+        self.signature = (wallet.hotkey.sign( data = str(self.challenge) )).hex()
+    def verify( self ) -> bool:
+        return bt.Keypair(ss58_address=self.hotkey).verify( data = str(self.challenge), signature = bytes.fromhex( self.signature) )
     class Config:
         arbitrary_types_allowed = True
         json_encoders = {BaseEnv: lambda v: v.name}
@@ -206,15 +213,13 @@ async def sink(
     block: int,
     results: List[Result],
 ):
-    """
-    Write a list of Result objects to Cloudflare R2 under
-    affine/results/<hotkey>/<block>.json, using our JSON encoders.
-    """
     key = f"affine/results/{wallet.hotkey.ss58_address}/{block}.json"
-    # --- use Pydantic JSON dump so that env => "SAT"/"ABD"/"DED" instead of {}
-    raw: List[dict] = [r.model_dump(mode="json") for r in results]
+    raw: List[dict] = []
+    for r in results:
+        r.sign(wallet)
+        raw.append( r.model_dump(mode="json") )
     body = json.dumps(raw).encode("utf-8")
-    print(f"[sink] block={block} → key={key}")
+    logger.debug(f"[SINK] block={block} → key={key}")
     try:
         async with get_client_ctx() as client:
             await client.put_object(
@@ -275,7 +280,10 @@ async def dataset(
         batch = await coro
         if not isinstance(batch, list):continue
         for item in batch:
-            try: results.append(Result.model_validate(item))
+            try: 
+                result = Result.model_validate(item)
+                if result.verify():
+                    results.append(result)
             except Exception as e: logger.trace(f'Deserialize error:{e}')
     return results
 
@@ -374,6 +382,8 @@ async def query(prompt:str, model:str = "unsloth/gemma-3-12b-it", timeout=120, r
 
 
 LOG_TEMPLATE = (
+    "[RESULT]"
+    "{pct:>3.0f}% | "
     "U{uid:>3d} │ "
     "{model:<50s} │ "
     "{env:<3} │ "
@@ -395,11 +405,13 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
         except Exception as e: ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
         return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
     tasks = [ asyncio.create_task(proc(m, chal)) for m in mmap.values() if m.model for chal in challenges]  
+    total = len(tasks); completed = 0
     for task in asyncio.as_completed(tasks): 
         result: Result = await task
-        response.append(result)
+        response.append(result); completed += 1
         logger.debug(
             LOG_TEMPLATE.format(
+                pct    = completed / total * 100,
                 env    = result.challenge.env.name,                   
                 uid    = result.miner.uid,                 
                 model  = result.miner.model[:50] or "",         
@@ -518,27 +530,29 @@ def validate(coldkey: str, hotkey: str):
     async def maybe_set_weights( sub, meta, block ): 
         nonlocal LAST, RESULTS       
         if block - LAST < TEMPO: return
+        # Pull and extend RESULTS with all results from validators.
         next_results = await dataset( tail = min(block - LAST, 1000) )
-        print(next_results)
-        RESULTS.extend( next_results )
+        for res in next_results:
+            if res.hotkey in meta.hotkeys and bool(meta.validator_permit[ meta.hotkeys.index( res.hotkey) ]):
+                RESULTS.append( res )
         LAST = block
 
         # ---------------- Compute scores ------------------------
         prev = { } 
-        scores = { hk: 0 for hk in meta.hotkeys } 
-        for rc in RESULTS:
-            hk = rc.miner.hotkey
-            env = rc.challenge.env.name
-            scr = rc.evaluation.score
+        scores = { hk: defaultdict(float) for hk in meta.hotkeys } 
+        for crr in RESULTS:
+            hk = crr.miner.hotkey
+            env = crr.challenge.env.name
+            scr = crr.evaluation.score
             if hk in prev:
-                pr = prev[ hk ]
-                reset = pr.miner.block != rc.miner.block
-                reset = pr.miner.model != rc.miner.model
-                reset = pr.miner.chute.revision != pr.miner.chute.revision
+                prv = prev[ hk ]
+                reset = prv.miner.block != crr.miner.block
+                reset = prv.miner.model != crr.miner.model
+                reset = prv.miner.revision != crr.miner.revision
                 if reset:
                     scores[hk][env] = 0
-            prev[ hk ] = rc
-            if rc.response.success:
+            prev[ hk ] = crr
+            if crr.response.success:
                 scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
 
         # ---------------- Compute Pairwise Dominance -----------------
@@ -583,7 +597,7 @@ def validate(coldkey: str, hotkey: str):
             except asyncio.CancelledError: break
             except Exception as e:
                 traceback.print_exc()
-                logger.info(f"[yellow]Error in producer:[/yellow] {e}. Continuing ...")
+                logger.info(f"Error in loop: {e}. Continuing ...")
                 subtensor = None  # Force reconnection on next iteration
                 await asyncio.sleep(10)  # Wait before retrying
                 continue
