@@ -462,9 +462,9 @@ def validate(coldkey: str, hotkey: str):
         # ---------------- Set weights. ------------------------
         best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
         weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]
-        logger.info('ranks', ranks)
-        logger.info('counts', counts)
-        logger.info('weights', weights)
+        logger.info(f'ranks:{ranks}')
+        logger.info(f'counts:{counts}')
+        logger.info(f'weights:{weights}')
         await sub.set_weights(
             wallet=wallet,
             netuid=NETUID,
