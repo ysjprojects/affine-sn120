@@ -444,7 +444,7 @@ def validate(coldkey: str, hotkey: str):
                 if reset:
                     scores[hk][env] = 0
             prev[ hk ] = crr
-            if crr.response.success:
+            if crr.response.success or crr.miner.chute['hot']:
                 scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
 
         # ---------------- Compute Pairwise Dominance -----------------
