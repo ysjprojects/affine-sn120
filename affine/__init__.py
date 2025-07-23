@@ -17,9 +17,8 @@ import textwrap
 import traceback
 import bittensor as bt
 from pathlib import Path
-from rich.table import Table
+from tabulate import tabulate
 from dotenv import load_dotenv
-from rich.console import Console
 from huggingface_hub import HfApi
 from botocore.config import Config
 from collections import defaultdict
@@ -474,24 +473,16 @@ def validate(coldkey: str, hotkey: str):
         )
         
         # ---------------- Print State ------------------------
-        console = Console(); table   = Table(title="Validator Summary", show_lines=True)
-        table.add_column("UID", justify="right")
-        table.add_column("Model", no_wrap=True)
-        table.add_column("Rev", justify="center")
-        for env in ENVS:
-            table.add_column(f"{env} Score", justify="right")
-            table.add_column(f"{env} Rank",  justify="center")
-        table.add_column("Count", justify="right")
-        table.add_column("Weight", justify="right")
-        for hk in meta.hotkeys:
-            last = prev.get(hk)
-            if not last or not last.miner.model: continue
-            m = last.miner
-            row = [ str(m.uid), m.model, m.revision or ""]
-            for env in ENVS: row += [f"{scores[hk][env]:.4f}", str(ranks[env][hk])]
-            row += [str(counts.get(hk, 0)), f"{weights[meta.hotkeys.index(hk)]:.1f}"]
-            table.add_row(*row)
-        console.print(table)  
+        h = ["UID","Model","Rev"] + [f"{e} Score" for e in ENVS] + [f"{e} Rank" for e in ENVS] + ["Count","Weight"]
+        r = [
+            [str(m.uid), m.model, m.revision or ""] 
+            + [f"{scores[hk][e]:.4f}" for e in ENVS] 
+            + [str(ranks[e][hk])      for e in ENVS] 
+            + [str(counts.get(hk,0)), f"{weights[meta.hotkeys.index(hk)]:.1f}"]
+            for hk in meta.hotkeys
+            if (last := prev.get(hk)) and last.miner.model and (m := last.miner)
+        ]
+        logger.info("\nValidator Summary:\n%s", tabulate(r, h, tablefmt="plain"))
         
     # ---------------- Main loop. ------------------------
     async def loop():
