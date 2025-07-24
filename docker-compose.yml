@@ -1,11 +1,8 @@
 version: '3.8'
 
-version: '3.8'
-
 services:
   validator:
     image: thebes1618/affine:latest
-    pull_policy: always
     container_name: affine-validator
     restart: unless-stopped
     env_file:
@@ -15,11 +12,15 @@ services:
       - ./.env:/app/.env
       - ~/.affine:/root/.affine
       - ~/.bittensor/wallets:/root/.bittensor/wallets
-    command: ["-vv", "validate"]
+    ports:
+      - "8001:8000"  # Exposes validator metrics on 8001
+    environment:
+      - AFFINE_METRICS_PORT=8000
+      - AFFINE_METRICS_ADDR=0.0.0.0
+    command: ["-vvv", "validate"]
 
   runner:
     image: thebes1618/affine:latest
-    pull_policy: always
     container_name: affine-runner
     restart: unless-stopped
     env_file:
@@ -29,13 +30,40 @@ services:
       - ./.env:/app/.env
       - ~/.affine:/root/.affine
       - ~/.bittensor/wallets:/root/.bittensor/wallets
-    command: ["-vv", "runner"]
+    ports:
+      - "8002:8000"  # Exposes runner metrics on 8002
+    environment:
+      - AFFINE_METRICS_PORT=8000
+      - AFFINE_METRICS_ADDR=0.0.0.0
+    command: ["-vvv", "runner"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: affine-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: affine-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana
 
   watchtower:
     image: containrrr/watchtower
-    pull_policy: always
     container_name: affine-watchtower
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command: --interval 30 affine-validator affine-runner
+
+volumes:
+  grafana-storage:

@@ -42,6 +42,15 @@ TRACE  = 5
 logging.addLevelName(TRACE, "TRACE")
 
 # --------------------------------------------------------------------------- #
+#                       Prometheus                         #
+# --------------------------------------------------------------------------- #
+from prometheus_client import Counter, CollectorRegistry, start_http_server
+METRICS_PORT   = int(os.getenv("AFFINE_METRICS_PORT", "8000"))
+METRICS_ADDR   = os.getenv("AFFINE_METRICS_ADDR", "0.0.0.0")
+REGISTRY       = CollectorRegistry(auto_describe=True)
+QCOUNT    = Counter("qcount", "qcount", ["model"], registry=REGISTRY)
+
+# --------------------------------------------------------------------------- #
 #                               Logging                                       #
 # --------------------------------------------------------------------------- #
 def _trace(self, msg, *args, **kwargs):
@@ -50,6 +59,9 @@ def _trace(self, msg, *args, **kwargs):
 logging.Logger.trace = _trace
 logger = logging.getLogger("affine")
 def setup_logging(verbosity: int):
+    if not getattr(setup_logging, "_prom_started", False):
+        start_http_server(METRICS_PORT, METRICS_ADDR, registry=REGISTRY)
+        setup_logging._prom_started = True
     level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
     for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions", "botocore"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -257,6 +269,7 @@ async def query(prompt, model="unsloth/gemma-3-12b-it", timeout=120, retries=0, 
     url = "https://llm.chutes.ai/v1/chat/completions"
     hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
     start = time.monotonic()
+    QCOUNT.labels(model=model).inc()
     R = lambda resp, at, err, ok: Response(response=resp, latency_seconds=time.monotonic()-start,
                                           attempts=at, model=model, error=err, success=ok)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
