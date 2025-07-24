@@ -42,10 +42,11 @@ services:
     container_name: affine-prometheus
     restart: unless-stopped
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus.yml:/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
     command:
+      - "--config.file=/prometheus/prometheus.yml"
       - "--log.level=warn"
 
   grafana:
@@ -56,6 +57,7 @@ services:
       - "3000:3000"
     environment:
     - GF_SECURITY_ADMIN_PASSWORD=admin
+    - GF_SERVER_HTTP_ADDR=0.0.0.0
     - GF_LOG_LEVEL=warn       
     - GF_LOG_MODE=console     
     volumes:
