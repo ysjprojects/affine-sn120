@@ -15,6 +15,8 @@ import asyncio
 import logging
 import textwrap
 import traceback
+from .utils import *
+import datetime as dt
 import bittensor as bt
 from pathlib import Path
 from tabulate import tabulate
@@ -28,7 +30,8 @@ from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
-from .utils import *
+
+
 
 __version__ = "0.0.0"
 
@@ -494,6 +497,7 @@ def validate(coldkey: str, hotkey: str):
                 meta = await subtensor.metagraph( NETUID )
                 blk = await subtensor.get_current_block()
                 miners_map = await miners(meta=meta)
+                miners_map = await validate_miners_unchanged(miners_map, margin_sec=300)
                 challenges = [await e.generate() for e in envs.values()]
                 results    = await run(challenges, miners_map, timeout=90)
                 await sink( wallet = wallet, block = blk, results = results )
@@ -555,9 +559,10 @@ def pull(uid: int, model_path: str, hf_token: str):
 @cli.command("push")
 @click.option('--model_path',  default='./model_path', help='Local path to model artifacts.')
 @click.option('--existing-repo', default=None, help='Use an existing HF repo instead of uploading (format <user>/<repo>)')
+@click.option('--revision', default=None, help='Commit SHA to register (only relevant with --existing-repo)')
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
-def push(model_path: str, existing_repo: str, coldkey: str, hotkey: str):
+def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotkey: str):
     """Pushes a model to be hosted by your miner."""
     # -----------------------------------------------------------------------------
     # 1. Wallet & config
@@ -628,9 +633,12 @@ def push(model_path: str, existing_repo: str, coldkey: str, hotkey: str):
     # -----------------------------------------------------------------------------
     # 5. Fetch latest revision hash
     # -----------------------------------------------------------------------------
-    info     = api.repo_info(repo_id=repo_name, repo_type="model")
-    revision = getattr(info, "sha", getattr(info, "oid", "")) or ""
-    logger.debug("Latest revision: %s", revision)
+    if revision:
+        logger.debug("Using user-supplied revision: %s", revision)
+    else:
+        info      = api.repo_info(repo_id=repo_name, repo_type="model")
+        revision  = getattr(info, "sha", getattr(info, "oid", "")) or ""
+        logger.debug("Latest revision from HF: %s", revision)
 
     # -----------------------------------------------------------------------------
     # 6. Commit model revision on-chain
@@ -668,7 +676,7 @@ def push(model_path: str, existing_repo: str, coldkey: str, hotkey: str):
     # -----------------------------------------------------------------------------
     async def deploy_to_chutes():
         logger.debug("Building Chute config")
-        rev_flag = f"--revision {revision} " if revision else ""
+        rev_flag = f'revision="{revision}",' if revision else ""
         chutes_config = textwrap.dedent(f"""
 import os
 from chutes.chute import NodeSelector
@@ -679,8 +687,9 @@ chute = build_sglang_chute(
     username="{chute_user}",
     readme="{repo_name}",
     model_name="{repo_name}",
-    image="chutes/sglang:0.4.6.post5b",
+    image="chutes/sglang:0.4.9.post3",
     concurrency=20,
+    {rev_flag}
     node_selector=NodeSelector(
         gpu_count=4,
         min_vram_gb_per_gpu=24,
@@ -689,7 +698,6 @@ chute = build_sglang_chute(
     ),
     engine_args=(
         "--trust-remote-code "
-        "{rev_flag}"
         "--tool-call-parser deepseekv3 "
     ),
 )
@@ -730,19 +738,130 @@ chute = build_sglang_chute(
         sub       = await get_subtensor()
         meta      = await sub.metagraph(NETUID)
         my_uid    = meta.hotkeys.index(wallet.hotkey.ss58_address)
-        miner  = (await miners(uids=my_uid))[my_uid]
+        miner  = (await miners(netuid=NETUID))[my_uid]
 
         while not (miner.chute or {}).get("hot", False):
             challenge = await SAT().generate()
             await run(challenges=challenge, miners=[miner])
             await sub.wait_for_block()
-            miner = (await miners(uids=my_uid))[my_uid]
+            miner = (await miners(netuid=NETUID))[my_uid]
             logger.trace("Checked hot status: %s", (miner.chute or {}).get("hot"))
 
         logger.debug("Model is now hot and ready")
 
     asyncio.run(warmup_model())
     logger.debug("Mining setup complete. Model is live!")  
+
+
+async def get_hf_last_modified(repo_id: str, hf_token: Optional[str] = None) -> Optional[dt.datetime]:
+ 
+    hf_token = hf_token or os.getenv("HF_TOKEN") or None
+
+    def _fetch_info():
+        api = HfApi(token=hf_token)
+        return api.repo_info(repo_id=repo_id, repo_type="model")
+    try:
+        info = await asyncio.to_thread(_fetch_info)
+    except Exception as exc:
+        logger.debug("get_hf_last_modified: impossible to get %s – %s", repo_id, exc)
+        return None
+
+    ts = getattr(info, "last_modified", None) or getattr(info, "lastModified", None)
+
+    if isinstance(ts, dt.datetime):
+        return ts.astimezone(dt.timezone.utc)
+    if isinstance(ts, str):
+        try:
+            return dt.datetime.fromisoformat(ts.rstrip("Z")) .replace(tzinfo=dt.timezone.utc)
+        except Exception:
+            pass
+    return None
+
+async def get_block_timestamp(block: int, netuid: int = NETUID) -> Optional[dt.datetime]:
+
+    ts_ms = await _block_timestamp_ms(block, netuid)
+    if ts_ms is None:
+        return None
+    return dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc)
+
+async def get_chute_last_modified(model: str) -> Optional[dt.datetime]:
+    info = await get_chute(model)
+    if not info:
+        return None
+    ts_raw = (
+        info.get("updated_at")
+    )
+    if ts_raw is None:
+        return None
+    if isinstance(ts_raw, (int, float)):
+        ts_sec = ts_raw / 1000 if ts_raw > 1e12 else ts_raw
+        return dt.datetime.fromtimestamp(ts_sec, tz=dt.timezone.utc)
+
+    if isinstance(ts_raw, str):
+        try:
+            return dt.datetime.fromisoformat(ts_raw.rstrip("Z")) .replace(tzinfo=dt.timezone.utc)
+        except Exception:
+            try:
+                return dt.datetime.fromtimestamp(float(ts_raw), tz=dt.timezone.utc)
+            except Exception:
+                return None
+    if isinstance(ts_raw, dt.datetime):
+        return ts_raw.astimezone(dt.timezone.utc)
+
+    return None
+        
+
+async def _block_timestamp_ms(block: int, netuid: int = NETUID) -> Optional[int]:
+    async def _try_archive() -> Optional[int]:
+        try:
+            st = bt.async_subtensor("archive")
+            await st.initialize()
+            block_hash = await st.get_block_hash(block)
+            ts_obj = await st.substrate.query("Timestamp", "Now", block_hash=block_hash)
+            return int(ts_obj.value)
+        except Exception as exc:
+            logger.debug("_block_timestamp_ms – archive failed: %s", exc)
+            return None
+
+    async def _try_default() -> Optional[int]:
+        try:
+            st = await get_subtensor()
+            block_hash = await st.get_block_hash(block)
+            ts_obj = await st.substrate.query("Timestamp", "Now", block_hash=block_hash)
+            return int(ts_obj.value)
+        except Exception as exc:
+            logger.debug("_block_timestamp_ms – default failed: %s", exc)
+            return None
+
+    ts_ms = await _try_archive()
+    if ts_ms is None:
+        ts_ms = await _try_default()
+    return ts_ms
+        
+
+async def validate_miners_unchanged(miners_dict: Dict[int, Miner], margin_sec: int = 300) -> Dict[int, Miner]:
+    if not miners_dict:
+        return miners_dict
+
+    async def _is_valid(miner: Miner) -> bool:
+        commit_dt = await get_block_timestamp(miner.block) if miner.block else None
+        if commit_dt is None:
+            return True
+        hf_ts, chute_ts = await asyncio.gather(
+            get_hf_last_modified(miner.model) if miner.model else None,
+            get_chute_last_modified(miner.model) if miner.model else None,
+        )
+        mods = [ts for ts in (hf_ts, chute_ts) if ts]
+        if not mods:
+            return True
+        latest_mod = max(mods)
+        return (latest_mod - commit_dt).total_seconds() <= margin_sec
+
+    flags = await asyncio.gather(*[_is_valid(m) for m in miners_dict.values()])
+
+    invalidated = [(uid, miner) for (uid, miner), ok in zip(miners_dict.items(), flags) if not ok]
+    
+    return {uid: miner for (uid, miner), ok in zip(miners_dict.items(), flags) if ok}
 
 
         
