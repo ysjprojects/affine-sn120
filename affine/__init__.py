@@ -32,7 +32,6 @@ from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence
 
 
-
 __version__ = "0.0.0"
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +253,6 @@ async def dataset(tail: int = 1000, max_concurrency: int = 10) -> list[Result]:
 # --------------------------------------------------------------------------- #
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
-
 async def query(prompt, model="unsloth/gemma-3-12b-it", timeout=120, retries=0, backoff=1) -> Response:
     url = "https://llm.chutes.ai/v1/chat/completions"
     hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
@@ -406,112 +404,157 @@ def set_config(key: str, value: str):
     open(path, "w").writelines(lines)
     logger.info("Set %s in %s", key, path)
     click.echo(f"Set {key} in {path}")
-
-@cli.command("validate")
-@click.option("--coldkey", default=None, help="Cold wallet name")
-@click.option("--hotkey", default=None, help="Hot wallet key")
-def validate(coldkey: str, hotkey: str):
     
-    # ---------------- Init Wallet ------------------------
-    coldkey = coldkey or get_conf("BT_WALLET_COLD", "default")
-    hotkey  = hotkey  or get_conf("BT_WALLET_HOT", "default")
+    
+# --------------------------------------------------------------------------- #
+#                               Watchdog                                      #
+# --------------------------------------------------------------------------- #
+HEARTBEAT = time.monotonic()
+async def watchdog(timeout: int = 300):
+    global HEARTBEAT
+    while True:
+        await asyncio.sleep(timeout // 3)
+        elapsed = time.monotonic() - HEARTBEAT
+        if elapsed > timeout:
+            logging.error(f"[WATCHDOG] Process stalled {elapsed:.0f}s — exiting process.")
+            os._exit(1)
+            
+# --------------------------------------------------------------------------- #
+#                               Runner                                        #
+# --------------------------------------------------------------------------- #
+@cli.command("runner")
+def runner():    
+    coldkey = get_conf("BT_WALLET_COLD", "default")
+    hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
-    
-    # ---------------- Set weights. ------------------------
-    LAST = 0
-    ALPHA = 0.9
-    TEMPO = 100
-    RESULTS: List[Result] = []
-    async def maybe_set_weights( sub, meta, block ): 
-        nonlocal LAST, RESULTS       
-        if block - LAST < TEMPO: return
-        # Pull and extend RESULTS with all results from validators.
-        next_results = await dataset( tail = min(block - LAST, 1000) )
-        for res in next_results:
-            if res.hotkey in meta.hotkeys and bool(meta.validator_permit[ meta.hotkeys.index( res.hotkey) ]):
-                RESULTS.append( res )
-        LAST = block
-
-        # ---------------- Compute scores ------------------------
-        prev = { } 
-        scores = { hk: defaultdict(float) for hk in meta.hotkeys } 
-        for crr in RESULTS:
-            hk = crr.miner.hotkey
-            env = crr.challenge.env.name
-            scr = crr.evaluation.score
-            if hk in prev:
-                prv = prev[ hk ]
-                reset = prv.miner.block != crr.miner.block
-                reset = prv.miner.model != crr.miner.model
-                reset = prv.miner.revision != crr.miner.revision
-                if reset:
-                    scores[hk][env] = 0
-            prev[ hk ] = crr
-            if crr.response.success or crr.miner.chute['hot']:
-                scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
-
-        # ---------------- Compute Pairwise Dominance -----------------
-        ranks, counts = {}, defaultdict(int)
-        for e in ENVS:
-            uniq = sorted({scores[h][e] for h in meta.hotkeys}, reverse=True)
-            rank_of = {score: i + 1 for i, score in enumerate(uniq)}
-            ranks[e] = {h: rank_of[scores[h][e]] for h in meta.hotkeys}
-        for a in meta.hotkeys:
-            for b in meta.hotkeys:
-                if a == b: continue
-                better    = sum(ranks[e][a] < ranks[e][b] for e in ENVS)
-                not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
-                if not_worse and better >= 1:
-                    counts[a] += 1
-
-        # ---------------- Set weights. ------------------------
-        best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
-        weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]      
-        await sub.set_weights(
-            wallet=wallet,
-            netuid=NETUID,
-            uids=meta.uids,
-            weights=weights,
-            wait_for_inclusion=False
-        )
-        
-        # ---------------- Print State ------------------------
-        h = ["UID","Model","Rev"] + [f"{e} Score" for e in ENVS] + [f"{e} Rank" for e in ENVS] + ["Count","Weight"]
-        r = [
-            [str(m.uid), m.model, m.revision or ""] 
-            + [f"{scores[hk][e]:.4f}" for e in ENVS] 
-            + [str(ranks[e][hk])      for e in ENVS] 
-            + [str(counts.get(hk,0)), f"{weights[meta.hotkeys.index(hk)]:.1f}"]
-            for hk in meta.hotkeys
-            if (last := prev.get(hk)) and last.miner.model and (m := last.miner)
-        ]
-        logger.info("\nValidator Summary:\n%s", tabulate(r, h, tablefmt="plain"))
-        
-    # ---------------- Main loop. ------------------------
-    async def loop():
+    async def _run():
         subtensor = None
         envs = { name: cls() for name, cls in ENVS.items() }
         while True:
+            global HEARTBEAT
             try:
                 if subtensor is None: subtensor = await get_subtensor()
                 meta = await subtensor.metagraph( NETUID )
                 blk = await subtensor.get_current_block()
+                HEARTBEAT = time.monotonic()
                 miners_map = await miners(meta=meta)
-                miners_map = await validate_miners_unchanged(miners_map, margin_sec=300)
                 challenges = [await e.generate() for e in envs.values()]
                 results    = await run(challenges, miners_map, timeout=90)
                 await sink( wallet = wallet, block = blk, results = results )
-                await maybe_set_weights( subtensor, meta, blk )
             except asyncio.CancelledError: break
             except Exception as e:
                 traceback.print_exc()
-                logger.info(f"Error in loop: {e}. Continuing ...")
+                logger.info(f"Error in proctor loop: {e}. Continuing ...")
+                subtensor = None  # Force reconnection on next iteration
+                await asyncio.sleep(10)  # Wait before retrying
+                continue
+    async def main():
+        await asyncio.gather(
+            _run(),
+            watchdog()
+        )
+    asyncio.run(main())
+
+# --------------------------------------------------------------------------- #
+#                               Validator                                     #
+# --------------------------------------------------------------------------- #
+@cli.command("validate")
+def validate():
+    coldkey = get_conf("BT_WALLET_COLD", "default")
+    hotkey  = get_conf("BT_WALLET_HOT", "default")
+    wallet  = bt.wallet(name=coldkey, hotkey=hotkey)    
+    async def _run():     
+        LAST = 0
+        ALPHA = 0.9
+        TEMPO = 100
+        RESULTS: List[Result] = []
+        subtensor = None
+        while True:
+            try:
+                global HEARTBEAT
+                if subtensor is None: subtensor = await get_subtensor()
+                meta = await subtensor.metagraph( NETUID )
+                BLOCK = await subtensor.get_current_block()
+                HEARTBEAT = time.monotonic()
+            
+                if BLOCK - LAST < TEMPO: return
+                # Pull and extend RESULTS with all results from validators.
+                next_results = await dataset( tail = min(BLOCK - LAST, 1000) )
+                for res in next_results:
+                    if res.hotkey in meta.hotkeys and bool(meta.validator_permit[ meta.hotkeys.index( res.hotkey) ]):
+                        RESULTS.append( res )
+                LAST = BLOCK
+
+                # ---------------- Compute scores ------------------------
+                prev = { } 
+                scores = { hk: defaultdict(float) for hk in meta.hotkeys } 
+                for crr in RESULTS:
+                    hk = crr.miner.hotkey
+                    env = crr.challenge.env.name
+                    scr = crr.evaluation.score
+                    if hk in prev:
+                        prv = prev[ hk ]
+                        reset = prv.miner.block != crr.miner.block
+                        reset = prv.miner.model != crr.miner.model
+                        reset = prv.miner.revision != crr.miner.revision
+                        if reset:
+                            scores[hk][env] = 0
+                    prev[ hk ] = crr
+                    if crr.response.success or crr.miner.chute['hot']:
+                        scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
+
+                # ---------------- Compute Pairwise Dominance -----------------
+                ranks, counts = {}, defaultdict(int)
+                for e in ENVS:
+                    uniq = sorted({scores[h][e] for h in meta.hotkeys}, reverse=True)
+                    rank_of = {score: i + 1 for i, score in enumerate(uniq)}
+                    ranks[e] = {h: rank_of[scores[h][e]] for h in meta.hotkeys}
+                for a in meta.hotkeys:
+                    for b in meta.hotkeys:
+                        if a == b: continue
+                        better    = sum(ranks[e][a] < ranks[e][b] for e in ENVS)
+                        not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
+                        if not_worse and better >= 1:
+                            counts[a] += 1
+
+                # ---------------- Set weights. ------------------------
+                best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
+                weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]      
+                await subtensor.set_weights(
+                    wallet=wallet,
+                    netuid=NETUID,
+                    uids=meta.uids,
+                    weights=weights,
+                    wait_for_inclusion=False
+                )
+            
+                # ---------------- Print State ------------------------
+                h = ["UID","Model","Rev"] + [f"{e} Score" for e in ENVS] + [f"{e} Rank" for e in ENVS] + ["Count","Weight"]
+                r = [
+                    [str(m.uid), m.model, m.revision or ""] 
+                    + [f"{scores[hk][e]:.4f}" for e in ENVS] 
+                    + [str(ranks[e][hk])      for e in ENVS] 
+                    + [str(counts.get(hk,0)), f"{weights[meta.hotkeys.index(hk)]:.1f}"]
+                    for hk in meta.hotkeys
+                    if (last := prev.get(hk)) and last.miner.model and (m := last.miner)
+                ]
+                logger.info("\nValidator Summary:\n%s", tabulate(r, h, tablefmt="plain"))
+                
+            except asyncio.CancelledError: break
+            except Exception as e:
+                traceback.print_exc()
+                logger.info(f"Error in validator loop: {e}. Continuing ...")
                 subtensor = None  # Force reconnection on next iteration
                 await asyncio.sleep(10)  # Wait before retrying
                 continue
             
-    asyncio.run( loop() )
-    
+    async def main():
+        await asyncio.gather(
+            _run(),
+            watchdog()
+        )
+    asyncio.run(main())
+
 
 # --------------------------------------------------------------------------- #
 #                              Pull Model                                     #
@@ -751,118 +794,3 @@ chute = build_sglang_chute(
 
     asyncio.run(warmup_model())
     logger.debug("Mining setup complete. Model is live!")  
-
-
-async def get_hf_last_modified(repo_id: str, hf_token: Optional[str] = None) -> Optional[dt.datetime]:
- 
-    hf_token = hf_token or os.getenv("HF_TOKEN") or None
-
-    def _fetch_info():
-        api = HfApi(token=hf_token)
-        return api.repo_info(repo_id=repo_id, repo_type="model")
-    try:
-        info = await asyncio.to_thread(_fetch_info)
-    except Exception as exc:
-        logger.debug("get_hf_last_modified: impossible to get %s – %s", repo_id, exc)
-        return None
-
-    ts = getattr(info, "last_modified", None) or getattr(info, "lastModified", None)
-
-    if isinstance(ts, dt.datetime):
-        return ts.astimezone(dt.timezone.utc)
-    if isinstance(ts, str):
-        try:
-            return dt.datetime.fromisoformat(ts.rstrip("Z")) .replace(tzinfo=dt.timezone.utc)
-        except Exception:
-            pass
-    return None
-
-async def get_block_timestamp(block: int, netuid: int = NETUID) -> Optional[dt.datetime]:
-
-    ts_ms = await _block_timestamp_ms(block, netuid)
-    if ts_ms is None:
-        return None
-    return dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc)
-
-async def get_chute_last_modified(model: str) -> Optional[dt.datetime]:
-    info = await get_chute(model)
-    if not info:
-        return None
-    ts_raw = (
-        info.get("updated_at")
-    )
-    if ts_raw is None:
-        return None
-    if isinstance(ts_raw, (int, float)):
-        ts_sec = ts_raw / 1000 if ts_raw > 1e12 else ts_raw
-        return dt.datetime.fromtimestamp(ts_sec, tz=dt.timezone.utc)
-
-    if isinstance(ts_raw, str):
-        try:
-            return dt.datetime.fromisoformat(ts_raw.rstrip("Z")) .replace(tzinfo=dt.timezone.utc)
-        except Exception:
-            try:
-                return dt.datetime.fromtimestamp(float(ts_raw), tz=dt.timezone.utc)
-            except Exception:
-                return None
-    if isinstance(ts_raw, dt.datetime):
-        return ts_raw.astimezone(dt.timezone.utc)
-
-    return None
-        
-
-async def _block_timestamp_ms(block: int, netuid: int = NETUID) -> Optional[int]:
-    async def _try_archive() -> Optional[int]:
-        try:
-            st = bt.async_subtensor("archive")
-            await st.initialize()
-            block_hash = await st.get_block_hash(block)
-            ts_obj = await st.substrate.query("Timestamp", "Now", block_hash=block_hash)
-            return int(ts_obj.value)
-        except Exception as exc:
-            logger.debug("_block_timestamp_ms – archive failed: %s", exc)
-            return None
-
-    async def _try_default() -> Optional[int]:
-        try:
-            st = await get_subtensor()
-            block_hash = await st.get_block_hash(block)
-            ts_obj = await st.substrate.query("Timestamp", "Now", block_hash=block_hash)
-            return int(ts_obj.value)
-        except Exception as exc:
-            logger.debug("_block_timestamp_ms – default failed: %s", exc)
-            return None
-
-    ts_ms = await _try_archive()
-    if ts_ms is None:
-        ts_ms = await _try_default()
-    return ts_ms
-        
-
-async def validate_miners_unchanged(miners_dict: Dict[int, Miner], margin_sec: int = 300) -> Dict[int, Miner]:
-    if not miners_dict:
-        return miners_dict
-
-    async def _is_valid(miner: Miner) -> bool:
-        commit_dt = await get_block_timestamp(miner.block) if miner.block else None
-        if commit_dt is None:
-            return True
-        hf_ts, chute_ts = await asyncio.gather(
-            get_hf_last_modified(miner.model) if miner.model else None,
-            get_chute_last_modified(miner.model) if miner.model else None,
-        )
-        mods = [ts for ts in (hf_ts, chute_ts) if ts]
-        if not mods:
-            return True
-        latest_mod = max(mods)
-        return (latest_mod - commit_dt).total_seconds() <= margin_sec
-
-    flags = await asyncio.gather(*[_is_valid(m) for m in miners_dict.values()])
-
-    invalidated = [(uid, miner) for (uid, miner), ok in zip(miners_dict.items(), flags) if not ok]
-    
-    return {uid: miner for (uid, miner), ok in zip(miners_dict.items(), flags) if ok}
-
-
-        
-

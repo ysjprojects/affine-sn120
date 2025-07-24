@@ -3,8 +3,8 @@ set -e
 
 # Configuration
 DOCKER_USERNAME="thebes1618"
-IMAGE_NAME="affine-validator"
-DOCKERFILE="validator.Dockerfile"
+IMAGE_NAME="affine"
+DOCKERFILE="Dockerfile"
 
 # Get the latest git commit hash
 GIT_COMMIT=$(git rev-parse --short HEAD)
