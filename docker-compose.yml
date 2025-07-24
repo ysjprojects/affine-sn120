@@ -5,14 +5,18 @@ services:
     image: thebes1618/affine:latest
     container_name: affine-validator
     restart: unless-stopped
+    mem_reservation: "6g"
+    mem_limit:       "8g"
     env_file:
       - .env
     volumes:
       - ./.env:/app/.env
       - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - validator-cache:/app/data/blocks
     ports:
       - "8001:8001"  # Exposes validator metrics on 8001
     environment:
+      - AFFINE_CACHE_DIR=/app/data/blocks
       - AFFINE_METRICS_PORT=8000
       - AFFINE_METRICS_ADDR=0.0.0.0
     command: ["-vv", "validate"]
@@ -21,14 +25,18 @@ services:
     image: thebes1618/affine:latest
     container_name: affine-runner
     restart: unless-stopped
+    mem_reservation: "6g"
+    mem_limit:       "8g"
     env_file:
       - .env
     volumes:
       - ./.env:/app/.env
       - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - validator-cache:/app/data/blocks
     ports:
       - "8002:8002"  # Exposes runner metrics on 8002
     environment:
+      - AFFINE_CACHE_DIR=/app/data/blocks
       - AFFINE_METRICS_PORT=8000
       - AFFINE_METRICS_ADDR=0.0.0.0
     command: ["-vv", "runner"]
@@ -69,3 +77,5 @@ services:
 
 volumes:
   grafana-storage:
+  validator-cache:
+    name: affine-validator-cache

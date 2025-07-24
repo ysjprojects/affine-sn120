@@ -205,6 +205,11 @@ ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
 # --------------------------------------------------------------------------- #
 #                   S3 helpers                                                #
 # --------------------------------------------------------------------------- #
+import os
+import json
+import asyncio
+from pathlib import Path
+from typing import AsyncIterator
 get_client_ctx = lambda: get_session().create_client(
     "s3",
     endpoint_url=f"https://{get_conf('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
@@ -214,7 +219,7 @@ get_client_ctx = lambda: get_session().create_client(
 )
 
 async def sink(wallet: bt.wallet, block: int, results: list[Result]):
-    key = f"affine/results/{wallet.hotkey.ss58_address}/{block}.json"
+    key = f"affine/results/{block}-{wallet.hotkey.ss58_address}.json"
     body = json.dumps([r.sign(wallet) or r.model_dump(mode="json") for r in results]).encode()
     logger.debug(f"[SINK] block={block} → key={key}")
     try:
@@ -228,38 +233,73 @@ async def get(key: str):
         data = await resp["Body"].read()
     return json.loads(data) if resp.get("ContentType") == "application/json" else data
 
-async def dataset(tail: int = 1000, max_concurrency: int = 10) -> list[Result]:
-    sub = await get_subtensor()
-    cutoff = (await sub.get_current_block()) - tail
+
+CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR", "/tmp/data/blocks"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+async def dataset(
+    min_block: int,
+    max_concurrency: int = 10
+) -> AsyncIterator[Result]:
+    """
+    Async iterator over Result objects stored under
+    `affine/results/{block}-{wallet}.json` in R2 with block >= min_block.
+    Shards are cached locally as JSON‑Lines in $AFFINE_CACHE_DIR.
+    """
     bucket, prefix = get_conf("R2_BUCKET_ID"), "affine/results/"
-    # collect all keys newer than cutoff
-    keys = []
-    async with get_client_ctx() as s3:
-        pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+    sem = asyncio.Semaphore(max_concurrency)
+
+    # 1) list all keys with block >= min_block
+    async with get_client_ctx() as client:
+        paginator = client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+        keys: list[tuple[int,str]] = []
         async for page in pages:
             for o in page.get("Contents", []):
-                k = o["Key"]
-                try:
-                    if int(k.rsplit("/", 1)[-1].removesuffix(".json")) > cutoff: keys.append(k)
-                except ValueError: pass
+                name = Path(o["Key"]).name
+                if not name.endswith(".json"):
+                    continue
+                base = name[:-5]  # strip ".json"
+                parts = base.split("-", 1)
+                if len(parts) != 2:
+                    # malformed, skip
+                    continue
+                blk_str, _wallet = parts
+                if not blk_str.isdigit():
+                    continue
+                blk = int(blk_str)
+                if blk >= min_block:
+                    keys.append((blk, o["Key"]))
 
-    sem = asyncio.Semaphore(max_concurrency)
-    async def fetch(k):
-        async with sem:
-            d = await get(k)
-            return json.loads(d) if isinstance(d, (bytes, bytearray)) else d
+    # sort by block ascending, then by full key lex
+    keys.sort(key=lambda x: (x[0], x[1]))
 
-    results = []
-    # fetch & rehydrate
-    batches = await asyncio.gather(*[fetch(k) for k in sorted(keys)])
-    for batch in batches:
-        if isinstance(batch, list):
-            for item in batch:
-                try:
-                    r = Result.model_validate(item)
-                    if r.verify(): results.append(r)
-                except Exception: logger.trace("Deserialization error", exc_info=True)
-    return results
+    # 2) shard loader: fetch once and cache to disk as JSON‑Lines
+    async def load_shard(key: str) -> Path:
+        fname = Path(key).name
+        out   = CACHE_DIR / f"{fname}.jsonl"
+        if out.exists():
+            return out
+        async with sem, get_client_ctx() as client:
+            resp = await client.get_object(Bucket=bucket, Key=key)
+            raw  = await resp["Body"].read()
+        data = json.loads(raw)  # should be a list
+        with out.open("w") as fh:
+            for item in data:
+                fh.write(json.dumps(item, separators=(",",":")) + "\n")
+        return out
+
+    # 3) stream each Result from each shard
+    for blk, key in keys:
+        shard_file = await load_shard(key)
+        for line in shard_file.open("r"):
+            try:
+                item = json.loads(line)
+                r = Result.model_validate(item)
+                if r.verify():
+                    yield r
+            except Exception:
+                # skip invalid or corrupt entries
+                continue
 
 
 # --------------------------------------------------------------------------- #
@@ -396,7 +436,7 @@ async def miners(
     results = await asyncio.gather(*(fetch(uid) for uid in uids))
     output = {uid: m for uid, m in zip(uids, results) if m is not None}
     return output
-        
+
 
 # --------------------------------------------------------------------------- #
 #                               CLI                                           #
@@ -468,28 +508,22 @@ def validate():
         LAST = 0
         ALPHA = 0.9
         TEMPO = 100
-        RESULTS: List[Result] = []
         subtensor = None
         while True:
             try:
                 global HEARTBEAT
-                if subtensor is None: subtensor = await get_subtensor()
-                meta = await subtensor.metagraph( NETUID )
-                BLOCK = await subtensor.get_current_block()
                 HEARTBEAT = time.monotonic()
-            
-                if BLOCK - LAST < TEMPO: return
-                # Pull and extend RESULTS with all results from validators.
-                next_results = await dataset( tail = min(BLOCK - LAST, 1000) )
-                for res in next_results:
-                    if res.hotkey in meta.hotkeys and bool(meta.validator_permit[ meta.hotkeys.index( res.hotkey) ]):
-                        RESULTS.append( res )
-                LAST = BLOCK
-
+                if subtensor is None: subtensor = await get_subtensor()
+                BLOCK = await subtensor.get_current_block()
+                if BLOCK - LAST < TEMPO: 
+                    await asyncio.sleep(12)
+                    continue
+                meta = await subtensor.metagraph( NETUID )
+                
                 # ---------------- Compute scores ------------------------
                 prev = { } 
-                scores = { hk: defaultdict(float) for hk in meta.hotkeys } 
-                for crr in RESULTS:
+                scores = { hk: defaultdict(float) for hk in meta.hotkeys }                 
+                async for crr in dataset(min_block=BLOCK - 10_000):
                     hk = crr.miner.hotkey
                     env = crr.challenge.env.name
                     scr = crr.evaluation.score
@@ -561,7 +595,7 @@ def validate():
     async def main():
         await asyncio.gather(
             _run(),
-            watchdog()
+            watchdog(timeout = (60 * 10))
         )
     asyncio.run(main())
 
