@@ -44,11 +44,14 @@ logging.addLevelName(TRACE, "TRACE")
 # --------------------------------------------------------------------------- #
 #                       Prometheus                         #
 # --------------------------------------------------------------------------- #
-from prometheus_client import Counter, CollectorRegistry, start_http_server
+from prometheus_client import Counter, CollectorRegistry, start_http_server, Gauge
 METRICS_PORT   = int(os.getenv("AFFINE_METRICS_PORT", "8000"))
 METRICS_ADDR   = os.getenv("AFFINE_METRICS_ADDR", "0.0.0.0")
 REGISTRY       = CollectorRegistry(auto_describe=True)
-QCOUNT    = Counter("qcount", "qcount", ["model"], registry=REGISTRY)
+QCOUNT  = Counter("qcount", "qcount", ["model"], registry=REGISTRY)
+SCORE   = Gauge( "score", "score", ["uid", "env"], registry=REGISTRY)
+RANK    = Gauge( "rank", "rank", ["uid", "env"], registry=REGISTRY)
+WEIGHT  = Gauge( "weight", "weight", ["uid"], registry=REGISTRY)
 
 # --------------------------------------------------------------------------- #
 #                               Logging                                       #
@@ -525,6 +528,15 @@ def validate():
                     weights=weights,
                     wait_for_inclusion=False
                 )
+                
+                # ---------------- Prometheus ------------------------
+                for uid, hk in enumerate(meta.hotkeys):
+                    WEIGHT.labels(uid=uid).set( weights[uid] )
+                    for e in ENVS:
+                        if scores[hk][e] > 0:
+                            SCORE.labels(uid=uid, env=e).set(scores[hk][e])
+                            RANK.labels(uid=uid, env=e).set(ranks[e][hk])
+                            
             
                 # ---------------- Print State ------------------------
                 h = ["UID","Model","Rev"] + [f"{e} Score" for e in ENVS] + [f"{e} Rank" for e in ENVS] + ["Count","Weight"]
