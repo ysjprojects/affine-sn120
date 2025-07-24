@@ -25,7 +25,7 @@ dependencies = [
     "prometheus-client>=0.21.0",
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.12"
 
 [project.scripts]
 af = "affine:cli"
