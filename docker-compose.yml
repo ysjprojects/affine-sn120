@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   validator:
@@ -10,11 +10,11 @@ services:
     env_file:
       - .env
     volumes:
-      - ./.env:/app/.env
-      - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - ./.env:/app/.env:ro
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - validator-cache:/app/data/blocks
     ports:
-      - "8001:8001"  # Exposes validator metrics on 8001
+      - "8001:8000"           # host 8001 → container’s AFFINE_METRICS_PORT=8000
     environment:
       - AFFINE_CACHE_DIR=/app/data/blocks
       - AFFINE_METRICS_PORT=8000
@@ -30,13 +30,12 @@ services:
     env_file:
       - .env
     volumes:
-      - ./.env:/app/.env
-      - ~/.bittensor/wallets:/root/.bittensor/wallets
-      - validator-cache:/app/data/blocks
+      - ./.env:/app/.env:ro
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      # runner doesn’t need the cache—omit or give its own if desired
     ports:
-      - "8002:8002"  # Exposes runner metrics on 8002
+      - "8002:8000"           # host 8002 → container’s AFFINE_METRICS_PORT=8000
     environment:
-      - AFFINE_CACHE_DIR=/app/data/blocks
       - AFFINE_METRICS_PORT=8000
       - AFFINE_METRICS_ADDR=0.0.0.0
     command: ["-vv", "runner"]
@@ -60,12 +59,12 @@ services:
     ports:
       - "8000:3000"
     environment:
-    - GF_SECURITY_ADMIN_PASSWORD=admin
-    - GF_SERVER_HTTP_ADDR=0.0.0.0
-    - GF_LOG_LEVEL=warn       
-    - GF_LOG_MODE=console     
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_HTTP_ADDR=0.0.0.0
+      - GF_LOG_LEVEL=warn       
+      - GF_LOG_MODE=console     
     volumes:
-      - grafana-storage:/var/lib/grafana
+      - grafana-storage:/var/lib/grafana:rw
 
   watchtower:
     image: containrrr/watchtower

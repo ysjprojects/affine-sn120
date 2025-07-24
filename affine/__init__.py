@@ -234,7 +234,7 @@ async def get(key: str):
     return json.loads(data) if resp.get("ContentType") == "application/json" else data
 
 
-CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR", "/tmp/data/blocks"))
+CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR", "/app/data/blocks"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 async def dataset(
     min_block: int,
