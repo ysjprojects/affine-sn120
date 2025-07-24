@@ -106,6 +106,7 @@ print( evaluation.score )
 # Query the miner and do the eval all in one go.
 results = await af.run( chals, miners )
 
-# Pull data from trials 1000 blocks in the past.
-validator_results = af.dataset( tail = 1000 )
+# Stream results from the last X blocks
+async for result in dataset(tail=10_000):
+    print(result.miner.model, result.challenge.prompt, result.evaluation.score)
 ```

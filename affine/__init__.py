@@ -234,17 +234,18 @@ async def get(key: str):
     return json.loads(data) if resp.get("ContentType") == "application/json" else data
 
 
-CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR", "/app/data/blocks"))
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# use AFFINE_CACHE_DIR or fall back to a sane home‐cache location
+_env = os.getenv("AFFINE_CACHE_DIR")
+CACHE_DIR = Path(_env) if _env else Path.home() / ".cache" / "affine" / "blocks"
+try: CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as e: logger.warning("Could not create cache dir %s: %s", CACHE_DIR, e)
 async def dataset(
-    min_block: int,
+    tail: int,
     max_concurrency: int = 10
 ) -> AsyncIterator[Result]:
-    """
-    Async iterator over Result objects stored under
-    `affine/results/{block}-{wallet}.json` in R2 with block >= min_block.
-    Shards are cached locally as JSON‑Lines in $AFFINE_CACHE_DIR.
-    """
+    sub       = await get_subtensor()
+    current   = await sub.get_current_block()
+    min_block = current - tail
     bucket, prefix = get_conf("R2_BUCKET_ID"), "affine/results/"
     sem = asyncio.Semaphore(max_concurrency)
 
@@ -523,7 +524,7 @@ def validate():
                 # ---------------- Compute scores ------------------------
                 prev = { } 
                 scores = { hk: defaultdict(float) for hk in meta.hotkeys }                 
-                async for crr in dataset(min_block=BLOCK - 10_000):
+                async for crr in dataset(tail=10_000):
                     hk = crr.miner.hotkey
                     env = crr.challenge.env.name
                     scr = crr.evaluation.score
