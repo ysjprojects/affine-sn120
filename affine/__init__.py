@@ -519,6 +519,7 @@ def validate():
                 if BLOCK - LAST < TEMPO: 
                     await asyncio.sleep(12)
                     continue
+                LAST = BLOCK
                 meta = await subtensor.metagraph( NETUID )
                 
                 # ---------------- Compute scores ------------------------
