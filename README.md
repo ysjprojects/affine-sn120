@@ -28,8 +28,8 @@ af
 
 Set env vars, chutes api key.
 ```bash
-# Copy .env and fill out items.
-cp .env.validator.example .env
+# Copy .env and fill out validator items
+cp .env.example .env
 ```
 
 (Recommended): Run the validator with docker and watchtower autoupdate.
@@ -46,15 +46,15 @@ af -vv validate
 
 # Mining
 
-1. Miners need a chutes developer account ( `chutes.ai` )
+1. Set env vars.
 ```bash
-chutes register
+# Copy .env and fill out validator items
+cp .env.example .env
 ```
 
-2. Set env vars.
+2. Miners need a chutes developer account ( `chutes.ai` )
 ```bash
-# Copy .env and fill out items.
-cp .env.validator.example .env
+chutes register
 ```
 
 3. Register your miner to Affine (S120).

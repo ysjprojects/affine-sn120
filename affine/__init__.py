@@ -72,8 +72,7 @@ def setup_logging(verbosity: int):
 # --------------------------------------------------------------------------- #
 #                             Utility helpers                                 #
 # --------------------------------------------------------------------------- #
-LOCAL_BASE = Path.home() / ".affine"; LOCAL_BASE.mkdir(parents=True, exist_ok=True)
-load_dotenv(os.path.expanduser("~/.affine/config.env"), override=True); load_dotenv(override=True)
+load_dotenv(override=True)
 def get_conf(key, default=None) -> Any:
     v = os.getenv(key); 
     if not v and default is None:
@@ -404,20 +403,6 @@ async def miners(
 def cli(verbose):
     """Affine CLI"""
     setup_logging(verbose)
-
-@cli.command('set')
-@click.argument('key')
-@click.argument('value')
-def set_config(key: str, value: str):
-    """Set a key-value pair in ~/.affine/config.env."""
-    path = os.path.expanduser("~/.affine/config.env")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    lines = [l for l in open(path).readlines() if not l.startswith(f"{key}=")] if os.path.exists(path) else []
-    lines.append(f"{key}={value}\n")
-    open(path, "w").writelines(lines)
-    logger.info("Set %s in %s", key, path)
-    click.echo(f"Set {key} in {path}")
-    
     
 # --------------------------------------------------------------------------- #
 #                               Watchdog                                      #

@@ -7,10 +7,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-      - ~/.affine/config.env
     volumes:
       - ./.env:/app/.env
-      - ~/.affine:/root/.affine
       - ~/.bittensor/wallets:/root/.bittensor/wallets
     ports:
       - "8001:8000"  # Exposes validator metrics on 8001
@@ -25,10 +23,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-      - ~/.affine/config.env
     volumes:
       - ./.env:/app/.env
-      - ~/.affine:/root/.affine
       - ~/.bittensor/wallets:/root/.bittensor/wallets
     ports:
       - "8002:8000"  # Exposes runner metrics on 8002
