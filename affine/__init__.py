@@ -175,6 +175,8 @@ class Miner(BaseModel):
     uid: int; hotkey: str; model: Optional[str] = None
     revision: Optional[str] = None; block: Optional[int] = None
     chute: Optional[Dict[str, Any]] = None
+    slug: Optional[str] = None
+    
 
 class Result(BaseModel):
     version: str = __version__
@@ -308,8 +310,8 @@ async def dataset(
 # --------------------------------------------------------------------------- #
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
-async def query(prompt, model="unsloth/gemma-3-12b-it", timeout=120, retries=0, backoff=1) -> Response:
-    url = "https://llm.chutes.ai/v1/chat/completions"
+async def query(prompt, model : str, slug :str, timeout=120, retries=0, backoff=1) -> Response:
+    url = f"https://{slug}.chutes.ai/v1/chat/completions"
     hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
     start = time.monotonic()
     QCOUNT.labels(model=model).inc()
@@ -318,7 +320,8 @@ async def query(prompt, model="unsloth/gemma-3-12b-it", timeout=120, retries=0, 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
         for attempt in range(1, retries+2):
             try:
-                async with HTTP_SEM, sess.post(url, json={"model": model, "messages":[{"role":"user","content":prompt}]},
+                payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+                async with HTTP_SEM, sess.post(url, json=payload,
                                                headers=hdr, timeout=timeout) as r:
                     txt = await r.text(errors="ignore")
                     if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
@@ -348,7 +351,7 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
     logger.trace("Running challenges: %s on miners: %s", [chal.prompt[:30] for chal in challenges], list(mmap.keys()))
     response = []
     async def proc(miner, chal):
-        resp = await query(chal.prompt, miner.model, timeout, retries, backoff)
+        resp = await query(chal.prompt, miner.model, miner.slug, timeout, retries, backoff)
         try: ev = await chal.evaluate(resp)
         except Exception as e: ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
         return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
@@ -374,8 +377,8 @@ async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=Tr
 # --------------------------------------------------------------------------- #
 #                              Miners                                         #
 # --------------------------------------------------------------------------- #
-async def get_chute(model: str) -> Dict[str, Any]:
-    url = f"https://api.chutes.ai/chutes/{model}"
+async def get_chute(chutes_id: str) -> Dict[str, Any]:
+    url = f"https://api.chutes.ai/chutes/{chutes_id}"
     token = os.getenv("CHUTES_API_KEY", "")
     headers = {"Authorization": token}
     async with aiohttp.ClientSession() as session:
@@ -398,6 +401,22 @@ async def get_chute_code(identifier: str) -> Optional[str]:
             if r.status != 200:
                 return None
             return await r.text(errors="ignore")
+
+async def get_latest_chute_id(model_name: str, api_key: Optional[str] = None) -> Optional[str]:
+    token = api_key or os.getenv("CHUTES_API_KEY", ""); 
+    if not token: return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.chutes.ai/chutes/", headers={"Authorization": token}) as r:
+                if r.status != 200: return None
+                data = await r.json()
+    except Exception: return None
+    chutes = data.get("items", data) if isinstance(data, dict) else data
+    if not isinstance(chutes, list): return None
+    for chute in reversed(chutes):
+        if any(chute.get(k) == model_name for k in ("model_name", "name", "readme")):
+            return chute.get("chute_id")
+    return None
 
 def _extract_revision(code: str) -> Optional[str]:
     matches = re.findall(r"--revision\s+([0-9a-f]{40})", code)
@@ -422,14 +441,14 @@ async def miners(
             commit = commits[hotkey]
             block, data = commit[-1]        
             data = json.loads(data)
-            model, miner_revision = data.get("model"), data.get("revision")
-            chute = await get_chute(model)
-            code = await get_chute_code(chute['chute_id'])
-            chutes_revision = _extract_revision(code)
+            model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
+            chute = await get_chute(chute_id)
+            slug, chutes_revision = chute.get("slug"), chute.get("revision")
             if chutes_revision == None or miner_revision == chutes_revision:
                 miner = Miner(
                     uid=uid, hotkey=hotkey, model=model, block=int(block),
                     revision = miner_revision,
+                    slug = slug,
                     chute=chute,
                 )
                 return miner
@@ -616,7 +635,7 @@ def pull(uid: int, model_path: str, hf_token: str):
     hf_token     = hf_token or get_conf("HF_TOKEN")
 
     # 2. Lookup miner on‑chain
-    miner_map = asyncio.run(miners(uids=uid, no_null=True))
+    miner_map = asyncio.run(miners(uids=uid))
     miner = miner_map.get(uid)
     
     if miner is None:
@@ -651,7 +670,8 @@ def pull(uid: int, model_path: str, hf_token: str):
 @click.option('--revision', default=None, help='Commit SHA to register (only relevant with --existing-repo)')
 @click.option('--coldkey',     default=None, help='Name of the cold wallet to use.')
 @click.option('--hotkey',      default=None, help='Name of the hot wallet to use.')
-def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotkey: str):
+@click.option('--chutes-api-key', default=None, help='Chutes API key (env CHUTES_API_KEY if unset)')
+def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotkey: str, chutes_api_key: str):
     """Pushes a model to be hosted by your miner."""
     # -----------------------------------------------------------------------------
     # 1. Wallet & config
@@ -664,13 +684,12 @@ def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotke
     # Required API credentials
     hf_user        = get_conf("HF_USER")
     hf_token       = get_conf("HF_TOKEN")
-    chutes_api_key = get_conf("CHUTES_API_KEY")
+    chutes_api_key = chutes_api_key or get_conf("CHUTES_API_KEY")
     chute_user     = get_conf("CHUTE_USER")
     # TODO: validate API creds, exit gracefully if missing
 
     # -----------------------------------------------------------------------------
-    # 2. Prepare HF repo name
-    #    - If --existing-repo provided, use it directly and skip local upload
+    # 2. Prepare HF repo name - If --existing-repo provided, use it directly and skip local upload
     # -----------------------------------------------------------------------------
     repo_name = existing_repo or f"{hf_user}/Affine-{wallet.hotkey.ss58_address}"
     logger.debug("Using existing HF repo: %s" if existing_repo else "Hugging Face repo: %s", repo_name)
@@ -732,11 +751,13 @@ def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotke
     # -----------------------------------------------------------------------------
     # 6. Commit model revision on-chain
     # -----------------------------------------------------------------------------
+    chute_id = None
+
     async def commit_to_chain():
-        """Submit the model commitment, retrying if the subnet space quota is full."""
+        """Submit the model commitment, retrying on quota errors."""
         logger.debug("Preparing on-chain commitment")
         sub     = await get_subtensor()
-        payload = json.dumps({"model": repo_name, "revision": revision})
+        payload = json.dumps({"model": repo_name, "revision": revision, "chute_id": chute_id})
         while True:
             try:
                 await sub.set_reveal_commitment(wallet=wallet, netuid=NETUID, data=payload, blocks_until_reveal=1)
@@ -749,7 +770,6 @@ def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotke
                 else:
                     raise
 
-    asyncio.run(commit_to_chain())
 
     # -----------------------------------------------------------------------------
     # 7. Make HF repo public
@@ -818,6 +838,13 @@ chute = build_sglang_chute(
         logger.debug("Chute deployment successful")
 
     asyncio.run(deploy_to_chutes())
+
+    # -----------------------------------------------------------------------------
+    # 8b. Retrieve chute_id and commit on-chain
+    # -----------------------------------------------------------------------------
+    chute_id = asyncio.run(get_latest_chute_id(repo_name, api_key=chutes_api_key))
+
+    asyncio.run(commit_to_chain())
 
     # -----------------------------------------------------------------------------
     # 9. Warm up model until it’s marked hot
