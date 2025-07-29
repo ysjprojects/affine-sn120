@@ -175,5 +175,3 @@ class DED(af.BaseEnv):
         )
         af.logger.trace(f"Evaluation completed with score: {score}")
         return af.Evaluation(env=self, score=score, feedback=feedback)
-
-

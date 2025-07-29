@@ -310,7 +310,7 @@ async def dataset(
 # --------------------------------------------------------------------------- #
 HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
 TERMINAL = {400, 404, 410}
-async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=120, retries=0, backoff=1) -> Response:
+async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> Response:
     url = f"https://{slug}.chutes.ai/v1/chat/completions"
     hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
     start = time.monotonic()
@@ -342,7 +342,7 @@ LOG_TEMPLATE = (
     "{score:>6.4f} │ "
     "{latency:>6.3f}s"
 )
-async def run(challenges, miners, timeout=120, retries=0, backoff=1, progress=True) -> List[Result]:
+async def run(challenges, miners, timeout=150, retries=0, backoff=1, progress=True) -> List[Result]:
     if not isinstance(challenges, list): challenges = [challenges]
     if isinstance(miners, Miner): miners = [miners]
     if isinstance(miners, dict):  mmap = miners
@@ -500,7 +500,7 @@ def runner():
                 HEARTBEAT = time.monotonic()
                 miners_map = await miners(meta=meta)
                 challenges = [await e.generate() for e in envs.values()]
-                results    = await run(challenges, miners_map, timeout=90)
+                results    = await run(challenges, miners_map, timeout=150)
                 await sink( wallet = wallet, block = blk, results = results )
             except asyncio.CancelledError: break
             except Exception as e:
@@ -800,10 +800,8 @@ chute = build_sglang_chute(
     concurrency=20,
     {rev_flag}
     node_selector=NodeSelector(
-        gpu_count=4,
+        gpu_count=8,
         min_vram_gb_per_gpu=24,
-        include=["4090", "l40s", "a6000_ada"],
-        exclude=["h200", "b200", "mi300x"],
     ),
     engine_args=(
         "--trust-remote-code "
