@@ -100,6 +100,7 @@ chals = await af.ABDUCTION().many( 10 )
 chals = await af.DEDUCTION().many( 10 )
 
 # Query the model directly.
+# NOTE: A CHUTES_API_KEY .env value is required for this command.
 response = await af.query( chal.prompt, model = miner.model )
 
 # Evaluate the response
@@ -107,7 +108,7 @@ evaluation = chal.evaluate( response )
 print( evaluation.score )
 
 # Stream results from the last 100 blocks
-# You need to set you .env with R2 values to run this command.
+# NOTE: All R2_* .env value are required for this command.
 async for result in af.dataset(tail=100):
     print(result.miner.model, result.challenge.prompt, result.evaluation.score)
 ```
