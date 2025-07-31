@@ -107,6 +107,6 @@ print( evaluation.score )
 results = await af.run( chals, miners )
 
 # Stream results from the last X blocks
-async for result in dataset(tail=10_000):
+async for result in af.dataset(tail=10_000):
     print(result.miner.model, result.challenge.prompt, result.evaluation.score)
 ```
