@@ -84,7 +84,7 @@ load_dotenv(override=True)
 def get_conf(key, default=None) -> Any:
     v = os.getenv(key); 
     if not v and default is None:
-        click.echo(f"{key} not set.\nRun:\n\taf set {key} <value>", err=True); sys.exit(1)
+        click.echo(f"{key} not set.\nYou must set env var: {key} in .env", err=True); sys.exit(1)
     return v or default
 
 # --------------------------------------------------------------------------- #
