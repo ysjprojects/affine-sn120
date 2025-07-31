@@ -63,7 +63,8 @@ logging.Logger.trace = _trace
 logger = logging.getLogger("affine")
 def setup_logging(verbosity: int):
     if not getattr(setup_logging, "_prom_started", False):
-        start_http_server(METRICS_PORT, METRICS_ADDR, registry=REGISTRY)
+        try: start_http_server(METRICS_PORT, METRICS_ADDR, registry=REGISTRY)
+        except: pass
         setup_logging._prom_started = True
     level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
     for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions", "botocore"]:
@@ -71,6 +72,10 @@ def setup_logging(verbosity: int):
     logging.basicConfig(level=level,
                         format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S")
+    
+def info():setup_logging(1)
+def debug():setup_logging(2)
+def trace():setup_logging(3)
 
 # --------------------------------------------------------------------------- #
 #                             Utility helpers                                 #

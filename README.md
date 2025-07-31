@@ -83,6 +83,9 @@ Affine is also an SDK you can use to generate and evaluate models envs.
 ```python
 import affine as af
 
+# Optionally turn on logging 
+af.trace(); af.debug(); af.info()
+
 # Get all miner model endpoints
 miners = await af.miners()
 
@@ -103,10 +106,8 @@ response = await af.query( chal.prompt, model = miner.model )
 evaluation = chal.evaluate( response ) 
 print( evaluation.score )
 
-# Query the miner and do the eval all in one go.
-results = await af.run( chals, miners )
-
 # Stream results from the last 100 blocks
+# You need to set you .env with R2 values to run this command.
 async for result in af.dataset(tail=100):
     print(result.miner.model, result.challenge.prompt, result.evaluation.score)
 ```
