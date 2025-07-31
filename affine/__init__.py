@@ -444,7 +444,7 @@ async def miners(
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
             chute = await get_chute(chute_id)
             slug, chutes_revision = chute.get("slug"), chute.get("revision")
-            if "Affine" not in model:
+            if model.lower()[:6] != 'affine' 
                 return None
             if chutes_revision == None or miner_revision == chutes_revision:
                 miner = Miner(
@@ -552,6 +552,7 @@ def validate():
                     scr = crr.evaluation.score
                     if hk in prev:
                         prv = prev[ hk ]
+                        reset = True if crr.miner.model.lower()[:6] != 'affine' else False
                         reset = prv.miner.block != crr.miner.block
                         reset = prv.miner.model != crr.miner.model
                         reset = prv.miner.revision != crr.miner.revision
@@ -803,7 +804,7 @@ chute = build_sglang_chute(
     {rev_flag}
     node_selector=NodeSelector(
         gpu_count=8,
-        include=["h200"],
+        min_vram_gb_per_gpu=24,
     ),
     engine_args=(
         "--trust-remote-code "
