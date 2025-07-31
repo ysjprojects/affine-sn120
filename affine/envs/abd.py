@@ -74,7 +74,6 @@ class ABD(af.BaseEnv):
             buffer_size=5,
             max_batch=5,
         )
-        af.logger.trace("ABDUCTION environment initialized.")
         
     async def _create_challenge(
         self, program: str, example_in: str, example_out: str
