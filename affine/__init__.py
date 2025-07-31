@@ -444,8 +444,7 @@ async def miners(
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
             chute = await get_chute(chute_id)
             slug, chutes_revision = chute.get("slug"), chute.get("revision")
-            if model.lower()[:6] != 'affine':
-                return None
+            if model.lower()[:6] != 'affine': return None
             if chutes_revision == None or miner_revision == chutes_revision:
                 miner = Miner(
                     uid=uid, hotkey=hotkey, model=model, block=int(block),
@@ -550,12 +549,12 @@ def validate():
                     hk = crr.miner.hotkey
                     env = crr.challenge.env.name
                     scr = crr.evaluation.score
+                    if crr.miner.model.lower()[:6] != 'affine': continue
                     if hk in prev:
                         prv = prev[ hk ]
-                        reset = True if crr.miner.model.lower()[:6] != 'affine' else False
                         reset = prv.miner.block != crr.miner.block
-                        reset = prv.miner.model != crr.miner.model
-                        reset = prv.miner.revision != crr.miner.revision
+                        reset = reset or (prv.miner.model != crr.miner.model)
+                        reset = reset or (prv.miner.revision != crr.miner.revision)
                         if reset:
                             scores[hk][env] = 0
                     prev[ hk ] = crr
