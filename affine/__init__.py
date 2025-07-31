@@ -444,6 +444,8 @@ async def miners(
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
             chute = await get_chute(chute_id)
             slug, chutes_revision = chute.get("slug"), chute.get("revision")
+            if "/Affine" not in model:
+                return None
             if chutes_revision == None or miner_revision == chutes_revision:
                 miner = Miner(
                     uid=uid, hotkey=hotkey, model=model, block=int(block),
@@ -805,7 +807,6 @@ chute = build_sglang_chute(
     ),
     engine_args=(
         "--trust-remote-code "
-        "--tool-call-parser deepseekv3 "
     ),
 )
 """)
