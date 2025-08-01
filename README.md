@@ -46,6 +46,8 @@ af -vv validate
 
 # Mining
 
+IMPORTANT: you require a ***developer enabled account*** on Chutes to mine. Normal API keys cannot deploy chutes right now.
+
 1. Set env vars.
 ```bash
 # Copy .env and fill out validator items
