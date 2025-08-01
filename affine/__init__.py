@@ -95,7 +95,7 @@ async def get_subtensor():
     global SUBTENSOR
     if SUBTENSOR == None:
         logger.trace("Making Bittensor connection...")
-        SUBTENSOR = bt.async_subtensor()
+        SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
         await SUBTENSOR.initialize()
         logger.trace("Connected")
     return SUBTENSOR
