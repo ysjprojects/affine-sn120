@@ -835,7 +835,14 @@ chute = build_sglang_chute(
             await proc.stdin.drain()
             proc.stdin.close()
         stdout, _ = await proc.communicate()
-        logger.trace(stdout.decode())
+        output = stdout.decode().split('confirm? (y/n)')[1].strip()
+        logger.trace(output)
+
+        import re
+        match = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)', output)
+        if match and match.group(2) == "ERROR":
+            logger.debug("Chutes deploy failed with the above error log")
+            raise RuntimeError("Chutes deploy failed")
         if proc.returncode != 0:
             logger.debug("Chutes deploy failed with code %d", proc.returncode)
             raise RuntimeError("Chutes deploy failed")
