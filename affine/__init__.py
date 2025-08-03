@@ -556,6 +556,8 @@ def validate():
                     env = crr.challenge.env.name
                     scr = crr.evaluation.score
                     if crr.miner.model.split('/')[1].lower()[:6] != 'affine': continue
+                    if hk not in scores:
+                        continue
                     if hk in prev:
                         prv = prev[ hk ]
                         reset = prv.miner.block != crr.miner.block
