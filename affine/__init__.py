@@ -54,7 +54,7 @@ RANK    = Gauge( "rank", "rank", ["uid", "env"], registry=REGISTRY)
 WEIGHT  = Gauge( "weight", "weight", ["uid"], registry=REGISTRY)
 LASTSET = Gauge( "lastset", "lastset", registry=REGISTRY)
 NRESULTS = Gauge( "nresults", "nresults", registry=REGISTRY)
-MAXENV  = Gauge( "maxenv", "maxenv", registry=REGISTRY)
+MAXENV = Gauge("maxenv", "maxenv", ["env"], registry=REGISTRY)
 CACHE = Gauge( "cache", "cache", registry=REGISTRY)
 
 # --------------------------------------------------------------------------- #
