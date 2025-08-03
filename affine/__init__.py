@@ -52,6 +52,10 @@ QCOUNT  = Counter("qcount", "qcount", ["model"], registry=REGISTRY)
 SCORE   = Gauge( "score", "score", ["uid", "env"], registry=REGISTRY)
 RANK    = Gauge( "rank", "rank", ["uid", "env"], registry=REGISTRY)
 WEIGHT  = Gauge( "weight", "weight", ["uid"], registry=REGISTRY)
+LASTSET = Gauge( "lastset", "lastset", registry=REGISTRY)
+NRESULTS = Gauge( "nresults", "nresults", registry=REGISTRY)
+MAXENV  = Gauge( "maxenv", "maxenv", registry=REGISTRY)
+CACHE = Gauge( "cache", "cache", registry=REGISTRY)
 
 # --------------------------------------------------------------------------- #
 #                               Logging                                       #
@@ -240,6 +244,18 @@ async def get(key: str):
         data = await resp["Body"].read()
     return json.loads(data) if resp.get("ContentType") == "application/json" else data
 
+async def prune( tail: int):
+    sub   = await get_subtensor()
+    BLOCK   = await sub.get_current_block()
+    MIN = BLOCK - tail
+    for f in CACHE_DIR.glob("*.jsonl"):
+        # filenames look like "12345-<wallet>.json.jsonl"
+        blk_str = f.name.split("-", 1)[0]
+        if blk_str.isdigit() and int(blk_str) < MIN:
+            try:
+                f.unlink()
+            except OSError:
+                 pass
 
 # use AFFINE_CACHE_DIR or fall back to a sane home‐cache location
 _env = os.getenv("AFFINE_CACHE_DIR")
@@ -532,26 +548,32 @@ def validate():
     hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)    
     async def _run():     
-        LAST = 0
         ALPHA = 0.9
+        LAST = 0
         TEMPO = 100
+        TAIL= 10_000
         subtensor = None
         while True:
             try:
+                # ---------------- Wait for set weights. -----------------
                 global HEARTBEAT
                 HEARTBEAT = time.monotonic()
                 if subtensor is None: subtensor = await get_subtensor()
                 BLOCK = await subtensor.get_current_block()
-                if BLOCK - LAST < TEMPO: 
-                    await asyncio.sleep(12)
+                if BLOCK % TEMPO != 0 or BLOCK <= LAST: 
+                    logger.info(f'Waiting ... {BLOCK} % {TEMPO} != 0:')
+                    await subtensor.wait_for_block()
                     continue
-                LAST = BLOCK
                 meta = await subtensor.metagraph( NETUID )
-                
+
                 # ---------------- Compute scores ------------------------
                 prev = { } 
-                scores = { hk: defaultdict(float) for hk in meta.hotkeys }                 
-                async for crr in dataset(tail=10_000):
+                scores = { hk: defaultdict(float) for hk in meta.hotkeys }   
+                max_score = { e: 0.0 for e in ENVS }
+                NRESULTS.set(0)              
+                await prune( tail = TAIL )
+                async for crr in dataset(tail = TAIL ):
+                    NRESULTS.inc()
                     hk = crr.miner.hotkey
                     env = crr.challenge.env.name
                     scr = crr.evaluation.score
@@ -568,6 +590,18 @@ def validate():
                     prev[ hk ] = crr
                     if crr.response.success or crr.miner.chute['hot']:
                         scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
+                        max_score[env] = max(max_score[env], scores[hk][env])
+                        
+                # ---------------- Measure cache size ------------------------
+                cache_dir = CACHE_DIR
+                total_bytes = sum(
+                    f.stat().st_size for f in cache_dir.glob("*.jsonl") if f.is_file()
+                )
+                CACHE.set(total_bytes)
+                        
+                # ---------------- Record max scores -----------------------
+                for e, m in max_score.items():
+                    MAXENV.labels(env=e).set(m)
 
                 # ---------------- Compute Pairwise Dominance -----------------
                 ranks, counts = {}, defaultdict(int)
@@ -593,7 +627,10 @@ def validate():
                     weights=weights,
                     wait_for_inclusion=False
                 )
-                
+                SETBLOCK = await subtensor.get_current_block()
+                LASTSET.set_function(lambda: SETBLOCK - LAST)
+                LAST = BLOCK
+
                 # ---------------- Prometheus ------------------------
                 for uid, hk in enumerate(meta.hotkeys):
                     WEIGHT.labels(uid=uid).set( weights[uid] )
