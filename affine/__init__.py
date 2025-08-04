@@ -585,7 +585,7 @@ def runner():
             except asyncio.CancelledError: break
             except Exception as e:
                 traceback.print_exc()
-                logger.info(f"Error in proctor loop: {e}. Continuing ...")
+                logger.info(f"Error in runner loop: {e}. Continuing ...")
                 subtensor = None  # Force reconnection on next iteration
                 await asyncio.sleep(10)  # Wait before retrying
                 continue
