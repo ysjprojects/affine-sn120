@@ -223,17 +223,21 @@ ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
 WINDOW = int(os.getenv("AFFINE_WINDOW", 20))
 
 # Environment config
-DEFAULT_BUCKET = "decis"
-DEFAULT_REGION = "us-east-1"
 RESULT_PREFIX  = "affine/results/"
 INDEX_KEY      = "affine/index.json"
 
 # Load from environment or fallback to defaults
-BUCKET       = os.getenv("S3_BUCKET_ID", DEFAULT_BUCKET)
-REGION       = os.getenv("S3_REGION", DEFAULT_REGION)
-ACCESS_KEY   = os.getenv("S3_WRITE_ACCESS_KEY_ID")
-SECRET_KEY   = os.getenv("S3_WRITE_SECRET_ACCESS_KEY")
-ENDPOINT_URL = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
+BUCKET       = os.getenv("R2_BUCKET_ID", '80f15715bb0b882c9e967c13e677ed7d')
+ACCESS_KEY   = os.getenv("R2_WRITE_ACCESS_KEY_ID", "ff3f4f078019b064bfb6347c270bee4d")
+SECRET_KEY   = os.getenv("R2_WRITE_SECRET_ACCESS_KEY", "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
+ENDPOINT_URL = f"https://{BUCKET}.r2.cloudflarestorage.com"
+get_client_ctx = lambda: get_session().create_client(
+    "s3",
+    endpoint_url=ENDPOINT_URL,
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY,
+    config=Config(max_pool_connections=256)
+)
 
 # Windowing function
 def _window_base(block: int) -> int:
@@ -244,19 +248,6 @@ _env = os.getenv("AFFINE_CACHE_DIR")
 CACHE_DIR = Path(_env) if _env else Path.home() / ".cache" / "affine" / "blocks"
 try: CACHE_DIR.mkdir(parents=True, exist_ok=True)
 except Exception as e: print(f"Warning: Could not create cache dir {CACHE_DIR}: {e}")
-
-def get_client_ctx(public=False):
-    kwargs = dict(
-        region_name=REGION,
-        endpoint_url=ENDPOINT_URL,
-        config=Config(signature_version=("s3v4" if not public else UNSIGNED), max_pool_connections=256)
-    )
-    if not public:
-        kwargs |= dict(
-            aws_access_key_id=ACCESS_KEY,
-            aws_secret_access_key=SECRET_KEY
-        )
-    return get_session().create_client("s3", **kwargs)
 
 async def sink(wallet: bt.wallet, results: list[Result], block: int | None = None) -> None:
     if not results: return
@@ -284,7 +275,6 @@ async def sink(wallet: bt.wallet, results: list[Result], block: int | None = Non
                 Key=key,
                 Body=body,
                 ContentType="application/json",
-                ACL="public-read"
             )
         if len(existing) == 0:
             await update_index(key)
@@ -293,7 +283,7 @@ async def sink(wallet: bt.wallet, results: list[Result], block: int | None = Non
 
 
 async def get(key: str):
-    async with get_client_ctx(public=True) as client:
+    async with get_client_ctx() as client:
         resp = await client.get_object(Bucket=BUCKET, Key=key)
         data = await resp["Body"].read()
     return json.loads(data) if resp.get("ContentType") == "application/json" else data
@@ -314,11 +304,10 @@ async def update_index(new_key: str) -> None:
             Key=INDEX_KEY,
             Body=body,
             ContentType="application/json",
-            ACL="public-read"
         )
     
 async def get_index() -> list[str]:
-    async with get_client_ctx(public=True) as client:
+    async with get_client_ctx() as client:
         resp = await client.get_object(Bucket=BUCKET, Key=INDEX_KEY)
         data = await resp["Body"].read()
     return json.loads(data)
@@ -364,7 +353,7 @@ async def dataset(tail: int, max_concurrency: int = 10) -> AsyncIterator[Result]
 
         # Check if we already have a cached copy and a recorded last-modified time
         if out.exists() and mod_path.exists():
-            async with get_client_ctx(public=True) as client:
+            async with get_client_ctx() as client:
                 head = await client.head_object(Bucket=BUCKET, Key=key)
                 remote_modified = head["LastModified"].isoformat()
             local_modified = mod_path.read_text().strip()
@@ -372,7 +361,7 @@ async def dataset(tail: int, max_concurrency: int = 10) -> AsyncIterator[Result]
                 return out  # Cached version is up to date
 
         # Download and cache the fresh version
-        async with sem, get_client_ctx(public=True) as client:
+        async with sem, get_client_ctx() as client:
             resp = await client.get_object(Bucket=BUCKET, Key=key)
             raw = await resp["Body"].read()
             remote_modified = resp["LastModified"].isoformat()
