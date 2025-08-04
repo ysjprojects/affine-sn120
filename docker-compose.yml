@@ -66,6 +66,39 @@ services:
     volumes:
       - grafana-storage:/var/lib/grafana:rw
 
+  common: &common
+    image: ghcr.io/opentensor/subtensor:latest
+    cpu_count: 4
+    mem_limit: 40000000000
+    memswap_limit: 80000000000
+    ports:
+      - "9944:9944"
+      - "30333:30333"
+      - "9933:9933"
+    expose:
+      - "9944"
+      - "30333"
+      - "9933"
+    environment:
+      - CARGO_HOME=/var/www/node-subtensor/.cargo
+
+  mainnet-lite:
+    <<: *common
+    container_name: subtensor-mainnet-lite
+    volumes:
+      - mainnet-lite-volume:/data
+    command:
+      - --base-path=/data
+      - --chain=./chainspecs/raw_spec_finney.json
+      - --rpc-external
+      - --rpc-cors=all
+      - --no-mdns
+      - --bootnodes=/dns/bootnode.finney.chain.opentensor.ai/tcp/30333/ws/p2p/12D3KooWRwbMb85RWnT8DSXSYMWQtuDwh4LJzndoRrTDotTR5gDC
+      - --sync=warp
+      - --database paritydb
+      - --db-cache 4096
+      - --trie-cache-size 2048
+
   watchtower:
     image: containrrr/watchtower
     container_name: affine-watchtower
@@ -78,3 +111,4 @@ volumes:
   grafana-storage:
   validator-cache:
     name: affine-validator-cache
+  mainnet-lite-volume:
