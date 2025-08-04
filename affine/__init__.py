@@ -249,7 +249,7 @@ CACHE_DIR = Path(_env) if _env else Path.home() / ".cache" / "affine" / "blocks"
 try: CACHE_DIR.mkdir(parents=True, exist_ok=True)
 except Exception as e: print(f"Warning: Could not create cache dir {CACHE_DIR}: {e}")
 
-async def sink(wallet: bt.wallet, results: list[Result], block: int | None = None) -> None:
+async def sink(wallet: bt.wallet, results: list[Result], block: int = None) -> None:
     if not results: return
     # Determine block for windowing
     if block is None:
