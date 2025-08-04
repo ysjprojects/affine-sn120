@@ -110,7 +110,6 @@ evaluation = chal.evaluate( response )
 print( evaluation.score )
 
 # Stream results from the last 100 blocks
-# NOTE: All R2_* .env value are required for this command.
 async for result in af.dataset(tail=100):
     print(result.miner.model, result.challenge.prompt, result.evaluation.score)
 ```

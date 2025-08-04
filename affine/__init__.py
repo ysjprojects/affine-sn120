@@ -618,7 +618,7 @@ def validate():
                 if subtensor is None: subtensor = await get_subtensor()
                 BLOCK = await subtensor.get_current_block()
                 if BLOCK % TEMPO != 0 or BLOCK <= LAST: 
-                    logger.info(f'Waiting ... {BLOCK} % {TEMPO} == {BLOCK % TEMPO} != 0')
+                    logger.debug(f'Waiting ... {BLOCK} % {TEMPO} == {BLOCK % TEMPO} != 0')
                     await subtensor.wait_for_block()
                     continue
                 meta = await subtensor.metagraph( NETUID )
