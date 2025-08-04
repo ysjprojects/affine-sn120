@@ -18,9 +18,12 @@ import traceback
 from .utils import *
 import datetime as dt
 import bittensor as bt
+from tqdm import tqdm
 from pathlib import Path
+from botocore import UNSIGNED
 from tabulate import tabulate
 from dotenv import load_dotenv
+from typing import AsyncIterator
 from huggingface_hub import HfApi
 from botocore.config import Config
 from collections import defaultdict
@@ -88,7 +91,7 @@ load_dotenv(override=True)
 def get_conf(key, default=None) -> Any:
     v = os.getenv(key); 
     if not v and default is None:
-        click.echo(f"{key} not set.\nYou must set env var: {key} in .env", err=True); sys.exit(1)
+        raise ValueError(f"{key} not set.\nYou must set env var: {key} in .env")
     return v or default
 
 # --------------------------------------------------------------------------- #
@@ -216,104 +219,173 @@ ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
 # --------------------------------------------------------------------------- #
 #                   S3 helpers                                                #
 # --------------------------------------------------------------------------- #
-import os
-import json
-import asyncio
-from pathlib import Path
-from typing import AsyncIterator
-get_client_ctx = lambda: get_session().create_client(
-    "s3",
-    endpoint_url=f"https://{get_conf('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
-    aws_access_key_id=get_conf("R2_WRITE_ACCESS_KEY_ID"),
-    aws_secret_access_key=get_conf("R2_WRITE_SECRET_ACCESS_KEY"),
-    config=Config(max_pool_connections=256)
-)
+# Block window size used for grouping
+WINDOW = int(os.getenv("AFFINE_WINDOW", 20))
 
-async def sink(wallet: bt.wallet, block: int, results: list[Result]):
-    key = f"affine/results/{block}-{wallet.hotkey.ss58_address}.json"
-    body = json.dumps([r.sign(wallet) or r.model_dump(mode="json") for r in results]).encode()
-    logger.debug(f"[SINK] block={block} → key={key}")
+# Environment config
+DEFAULT_BUCKET = "decis"
+DEFAULT_REGION = "us-east-1"
+RESULT_PREFIX  = "affine/results/"
+INDEX_KEY      = "affine/index.json"
+
+# Load from environment or fallback to defaults
+BUCKET       = os.getenv("S3_BUCKET_ID", DEFAULT_BUCKET)
+REGION       = os.getenv("S3_REGION", DEFAULT_REGION)
+ACCESS_KEY   = os.getenv("S3_WRITE_ACCESS_KEY_ID")
+SECRET_KEY   = os.getenv("S3_WRITE_SECRET_ACCESS_KEY")
+ENDPOINT_URL = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
+
+# Windowing function
+def _window_base(block: int) -> int:
+    return (block // WINDOW) * WINDOW
+
+# Cache directory
+_env = os.getenv("AFFINE_CACHE_DIR")
+CACHE_DIR = Path(_env) if _env else Path.home() / ".cache" / "affine" / "blocks"
+try: CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as e: print(f"Warning: Could not create cache dir {CACHE_DIR}: {e}")
+
+def get_client_ctx(public=False):
+    kwargs = dict(
+        region_name=REGION,
+        endpoint_url=ENDPOINT_URL,
+        config=Config(signature_version=("s3v4" if not public else UNSIGNED), max_pool_connections=256)
+    )
+    if not public:
+        kwargs |= dict(
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY
+        )
+    return get_session().create_client("s3", **kwargs)
+
+async def sink(wallet: bt.wallet, results: list[Result], block: int | None = None) -> None:
+    if not results: return
+    # Determine block for windowing
+    if block is None:
+        sub = await get_subtensor()
+        block = await sub.get_current_block()
+    window_base = _window_base(block)
+    key = f"{RESULT_PREFIX}{window_base:09d}-{wallet.hotkey.ss58_address}.json"
+    new_data = [r.sign(wallet) or r.model_dump(mode="json") for r in results]
     try:
         async with get_client_ctx() as client:
-            await client.put_object(Bucket=get_conf("R2_BUCKET_ID"), Key=key, Body=body)
-    except Exception: logger.error("R2 write failed for %s", key, exc_info=True)
+            # Load existing data if shard exists
+            try:
+                resp = await client.get_object(Bucket=BUCKET, Key=key)
+                existing = json.loads(await resp["Body"].read())
+            except client.exceptions.NoSuchKey:
+                existing = []
+            merged = existing + new_data
+            body = json.dumps(merged, separators=(",", ":")).encode()
+            logger.debug("[SINK] window=%d → %s (%d new, %d total items)",
+                         window_base, key, len(results), len(merged))
+            await client.put_object(
+                Bucket=BUCKET,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                ACL="public-read"
+            )
+        if len(existing) == 0:
+            await update_index(key)
+    except Exception:
+        logger.error("S3 write failed for %s", key, exc_info=True)
+
 
 async def get(key: str):
-    async with get_client_ctx() as client:
-        resp = await client.get_object(Bucket=get_conf("R2_BUCKET_ID"), Key=key)
+    async with get_client_ctx(public=True) as client:
+        resp = await client.get_object(Bucket=BUCKET, Key=key)
         data = await resp["Body"].read()
     return json.loads(data) if resp.get("ContentType") == "application/json" else data
 
-async def prune( tail: int):
-    sub   = await get_subtensor()
-    BLOCK   = await sub.get_current_block()
+async def update_index(new_key: str) -> None:
+    async with get_client_ctx() as client:
+        try:
+            resp = await client.get_object(Bucket=BUCKET, Key=INDEX_KEY)
+            index = set(json.loads(await resp["Body"].read()))
+        except client.exceptions.NoSuchKey:
+            index = set()
+        if new_key in index:
+            return
+        index.add(new_key)
+        body = json.dumps(sorted(index), separators=(",", ":")).encode()
+        await client.put_object(
+            Bucket=BUCKET,
+            Key=INDEX_KEY,
+            Body=body,
+            ContentType="application/json",
+            ACL="public-read"
+        )
+    
+async def get_index() -> list[str]:
+    async with get_client_ctx(public=True) as client:
+        resp = await client.get_object(Bucket=BUCKET, Key=INDEX_KEY)
+        data = await resp["Body"].read()
+    return json.loads(data)
+
+async def prune(tail: int):
+    sub = await get_subtensor()
+    BLOCK = await sub.get_current_block()
     MIN = BLOCK - tail
     for f in CACHE_DIR.glob("*.jsonl"):
-        # filenames look like "12345-<wallet>.json.jsonl"
         blk_str = f.name.split("-", 1)[0]
         if blk_str.isdigit() and int(blk_str) < MIN:
             try:
                 f.unlink()
             except OSError:
-                 pass
-
-# use AFFINE_CACHE_DIR or fall back to a sane home‐cache location
-_env = os.getenv("AFFINE_CACHE_DIR")
-CACHE_DIR = Path(_env) if _env else Path.home() / ".cache" / "affine" / "blocks"
-try: CACHE_DIR.mkdir(parents=True, exist_ok=True)
-except Exception as e: logger.warning("Could not create cache dir %s: %s", CACHE_DIR, e)
-async def dataset(
-    tail: int,
-    max_concurrency: int = 10
-) -> AsyncIterator[Result]:
-    sub       = await get_subtensor()
-    current   = await sub.get_current_block()
+                pass
+ 
+async def dataset(tail: int, max_concurrency: int = 10) -> AsyncIterator[Result]:
+    sub = await get_subtensor()
+    current = await sub.get_current_block()
     min_block = current - tail
-    bucket, prefix = get_conf("R2_BUCKET_ID"), "affine/results/"
+    min_window = _window_base(min_block)
+    max_window = _window_base(current)
+    wanted_windows = set(range(min_window, max_window + WINDOW, WINDOW))
+
+    all_keys = await get_index()
+
+    keys = []
+    for k in all_keys:
+        try:
+            win = int(Path(k).name.split("-", 1)[0])
+        except ValueError:
+            continue
+        if win in wanted_windows:
+            keys.append((win, k))
+
+    keys.sort(key=lambda x: (x[0], x[1]))
     sem = asyncio.Semaphore(max_concurrency)
 
-    # 1) list all keys with block >= min_block
-    async with get_client_ctx() as client:
-        paginator = client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-        keys: list[tuple[int,str]] = []
-        async for page in pages:
-            for o in page.get("Contents", []):
-                name = Path(o["Key"]).name
-                if not name.endswith(".json"):
-                    continue
-                base = name[:-5]  # strip ".json"
-                parts = base.split("-", 1)
-                if len(parts) != 2:
-                    # malformed, skip
-                    continue
-                blk_str, _wallet = parts
-                if not blk_str.isdigit():
-                    continue
-                blk = int(blk_str)
-                if blk >= min_block:
-                    keys.append((blk, o["Key"]))
-
-    # sort by block ascending, then by full key lex
-    keys.sort(key=lambda x: (x[0], x[1]))
-
-    # 2) shard loader: fetch once and cache to disk as JSON‑Lines
     async def load_shard(key: str) -> Path:
         fname = Path(key).name
-        out   = CACHE_DIR / f"{fname}.jsonl"
-        if out.exists():
-            return out
-        async with sem, get_client_ctx() as client:
-            resp = await client.get_object(Bucket=bucket, Key=key)
-            raw  = await resp["Body"].read()
-        data = json.loads(raw)  # should be a list
+        out = CACHE_DIR / f"{fname}.jsonl"
+        mod_path = out.with_suffix(".modified")
+
+        # Check if we already have a cached copy and a recorded last-modified time
+        if out.exists() and mod_path.exists():
+            async with get_client_ctx(public=True) as client:
+                head = await client.head_object(Bucket=BUCKET, Key=key)
+                remote_modified = head["LastModified"].isoformat()
+            local_modified = mod_path.read_text().strip()
+            if remote_modified == local_modified:
+                return out  # Cached version is up to date
+
+        # Download and cache the fresh version
+        async with sem, get_client_ctx(public=True) as client:
+            resp = await client.get_object(Bucket=BUCKET, Key=key)
+            raw = await resp["Body"].read()
+            remote_modified = resp["LastModified"].isoformat()
+
+        data = json.loads(raw)
         with out.open("w") as fh:
             for item in data:
-                fh.write(json.dumps(item, separators=(",",":")) + "\n")
+                fh.write(json.dumps(item, separators=(",", ":")) + "\n")
+        mod_path.write_text(remote_modified)
         return out
 
-    # 3) stream each Result from each shard
-    for blk, key in keys:
+    pbar_dl = tqdm(keys, desc="Downloading shards", unit="shard")
+    for _, key in pbar_dl:
         shard_file = await load_shard(key)
         with shard_file.open("r") as fh:
             for line in fh:
@@ -323,8 +395,9 @@ async def dataset(
                     if r.verify():
                         yield r
                 except Exception:
-                    # skip invalid or corrupt entries
                     continue
+    pbar_dl.close()
+
 
 
 # --------------------------------------------------------------------------- #
@@ -440,11 +513,6 @@ async def get_latest_chute_id(model_name: str, api_key: Optional[str] = None) ->
             return chute.get("chute_id")
     return None
 
-def _extract_revision(code: str) -> Optional[str]:
-    matches = re.findall(r"--revision\s+([0-9a-f]{40})", code)
-    # only accept exactly one occurrence
-    if len(matches) == 1: return matches[0]
-    return None
 
 async def miners(
     uids: Optional[Union[int, List[int]]] = None,
@@ -561,7 +629,7 @@ def validate():
                 if subtensor is None: subtensor = await get_subtensor()
                 BLOCK = await subtensor.get_current_block()
                 if BLOCK % TEMPO != 0 or BLOCK <= LAST: 
-                    logger.info(f'Waiting ... {BLOCK} % {TEMPO} != 0:')
+                    logger.info(f'Waiting ... {BLOCK} % {TEMPO} == {BLOCK % TEMPO} != 0')
                     await subtensor.wait_for_block()
                     continue
                 meta = await subtensor.metagraph( NETUID )
@@ -570,9 +638,12 @@ def validate():
                 prev = { } 
                 scores = { hk: defaultdict(float) for hk in meta.hotkeys }   
                 max_score = { e: 0.0 for e in ENVS }
-                NRESULTS.set(0)              
+                NRESULTS.set(0)    
+                logger.info(f'Pruning files for {TAIL} blocks from {BLOCK - TAIL} until {BLOCK}')
                 await prune( tail = TAIL )
-                async for crr in dataset(tail = TAIL ):
+                
+                logger.info(f'Loading dataset from {BLOCK - TAIL} until {BLOCK}')
+                async for crr in dataset( tail = TAIL ):
                     NRESULTS.inc()
                     hk = crr.miner.hotkey
                     env = crr.challenge.env.name
@@ -591,17 +662,7 @@ def validate():
                     if crr.response.success or crr.miner.chute['hot']:
                         scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
                         max_score[env] = max(max_score[env], scores[hk][env])
-                        
-                # ---------------- Measure cache size ------------------------
-                cache_dir = CACHE_DIR
-                total_bytes = sum(
-                    f.stat().st_size for f in cache_dir.glob("*.jsonl") if f.is_file()
-                )
-                CACHE.set(total_bytes)
-                        
-                # ---------------- Record max scores -----------------------
-                for e, m in max_score.items():
-                    MAXENV.labels(env=e).set(m)
+                    
 
                 # ---------------- Compute Pairwise Dominance -----------------
                 ranks, counts = {}, defaultdict(int)
@@ -618,18 +679,23 @@ def validate():
                             counts[a] += 1
 
                 # ---------------- Set weights. ------------------------
-                best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                
-                weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]      
+                best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                       
+                for e, m in max_score.items():
+                    MAXENV.labels(env=env).set(scores[best][env])
+        
+                weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]   
+                logger.info(f'Setting weights with best uid: {meta.hotkeys.index(best)}')
                 await subtensor.set_weights(
                     wallet=wallet,
                     netuid=NETUID,
                     uids=meta.uids,
                     weights=weights,
-                    wait_for_inclusion=False
+                    wait_for_inclusion=True
                 )
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
                 LAST = BLOCK
+                logger.info(f'Finished setting weights.')
 
                 # ---------------- Prometheus ------------------------
                 for uid, hk in enumerate(meta.hotkeys):
@@ -651,6 +717,9 @@ def validate():
                     if (last := prev.get(hk)) and last.miner.model and (m := last.miner)
                 ]
                 logger.info("\nValidator Summary:\n%s", tabulate(r, h, tablefmt="plain"))
+                
+                # ---------------- Other telemetry ------------------------
+                CACHE.set(sum( f.stat().st_size for f in CACHE_DIR.glob("*.jsonl") if f.is_file()))
                 
             except asyncio.CancelledError: break
             except Exception as e:
