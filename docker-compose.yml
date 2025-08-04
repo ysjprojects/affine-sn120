@@ -87,6 +87,8 @@ services:
     container_name: subtensor-mainnet-lite
     volumes:
       - mainnet-lite-volume:/data
+    environment:
+      - RUST_LOG=error
     command:
       - --base-path=/data
       - --chain=./chainspecs/raw_spec_finney.json
