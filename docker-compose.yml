@@ -1,5 +1,21 @@
 version: "3.8"
 
+x-common: &common
+  image: ghcr.io/opentensor/subtensor:latest
+  cpu_count: 4
+  mem_limit: 40000000000
+  memswap_limit: 80000000000
+  ports:
+    - "9944:9944"
+    - "30333:30333"
+    - "9933:9933"
+  expose:
+    - "9944"
+    - "30333"
+    - "9933"
+  environment:
+    - CARGO_HOME=/var/www/node-subtensor/.cargo
+
 services:
   validator:
     image: thebes1618/affine:latest
@@ -65,22 +81,6 @@ services:
       - GF_LOG_MODE=console     
     volumes:
       - grafana-storage:/var/lib/grafana:rw
-
-  common: &common
-    image: ghcr.io/opentensor/subtensor:latest
-    cpu_count: 4
-    mem_limit: 40000000000
-    memswap_limit: 80000000000
-    ports:
-      - "9944:9944"
-      - "30333:30333"
-      - "9933:9933"
-    expose:
-      - "9944"
-      - "30333"
-      - "9933"
-    environment:
-      - CARGO_HOME=/var/www/node-subtensor/.cargo
 
   mainnet-lite:
     <<: *common
