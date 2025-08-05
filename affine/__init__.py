@@ -409,7 +409,7 @@ LOG_TEMPLATE = (
     "{score:>6.4f} │ "
     "{latency:>6.3f}s"
 )
-async def run(challenges, miners, timeout=150, retries=0, backoff=1, progress=True) -> List[Result]:
+async def run(challenges, miners, timeout=150, retries=0, backoff=1 )-> List[Result]:
     if not isinstance(challenges, list): challenges = [challenges]
     if isinstance(miners, Miner): miners = [miners]
     if isinstance(miners, dict):  mmap = miners
@@ -417,6 +417,7 @@ async def run(challenges, miners, timeout=150, retries=0, backoff=1, progress=Tr
     else: mmap = await miners(miners)
     logger.trace("Running challenges: %s on miners: %s", [chal.prompt[:30] for chal in challenges], list(mmap.keys()))
     response = []
+    uuid = uuid.
     async def proc(miner, chal):
         resp = await query(chal.prompt, miner.model, miner.slug, timeout, retries, backoff)
         try: ev = await chal.evaluate(resp)
@@ -597,14 +598,18 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
                 call=call,
                 keypair=wallet.hotkey,
             )
-            response = await sub.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True, wait_for_finalization=False)
-            success = await response.is_success           
-            if success:
+            logger.info("Calling set weights ...")
+            current_block = await sub.get_current_block()
+            await sub.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=False, wait_for_finalization=False)
+            logger.info("Checking inclusion...")
+            await sub.wait_for_block()
+            meta = await sub.metagraph(NETUID)
+            last_update = meta.last_update[ meta.hotkeys.index( wallet.hotkey.ss58_address ) ]
+            if last_update >= current_block:
                 logger.info(f'Success, weight are on chain. Breaking loop.')
                 return
             else:
-                err = await response.error_message
-                logger.warning(f"Failed transaction with err:{err['name']} docs:{err['docs'][0]}: Retrying {tries}/{retry} ...")
+                logger.warning(f"Failed transaction. Retrying {tries}/{retry} ...")
                 continue
         except Exception as e:
             logger.warning(f'Error while setting weights: {e}, Retrying {tries}/{retry} ...')
