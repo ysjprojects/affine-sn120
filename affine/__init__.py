@@ -11,6 +11,7 @@ import json
 import time
 import click
 import random
+import hashlib
 import aiohttp
 import asyncio
 import logging
@@ -35,6 +36,7 @@ from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence, Literal, TypeVar, Awaitable
+from pydantic import root_validator
 
 __version__ = "0.0.0"
 
@@ -134,6 +136,19 @@ class Challenge(BaseModel):
     env:  BaseEnv
     prompt: str
     extra: Dict[str, Any] = Field(default_factory=dict)
+    challenge_id: Optional[str] = None
+    @root_validator(pre=True)
+    def set_challenge_id(cls, values):
+        if "challenge_id" not in values or values["challenge_id"] is None:
+            env = values["env"]
+            prompt = values["prompt"]
+            extra = values.get("extra", {})
+            if not isinstance(env, str): env = env.name
+            base_dict = { "env": env,"prompt": prompt, "extra": extra}
+            canonical = json.dumps(base_dict, sort_keys=True, separators=(",", ":"))
+            cid = hashlib.sha256(canonical.encode()).hexdigest()
+            values["challenge_id"] = cid
+        return values
     @validator("env", pre=True)
     def _parse_env(cls, v):
         from .envs.sat import SAT
@@ -150,6 +165,7 @@ class Challenge(BaseModel):
     def __repr__(self):
         return f"<Challenge env={self.env.name!r} prompt={_truncate(self.prompt)!r}>"
     __str__ = __repr__
+
 
 class Evaluation(BaseModel):
     env: BaseEnv
@@ -304,9 +320,13 @@ async def _jsonl(p: Path):
 async def dataset(
     tail: int,
     *,
-    max_concurrency: int = 10,
-    queue_size: int = 1000,
+    max_concurrency: int = 10,      # parallel S3 downloads
 ) -> AsyncIterator["Result"]:
+    """
+    Stream `Result`s in deterministic order while pre‑downloading future
+    shards concurrently.
+    """
+    # ── figure out which windows we need ────────────────────────────────
     sub  = await get_subtensor()
     cur  = await sub.get_current_block()
     need = {w for w in range(_w(cur - tail), _w(cur) + WINDOW, WINDOW)}
@@ -314,37 +334,31 @@ async def dataset(
         k for k in await _index()
         if (h := Path(k).name.split("-", 1)[0]).isdigit() and int(h) in need
     ]
-    # ── shared queue & sem ────────────────────────────────────────────────
-    q   : asyncio.Queue[Result | None] = asyncio.Queue(queue_size)
-    sem = asyncio.Semaphore(max_concurrency)
-    async def produce(key: str) -> None:
-        try:
-            path = await _cache_shard(key, sem)
-            async for raw in _jsonl(path):
-                try:
-                    r = Result.model_validate(_loads(raw))
-                    if r.verify():
-                        await q.put(r)
-                except Exception:
-                    pass
-        finally:
-            await q.put(None)                     
-
-    # ── launch producers (they start downloading immediately) ─────────────
-    producers = [asyncio.create_task(produce(k)) for k in keys]
-    finished = 0
-    total    = len(producers)
-    bar      = tqdm(desc=f"Dataset=({cur}, {cur - tail})", unit="res", dynamic_ncols=True)
-    while finished < total:
-        item = await q.get()
-        if item is None:
-            finished += 1
-            continue
-        bar.update(1)
-        yield item
+    keys.sort()    
+    # ── helpers ────────────────────────────────
+    sem = asyncio.Semaphore(max_concurrency)     # throttle S3
+    async def _prefetch(key: str) -> Path:       # just downloads / caches
+        return await _cache_shard(key, sem)
+    tasks: list[asyncio.Task[Path]] = [
+        asyncio.create_task(_prefetch(k)) for k in keys[:max_concurrency]
+    ]
+    next_key = max_concurrency            
+    bar = tqdm(f"Dataset=({cur}, {cur - tail})", unit="res", dynamic_ncols=True)
+    # ── main loop: iterate over keys in order ───────────────────────────
+    for i, key in enumerate(keys):
+        path = await tasks[i]
+        if next_key < len(keys):
+            tasks.append(asyncio.create_task(_prefetch(keys[next_key])))
+            next_key += 1
+        async for raw in _jsonl(path):
+            try:
+                r = Result.model_validate(_loads(raw))
+                if r.verify():
+                    bar.update(1)
+                    yield r
+            except Exception:
+                pass
     bar.close()
-
-    await asyncio.gather(*producers, return_exceptions=True)
 
 # ── Minimal sink / misc helpers (optional) ──────────────────────────────────
 async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
@@ -585,15 +599,20 @@ def runner():
 async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
     for tries in range(retry):
         try:
+            logger.info(f'Make subtensor connection...')
             sub = bt.subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
+            logger.info(f'Call set weights...')
             sub.set_weights(
                 wallet = wallet,
                 netuid=NETUID,
-                weights=[1],
-                uids=[best_uid]
+                weights=[1.0],
+                uids=[best_uid],
+                wait_for_inclusion=False
             )
+            logger.info(f'Waiting 1 block ...')
             current_block = sub.get_current_block()
             await asyncio.sleep(12)
+            logger.info(f'Checking last update...')
             meta = sub.metagraph(NETUID)
             last_update = meta.last_update[ meta.hotkeys.index( wallet.hotkey.ss58_address ) ]
             if last_update >= current_block:
@@ -682,6 +701,7 @@ def validate():
                 for e, m in max_score.items(): MAXENV.labels(env=env).set(scores[best_hotkey][env])
                 best_uid = meta.hotkeys.index(best_hotkey)   
                 await retry_set_weights( wallet, best_uid, retry = 3)
+                subtensor = await get_subtensor()
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
                 LAST = BLOCK
