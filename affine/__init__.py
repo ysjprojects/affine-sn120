@@ -575,7 +575,7 @@ def runner():
     async def main():
         await asyncio.gather(
             _run(),
-            watchdog()
+            watchdog(timeout = (60 * 10))
         )
     asyncio.run(main())
 
