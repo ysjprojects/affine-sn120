@@ -347,12 +347,12 @@ async def dataset(
     await asyncio.gather(*producers, return_exceptions=True)
 
 # ── Minimal sink / misc helpers (optional) ──────────────────────────────────
-async def sink(wallet: bt.wallet, items: list["Result"], block: int | None = None):
-    if not items: return
+async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
+    if not results: return
     if block is None:
         sub = await get_subtensor(); block = await sub.get_current_block()
     key = f"{RESULT_PREFIX}{_w(block):09d}-{wallet.hotkey.ss58_address}.json"
-    new = [r.sign(wallet) or r.model_dump(mode="json") for r in items]
+    new = [r.sign(wallet) or r.model_dump(mode="json") for r in results]
     async with get_client_ctx() as c:
         try:
             r = await c.get_object(Bucket=BUCKET, Key=key)
