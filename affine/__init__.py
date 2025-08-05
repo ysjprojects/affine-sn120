@@ -334,7 +334,7 @@ async def dataset(
     producers = [asyncio.create_task(produce(k)) for k in keys]
     finished = 0
     total    = len(producers)
-    bar      = tqdm(desc="Dataset", unit="res", dynamic_ncols=True)
+    bar      = tqdm(desc=f"Dataset=({cur}, {cur - tail})", unit="res", dynamic_ncols=True)
     while finished < total:
         item = await q.get()
         if item is None:
@@ -682,7 +682,7 @@ def validate():
                 best_hotkey = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                       
                 for e, m in max_score.items(): MAXENV.labels(env=env).set(scores[best_hotkey][env])
                 best_uid = meta.hotkeys.index(best_hotkey)   
-                await retry_set_weights( wallet, best_uid, retry = 10)
+                await retry_set_weights( wallet, best_uid, retry = 3)
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
                 LAST = BLOCK
