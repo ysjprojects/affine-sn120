@@ -585,24 +585,16 @@ def runner():
 async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
     for tries in range(retry):
         try:
-            sub = await get_subtensor()
-            call = await sub.substrate.compose_call(
-                call_module="SubtensorModule",
-                call_function="set_weights",
-                call_params={
-                    'origin': wallet.hotkey.ss58_address, 'netuid': NETUID, 'dests': [best_uid], 'weights': [65535], 'version_key': 1_000_000,
-                }
+            sub = bt.subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
+            sub.set_weights(
+                wallet = wallet,
+                netuid=NETUID,
+                weights=[1],
+                uids=[best_uid]
             )
-            extrinsic = await sub.substrate.create_signed_extrinsic(
-                call=call,
-                keypair=wallet.hotkey,
-            )
-            logger.info("Calling set weights ...")
-            current_block = await sub.get_current_block()
-            await sub.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=False, wait_for_finalization=False)
-            logger.info("Checking inclusion...")
-            await sub.wait_for_block()
-            meta = await sub.metagraph(NETUID)
+            current_block = sub.get_current_block()
+            asyncio.sleep(12)
+            meta = sub.metagraph(NETUID)
             last_update = meta.last_update[ meta.hotkeys.index( wallet.hotkey.ss58_address ) ]
             if last_update >= current_block:
                 logger.info(f'Success, weight are on chain. Breaking loop.')
@@ -666,7 +658,8 @@ def validate():
                     if crr.response.success or crr.miner.chute['hot']:
                         scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
                         max_score[env] = max(max_score[env], scores[hk][env])
-                    
+                logger.info("Scored results ...")
+
 
                 # ---------------- Compute Pairwise Dominance -----------------
                 ranks, counts = {}, defaultdict(int)
@@ -681,8 +674,10 @@ def validate():
                         not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
                         if not_worse and better >= 1:
                             counts[a] += 1
+                logger.info("Computed pairwise ...")
 
                 # ---------------- Set weights. ------------------------
+                logger.info("Setting weights ...")
                 best_hotkey = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                       
                 for e, m in max_score.items(): MAXENV.labels(env=env).set(scores[best_hotkey][env])
                 best_uid = meta.hotkeys.index(best_hotkey)   
