@@ -1,3 +1,4 @@
+import time
 import random, re
 import affine as af
 
@@ -23,7 +24,7 @@ class SAT(af.BaseEnv):
             "Provide your answer as comma-separated assignments like `x1=True, x2=False, ...`, "
             "or respond `UNSAT` if it has no solution."
         )
-        return af.Challenge(env=self, prompt=prompt, extra={"sol": sol, "cls": cls})        
+        return af.Challenge(env=self, prompt=prompt, extra={"sol": sol, "cls": cls, 'timestamp': time.time()})        
 
     async def evaluate(self, challenge: af.Challenge, response: af.Response):
         sol, cls = challenge.extra["sol"], challenge.extra["cls"]
