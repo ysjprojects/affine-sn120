@@ -417,7 +417,6 @@ async def run(challenges, miners, timeout=150, retries=0, backoff=1 )-> List[Res
     else: mmap = await miners(miners)
     logger.trace("Running challenges: %s on miners: %s", [chal.prompt[:30] for chal in challenges], list(mmap.keys()))
     response = []
-    uuid = uuid.
     async def proc(miner, chal):
         resp = await query(chal.prompt, miner.model, miner.slug, timeout, retries, backoff)
         try: ev = await chal.evaluate(resp)
