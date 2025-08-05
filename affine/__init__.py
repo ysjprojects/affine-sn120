@@ -241,12 +241,10 @@ WINDOW        = int(os.getenv("AFFINE_WINDOW", 20))
 RESULT_PREFIX = "affine/results/"
 INDEX_KEY     = "affine/index.json"
 
-BUCKET  = os.getenv("R2_BUCKET_ID",
-                    "80f15715bb0b882c9e967c13e677ed7d")
-ACCESS  = os.getenv("R2_WRITE_ACCESS_KEY_ID",
-                    "ff3f4f078019b064bfb6347c270bee4d")
-SECRET  = os.getenv("R2_WRITE_SECRET_ACCESS_KEY",
-                    "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
+FOLDER  = os.getenv("R2_FOLDER", "affine" )
+BUCKET  = os.getenv("R2_BUCKET_ID", "80f15715bb0b882c9e967c13e677ed7d" )
+ACCESS  = os.getenv("R2_WRITE_ACCESS_KEY_ID", "ff3f4f078019b064bfb6347c270bee4d")
+SECRET  = os.getenv("R2_WRITE_SECRET_ACCESS_KEY", "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
 ENDPOINT = f"https://{BUCKET}.r2.cloudflarestorage.com"
 
 get_client_ctx = lambda: get_session().create_client(
@@ -272,19 +270,19 @@ except ModuleNotFoundError:
 # ── Index helpers ───────────────────────────────────────────────────────────
 async def _index() -> list[str]:
     async with get_client_ctx() as c:
-        r = await c.get_object(Bucket=BUCKET, Key=INDEX_KEY)
+        r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
         return json.loads(await r["Body"].read())
 
 async def _update_index(k: str) -> None:
     async with get_client_ctx() as c:
         try:
-            r = await c.get_object(Bucket=BUCKET, Key=INDEX_KEY)
+            r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
             idx = set(json.loads(await r["Body"].read()))
         except c.exceptions.NoSuchKey:
             idx = set()
         if k not in idx:
             idx.add(k)
-            await c.put_object(Bucket=BUCKET, Key=INDEX_KEY,
+            await c.put_object(Bucket=FOLDER, Key=INDEX_KEY,
                                Body=_dumps(sorted(idx)),
                                ContentType="application/json")
 
@@ -294,10 +292,10 @@ async def _cache_shard(key: str, sem: asyncio.Semaphore) -> Path:
     out = CACHE_DIR / f"{name}.jsonl"; mod = out.with_suffix(".modified")
     async with sem, get_client_ctx() as c:
         if out.exists() and mod.exists():
-            h = await c.head_object(Bucket=BUCKET, Key=key)
+            h = await c.head_object(Bucket=FOLDER, Key=key)
             if h["LastModified"].isoformat() == mod.read_text().strip():
                 return out
-        o = await c.get_object(Bucket=BUCKET, Key=key)
+        o = await c.get_object(Bucket=FOLDER, Key=key)
         body, lm = await o["Body"].read(), o["LastModified"].isoformat()
     tmp = out.with_suffix(".tmp")
     with tmp.open("wb") as f:
@@ -369,11 +367,11 @@ async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
     new = [r.sign(wallet) or r.model_dump(mode="json") for r in results]
     async with get_client_ctx() as c:
         try:
-            r = await c.get_object(Bucket=BUCKET, Key=key)
+            r = await c.get_object(Bucket=FOLDER, Key=key)
             merged = json.loads(await r["Body"].read()) + new
         except c.exceptions.NoSuchKey:
             merged = new
-        await c.put_object(Bucket=BUCKET, Key=key, Body=_dumps(merged),
+        await c.put_object(Bucket=FOLDER, Key=key, Body=_dumps(merged),
                            ContentType="application/json")
     if len(merged) == len(new):              # shard was new
         await _update_index(key)
