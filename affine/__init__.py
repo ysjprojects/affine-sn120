@@ -593,7 +593,7 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
                 uids=[best_uid]
             )
             current_block = sub.get_current_block()
-            asyncio.sleep(12)
+            await asyncio.sleep(12)
             meta = sub.metagraph(NETUID)
             last_update = meta.last_update[ meta.hotkeys.index( wallet.hotkey.ss58_address ) ]
             if last_update >= current_block:
