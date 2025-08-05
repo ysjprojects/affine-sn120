@@ -604,7 +604,7 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
                 return
             else:
                 err = await response.error_message
-                logger.warning(f'Failed transaction with err:{err['name']} docs:{err['docs'][0]}: Retrying {tries}/{retry} ...')
+                logger.warning(f"Failed transaction with err:{err['name']} docs:{err['docs'][0]}: Retrying {tries}/{retry} ...")
                 continue
         except Exception as e:
             logger.warning(f'Error while setting weights: {e}, Retrying {tries}/{retry} ...')
