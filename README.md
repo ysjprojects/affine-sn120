@@ -88,10 +88,8 @@ import affine as af
 # Optionally turn on logging 
 af.trace(); af.debug(); af.info()
 
-# Get all miner model endpoints
+# Get all miner info or only for UID =5
 miners = await af.miners()
-
-# Get a miner endpoint for a UID
 miner = await af.miners( 5 )
 
 # Generate a SAT challenge
@@ -109,7 +107,7 @@ response = await af.query( chal.prompt, model = miner.model )
 evaluation = chal.evaluate( response ) 
 print( evaluation.score )
 
-# Stream results from the last 100 blocks
-async for result in af.dataset(tail=100):
-    print(result.miner.model, result.challenge.prompt, result.evaluation.score)
+# Async generator of results from last 100 blocks.
+async for res in af.dataset(100):
+    print (res)          # Result objects
 ```
