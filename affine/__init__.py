@@ -679,7 +679,7 @@ def validate():
                     netuid=NETUID,
                     uids=meta.uids,
                     weights=weights,
-                    wait_for_inclusion=True
+                    wait_for_inclusion=False
                 )
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
