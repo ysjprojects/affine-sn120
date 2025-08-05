@@ -301,30 +301,50 @@ async def _jsonl(p: Path):
         for l in await asyncio.to_thread(_read): yield l
 
 # ── Core async stream (Result objects) ──────────────────────────────────────
-async def dataset(tail: int, max_concurrency: int = 10
-                      ) -> AsyncIterator["Result"]:
-    sub  = await get_subtensor(); cur = await sub.get_current_block()
+async def dataset(
+    tail: int,
+    *,
+    max_concurrency: int = 10,
+    queue_size: int = 1000,
+) -> AsyncIterator["Result"]:
+    sub  = await get_subtensor()
+    cur  = await sub.get_current_block()
     need = {w for w in range(_w(cur - tail), _w(cur) + WINDOW, WINDOW)}
-    keys = [k for k in await _index()
-            if (h := Path(k).name.split("-", 1)[0]).isdigit()
-            and int(h) in need]
-    keys.sort()
+    keys = [
+        k for k in await _index()
+        if (h := Path(k).name.split("-", 1)[0]).isdigit() and int(h) in need
+    ]
+    # ── shared queue & sem ────────────────────────────────────────────────
+    q   : asyncio.Queue[Result | None] = asyncio.Queue(queue_size)
     sem = asyncio.Semaphore(max_concurrency)
-    pend = [asyncio.create_task(_cache_shard(k, sem))
-            for k in keys[:max_concurrency]]
-    nxt = len(pend)
-    bar = tqdm(desc="Dataset", unit="res",dynamic_ncols=True)
-    while pend:
-        path = await pend.pop(0)
-        if nxt < len(keys):
-            pend.append(asyncio.create_task(_cache_shard(keys[nxt], sem)))
-            nxt += 1
-        async for raw in _jsonl(path):
-            try:
-                r = Result.model_validate(_loads(raw))
-                if r.verify(): bar.update(1); yield r
-            except Exception: pass
+    async def produce(key: str) -> None:
+        try:
+            path = await _cache_shard(key, sem)
+            async for raw in _jsonl(path):
+                try:
+                    r = Result.model_validate(_loads(raw))
+                    if r.verify():
+                        await q.put(r)
+                except Exception:
+                    pass
+        finally:
+            await q.put(None)                     
+
+    # ── launch producers (they start downloading immediately) ─────────────
+    producers = [asyncio.create_task(produce(k)) for k in keys]
+    finished = 0
+    total    = len(producers)
+    bar      = tqdm(desc="Dataset", unit="res", dynamic_ncols=True)
+    while finished < total:
+        item = await q.get()
+        if item is None:
+            finished += 1
+            continue
+        bar.update(1)
+        yield item
     bar.close()
+
+    await asyncio.gather(*producers, return_exceptions=True)
 
 # ── Minimal sink / misc helpers (optional) ──────────────────────────────────
 async def sink(wallet: bt.wallet, items: list["Result"], block: int | None = None):
@@ -562,28 +582,29 @@ def runner():
 # --------------------------------------------------------------------------- #
 #                               Validator                                     #
 # --------------------------------------------------------------------------- #
-async def retry_set_weights( wallet: bt.Wallet, weights, uids, retry: int = 10 ):
-    logger.info(f'Setting {[ (u,w) for w,u in list(zip(uids, weights)) if w > 0]}')
+async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
     for tries in range(retry):
         try:
             sub = await get_subtensor()
-            current = await sub.get_current_block()
-            await sub.set_weights(
-                wallet=wallet,
-                netuid=NETUID,
-                uids=uids,
-                weights=weights,
-                wait_for_inclusion=False
+            call = await sub.substrate.compose_call(
+                call_module="SubtensorModule",
+                call_function="set_weights",
+                call_params={
+                    'origin': wallet.hotkey.ss58_address, 'netuid': NETUID, 'dests': [best_uid], 'weights': [65535], 'version_key': 1_000_000,
+                }
             )
-            logger.info(f'Waiting for execution...')
-            await sub.wait_for_block()
-            meta = await sub.metagraph()
-            last_update = meta.hotkeys.index( wallet.hotkey.ss58_address )
-            if last_update >= current:
+            extrinsic = await sub.substrate.create_signed_extrinsic(
+                call=call,
+                keypair=wallet.hotkey,
+            )
+            response = await sub.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True, wait_for_finalization=False)
+            success = await response.is_success           
+            if success:
                 logger.info(f'Success, weight are on chain. Breaking loop.')
                 return
             else:
-                logger.warning(f'last_update:{last_update} < current:{current}, Retrying {tries}/{retry} ...')
+                err = await response.error_message
+                logger.warning(f'Failed transaction with err:{err['name']} docs:{err['docs'][0]}: Retrying {tries}/{retry} ...')
                 continue
         except Exception as e:
             logger.warning(f'Error while setting weights: {e}, Retrying {tries}/{retry} ...')
@@ -658,17 +679,17 @@ def validate():
                             counts[a] += 1
 
                 # ---------------- Set weights. ------------------------
-                best = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                       
-                for e, m in max_score.items(): MAXENV.labels(env=env).set(scores[best][env])
-                weights = [1.0 if hk == best else 0.0 for hk in meta.hotkeys]   
-                await retry_set_weights( wallet, weights, meta.uids, retry = 10)
+                best_hotkey = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                       
+                for e, m in max_score.items(): MAXENV.labels(env=env).set(scores[best_hotkey][env])
+                best_uid = meta.hotkeys.index(best_hotkey)   
+                await retry_set_weights( wallet, best_uid, retry = 10)
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
                 LAST = BLOCK
 
                 # ---------------- Prometheus ------------------------
                 for uid, hk in enumerate(meta.hotkeys):
-                    WEIGHT.labels(uid=uid).set( weights[uid] )
+                    WEIGHT.labels(uid=uid).set( 1 if uid == best_uid else 0 )
                     for e in ENVS:
                         if scores[hk][e] > 0:
                             SCORE.labels(uid=uid, env=e).set(scores[hk][e])
@@ -681,7 +702,7 @@ def validate():
                     [str(m.uid), m.model, m.revision or ""] 
                     + [f"{scores[hk][e]:.4f}" for e in ENVS] 
                     + [str(ranks[e][hk])      for e in ENVS] 
-                    + [str(counts.get(hk,0)), f"{weights[meta.hotkeys.index(hk)]:.1f}"]
+                    + [str(counts.get(hk,0)), f"{(1 if hk == best_hotkey else 0):.1f}"]
                     for hk in meta.hotkeys
                     if (last := prev.get(hk)) and last.miner.model and (m := last.miner)
                 ]
