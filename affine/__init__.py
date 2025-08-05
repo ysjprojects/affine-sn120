@@ -17,6 +17,7 @@ import asyncio
 import logging
 import textwrap
 import traceback
+import itertools
 from .utils import *
 import datetime as dt
 from tqdm import tqdm
@@ -575,7 +576,7 @@ def runner():
                 HEARTBEAT = time.monotonic()
                 miners_map = await miners(meta=meta)
                 challenges = [await e.generate() for e in envs.values()]
-                results    = await run(challenges, miners_map, timeout=150)
+                results    = await run(challenges, miners_map, timeout=180)
                 await sink( wallet = wallet, block = blk, results = results )
             except asyncio.CancelledError: break
             except Exception as e:
@@ -623,16 +624,109 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
             logger.warning(f'Error while setting weights: {e}, Retrying {tries}/{retry} ...')
             continue
         
+TAIL= 10_000
+ALPHA = 0.9
+async def get_weights(tail=TAIL):
+    st = await get_subtensor()
+    blk = await st.get_current_block()
+    logger.info(f'Pruning {tail} blocks from {blk-tail} to {blk}')
+    await prune(tail=tail)
+
+    meta = await st.metagraph(NETUID)
+    cnt  = {hk: defaultdict(int) for hk in meta.hotkeys}
+    succ = {hk: defaultdict(int) for hk in meta.hotkeys}
+    prev = {}
+
+    logger.info(f'Loading data from {blk-tail} to {blk}')
+    async for c in dataset(tail=tail):
+        NRESULTS.inc()
+        hk, env = c.miner.hotkey, c.challenge.env.name
+        name = c.miner.model.split('/',1)[1].lower()
+        if hk not in cnt or not name.startswith('affine'):
+            continue
+
+        # reset if block/model/revision changed
+        if hk in prev:
+            p = prev[hk].miner
+            if (p.block!=c.miner.block or p.model!=c.miner.model
+             or p.revision!=c.miner.revision):
+                succ[hk][env] = 0
+
+        prev[hk] = c
+        cnt[hk][env] += 1
+        succ[hk][env] += c.evaluation.score
+
+    logger.info("Collected results.")
+
+    # compute accuracy & maxenv
+    acc = {
+        hk: {e: (float(succ[hk][e])/cnt[hk][e] if cnt[hk][e] else 0)
+             for e in ENVS}
+        for hk in meta.hotkeys
+    }
+    max_acc = {}
+    for e in ENVS:
+        max_acc[e] = max(acc[hk][e] for hk in meta.hotkeys)
+        MAXENV.labels(env=e).set(max_acc[e])
+    logger.info("Computed accuracy & updated MAXENV.")
+
+    # compute ranks with dense tie handling
+    ranks = {}
+    for e in ENVS:
+        uniq = sorted({acc[h][e] for h in meta.hotkeys}, reverse=True)
+        rank_of = {v: i+1 for i, v in enumerate(uniq)}
+        ranks[e] = {h: rank_of[acc[h][e]] for h in meta.hotkeys}
+    logger.info("Computed ranks.")
+
+    # pairwise dominance
+    dom = defaultdict(int)
+    for a, b in itertools.permutations(meta.hotkeys, 2):
+        if all(ranks[e][a] <= ranks[e][b] for e in ENVS) \
+        and any(ranks[e][a] < ranks[e][b] for e in ENVS):
+            dom[a] += 1
+    logger.info("Computed dominance counts.")
+
+    # select best
+    best = max(prev, key=lambda hk: (dom[hk], -prev[hk].miner.block))
+    best_uid = meta.hotkeys.index(best)
+
+    # print summary
+    hdr = ["UID","Model","Rev"] \
+        + [f"{e}Acc" for e in ENVS] \
+        + [f"{e}Rnk" for e in ENVS] \
+        + [f"{e}N"   for e in ENVS] \
+        + ["Dom","Wgt"]
+    rows = sorted([
+        [m.uid, m.model, m.revision[:5]]
+        + [f"{100*acc[hk][e]:.2f}" for e in ENVS]
+        + [ranks[e][hk]     for e in ENVS]
+        + [cnt[hk][e]       for e in ENVS]
+        + [dom[hk], 1 if hk==best else 0]
+        for hk, m in ((hk, prev[hk].miner) for hk in prev)
+    ], key=lambda r: r[-2], reverse=True)
+    print("Validator Summary:\n" + tabulate(rows, hdr, tablefmt="plain"))
+
+    # update Prometheus
+    for uid, hk in enumerate(meta.hotkeys):
+        WEIGHT.labels(uid=uid).set(1 if hk==best else 0)
+        for e in ENVS:
+            a = acc[hk][e]
+            if a > 0:
+                SCORE.labels(uid=uid, env=e).set(a)
+                RANK.labels(uid=uid, env=e).set(ranks[e][hk])
+
+    return best_uid, best
+
+
+        
 @cli.command("validate")
 def validate():
     coldkey = get_conf("BT_WALLET_COLD", "default")
     hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)    
     async def _run():     
-        ALPHA = 0.9
         LAST = 0
         TEMPO = 100
-        TAIL= 10_000
         subtensor = None
         while True:
             try:
@@ -645,86 +739,18 @@ def validate():
                     logger.debug(f'Waiting ... {BLOCK} % {TEMPO} == {BLOCK % TEMPO} != 0')
                     await subtensor.wait_for_block()
                     continue
-                meta = await subtensor.metagraph( NETUID )
-
-                # ---------------- Compute scores ------------------------
-                prev = { } 
-                scores = { hk: defaultdict(float) for hk in meta.hotkeys }   
-                max_score = { e: 0.0 for e in ENVS }
-                NRESULTS.set(0)    
-                logger.info(f'Pruning files for {TAIL} blocks from {BLOCK - TAIL} until {BLOCK}')
-                await prune( tail = TAIL )
                 
-                logger.info(f'Loading dataset from {BLOCK - TAIL} until {BLOCK}')
-                async for crr in dataset( tail = TAIL ):
-                    NRESULTS.inc()
-                    hk = crr.miner.hotkey
-                    env = crr.challenge.env.name
-                    scr = crr.evaluation.score
-                    if crr.miner.model.split('/')[1].lower()[:6] != 'affine': continue
-                    if hk not in scores:
-                        continue
-                    if hk in prev:
-                        prv = prev[ hk ]
-                        reset = prv.miner.block != crr.miner.block
-                        reset = reset or (prv.miner.model != crr.miner.model)
-                        reset = reset or (prv.miner.revision != crr.miner.revision)
-                        if reset:
-                            scores[hk][env] = 0
-                    prev[ hk ] = crr
-                    if crr.response.success or crr.miner.chute['hot']:
-                        scores[hk][env] = scr * (1 - ALPHA) + scores[hk][env] * ALPHA
-                        max_score[env] = max(max_score[env], scores[hk][env])
-                logger.info("Scored results ...")
-
-
-                # ---------------- Compute Pairwise Dominance -----------------
-                ranks, counts = {}, defaultdict(int)
-                for e in ENVS:
-                    uniq = sorted({scores[h][e] for h in meta.hotkeys}, reverse=True)
-                    rank_of = {score: i + 1 for i, score in enumerate(uniq)}
-                    ranks[e] = {h: rank_of[scores[h][e]] for h in meta.hotkeys}
-                for a in meta.hotkeys:
-                    for b in meta.hotkeys:
-                        if a == b: continue
-                        better    = sum(ranks[e][a] < ranks[e][b] for e in ENVS)
-                        not_worse = all(ranks[e][a] <= ranks[e][b] for e in ENVS)
-                        if not_worse and better >= 1:
-                            counts[a] += 1
-                logger.info("Computed pairwise ...")
-
+                # ---------------- Set weights. ------------------------
+                winner_uid, _ = await get_weights()
+        
                 # ---------------- Set weights. ------------------------
                 logger.info("Setting weights ...")
-                best_hotkey = max( meta.hotkeys, key=lambda hk: (counts.get(hk, 0), -prev[hk].miner.block if hk in prev else float('inf')) )                       
-                for e, m in max_score.items(): MAXENV.labels(env=env).set(scores[best_hotkey][env])
-                best_uid = meta.hotkeys.index(best_hotkey)   
-                await retry_set_weights( wallet, best_uid, retry = 3)
+                await retry_set_weights( wallet, winner_uid, retry = 3)
                 subtensor = await get_subtensor()
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
-                LAST = BLOCK
-
-                # ---------------- Prometheus ------------------------
-                for uid, hk in enumerate(meta.hotkeys):
-                    WEIGHT.labels(uid=uid).set( 1 if uid == best_uid else 0 )
-                    for e in ENVS:
-                        if scores[hk][e] > 0:
-                            SCORE.labels(uid=uid, env=e).set(scores[hk][e])
-                            RANK.labels(uid=uid, env=e).set(ranks[e][hk])
-                            
+                LAST = BLOCK           
             
-                # ---------------- Print State ------------------------
-                h = ["UID","Model","Rev"] + [f"{e} Score" for e in ENVS] + [f"{e} Rank" for e in ENVS] + ["Count","Weight"]
-                r = [
-                    [str(m.uid), m.model, m.revision or ""] 
-                    + [f"{scores[hk][e]:.4f}" for e in ENVS] 
-                    + [str(ranks[e][hk])      for e in ENVS] 
-                    + [str(counts.get(hk,0)), f"{(1 if hk == best_hotkey else 0):.1f}"]
-                    for hk in meta.hotkeys
-                    if (last := prev.get(hk)) and last.miner.model and (m := last.miner)
-                ]
-                logger.info("\nValidator Summary:\n%s", tabulate(r, h, tablefmt="plain"))
-                
                 # ---------------- Other telemetry ------------------------
                 CACHE.set(sum( f.stat().st_size for f in CACHE_DIR.glob("*.jsonl") if f.is_file()))
                 
@@ -742,7 +768,11 @@ def validate():
             watchdog(timeout = (60 * 10))
         )
     asyncio.run(main())
-
+    
+    
+@cli.command("weights")
+def weights():
+    asyncio.run(get_weights())
 
 # --------------------------------------------------------------------------- #
 #                              Pull Model                                     #

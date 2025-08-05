@@ -3,11 +3,11 @@ import random, re
 import affine as af
 
 class SAT(af.BaseEnv):
-    __version__: str = "0.0.1"
+    __version__: str = "0.0.2"
     n: int
     k: int
     m: int
-    def __init__(self, n=4, k=2, m=None):
+    def __init__(self, n=6, k=4, m=None):
         super().__init__(n=n, k=k, m=m or int(4.26 * n))
         
     async def generate(self):
