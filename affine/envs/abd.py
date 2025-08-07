@@ -99,7 +99,10 @@ class ABD(af.BaseEnv):
             af.logger.trace("Generated input insufficient, retrying")
             return None
 
-        output, error = self._executor.execute(program, gen_input)
+        loop = asyncio.get_running_loop()
+        output, error = await loop.run_in_executor(
+            None, self._executor.execute, program, gen_input
+        )
         af.logger.trace(f"Executed program with generated input. Output: {output}, Error: {error}, program: {program}")
         if error or not output.strip():
             af.logger.trace("Generated input contains error")
@@ -179,7 +182,10 @@ class ABD(af.BaseEnv):
                 env=self, score=0.0,
                 extra={"error": "No input found", "expected_output": expected}
             )
-        out, err = self._executor.execute(prog, gen_in)
+        loop = asyncio.get_running_loop()
+        out, err = await loop.run_in_executor(
+            None, self._executor.execute, prog, gen_in
+        )
         af.logger.trace(f"Executed program with generated input. Output: {out}, Error: {err}")
         if err:
             af.logger.trace("Error occurred during program execution.")

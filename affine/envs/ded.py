@@ -144,7 +144,7 @@ class DED(af.BaseEnv):
 
             try:
                 out, err = await loop.run_in_executor(
-                    None, lambda: self._executor.execute(exec_prog, inp)
+                    None, self._executor.execute, exec_prog, inp
                 )
             except subprocess.TimeoutExpired:
                 out, err = "", "TIMEOUT"

@@ -388,7 +388,22 @@ async def prune(tail: int):
 # --------------------------------------------------------------------------- #
 #                               QUERY                                         #
 # --------------------------------------------------------------------------- #
-HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+# Lazy-initialised semaphore and shared HTTP client
+_HTTP_SEM: asyncio.Semaphore | None = None
+_CLIENT: aiohttp.ClientSession | None = None
+
+async def _get_sem() -> asyncio.Semaphore:
+    global _HTTP_SEM
+    if _HTTP_SEM is None:
+        _HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+    return _HTTP_SEM
+
+async def _get_client() -> aiohttp.ClientSession:
+    global _CLIENT
+    if _CLIENT is None or _CLIENT.closed:
+        _CLIENT = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+    return _CLIENT
+
 TERMINAL = {400, 404, 410}
 async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> Response:
     url = f"https://{slug}.chutes.ai/v1/chat/completions"
@@ -397,20 +412,21 @@ async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm"
     QCOUNT.labels(model=model).inc()
     R = lambda resp, at, err, ok: Response(response=resp, latency_seconds=time.monotonic()-start,
                                           attempts=at, model=model, error=err, success=ok)
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
-        for attempt in range(1, retries+2):
-            try:
-                payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-                async with HTTP_SEM, sess.post(url, json=payload,
-                                               headers=hdr, timeout=timeout) as r:
+    sess = await _get_client()
+    sem = await _get_sem()
+    for attempt in range(1, retries+2):
+        try:
+            payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+            async with sem, sess.post(url, json=payload,
+                                      headers=hdr, timeout=timeout) as r:
                     txt = await r.text(errors="ignore")
                     if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
                     r.raise_for_status()
                     content = (await r.json())["choices"][0]["message"]["content"]
                     return R(content, attempt, None, True)
-            except Exception as e:
-                if attempt > retries: return R(None, attempt, str(e), False)
-                await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
+        except Exception as e:
+            if attempt > retries: return R(None, attempt, str(e), False)
+            await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
 
 LOG_TEMPLATE = (
     "[RESULT] "
