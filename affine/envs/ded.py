@@ -171,7 +171,7 @@ class DED(af.BaseEnv):
                 }
             )
 
-        score = passed / total if total else 0.0
+        score = 1.0 if passed == total else 0.0
         feedback = json.dumps(
             {"passed": passed, "total": total, "tests": details}, ensure_ascii=False
         )
