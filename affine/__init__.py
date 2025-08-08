@@ -780,7 +780,7 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
         logger.warning(f"Signer call timed out: {e}. Not falling back to local because validator has no wallet.")
         return
     
-TAIL= 100
+TAIL= 10_000
 ALPHA = 0.9
 async def get_weights(tail=TAIL):
     st = await get_subtensor()
@@ -882,7 +882,7 @@ def validate():
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)    
     async def _run():     
         LAST = 0
-        TEMPO = 10
+        TEMPO = 100
         subtensor = None
         while True:
             try:
