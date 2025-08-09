@@ -537,8 +537,8 @@ async def miners(
             data = json.loads(data)
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
             chute = await get_chute(chute_id)
-            slug, chutes_revision = chute.get("slug"), chute.get("revision")
-            if model.split('/')[1].lower()[:6] != 'affine': return None 
+            chutes_name, slug, chutes_revision = chute.get('name'), chute.get("slug"), chute.get("revision")
+            if model != chutes_name or chutes_name.split('/')[1].lower()[:6] != 'affine': return None 
             if chutes_revision == None or miner_revision == chutes_revision:
                 miner = Miner(
                     uid=uid, hotkey=hotkey, model=model, block=int(block),
