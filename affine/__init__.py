@@ -799,7 +799,8 @@ async def get_weights(tail=TAIL):
         NRESULTS.inc()
         hk, env = c.miner.hotkey, c.challenge.env.name
         name = c.miner.model.split('/',1)[1].lower()
-        if hk not in cnt or not name.startswith('affine'):
+        BASE_HK = meta.hotkeys[0]
+        if hk not in cnt or (hk != BASE_HK and not name.startswith('affine')):
             continue
 
         # reset if block/model/revision changed
