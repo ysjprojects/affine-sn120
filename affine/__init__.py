@@ -441,7 +441,7 @@ LOG_TEMPLATE = (
     "{score:>6.4f} │ "
     "{latency:>6.3f}s"
 )
-async def run(challenges, miners, timeout=150, retries=0, backoff=1 )-> List[Result]:
+async def run(challenges, miners, timeout=240, retries=0, backoff=1 )-> List[Result]:
     if not isinstance(challenges, list): challenges = [challenges]
     if isinstance(miners, Miner): miners = [miners]
     if isinstance(miners, dict):  mmap = miners
@@ -533,12 +533,13 @@ async def miners(
             hotkey = meta.hotkeys[ uid ]
             if hotkey not in commits: return None
             commit = commits[hotkey]
-            block, data = commit[-1]        
+            block, data = commit[-1]     
+            block = 0 if uid == 0 else block
             data = json.loads(data)
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
             chute = await get_chute(chute_id)
             chutes_name, slug, chutes_revision = chute.get('name'), chute.get("slug"), chute.get("revision")
-            if model != chutes_name or chutes_name.split('/')[1].lower()[:6] != 'affine': return None 
+            if model != chutes_name or (uid != 0 and chutes_name.split('/')[1].lower()[:6] != 'affine'): return None
             if chutes_revision == None or miner_revision == chutes_revision:
                 miner = Miner(
                     uid=uid, hotkey=hotkey, model=model, block=int(block),
