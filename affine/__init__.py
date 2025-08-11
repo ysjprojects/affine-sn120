@@ -41,6 +41,7 @@ from pydantic import root_validator
 from aiohttp import ClientConnectorError
 import socket
 from urllib.parse import urlparse
+import requests
 
 __version__ = "0.0.0"
 
@@ -66,6 +67,14 @@ LASTSET = Gauge( "lastset", "lastset", registry=REGISTRY)
 NRESULTS = Gauge( "nresults", "nresults", registry=REGISTRY)
 MAXENV = Gauge("maxenv", "maxenv", ["env"], registry=REGISTRY)
 CACHE = Gauge( "cache", "cache", registry=REGISTRY)
+
+# --------------------------------------------------------------------------- #
+#                       Model Gating Check                                    #
+# --------------------------------------------------------------------------- #
+# Global cache for model gating status
+MODEL_GATING_STATUS = {}  # {model_id: (is_gated, last_checked)}
+MODEL_GATING_LOCK = asyncio.Lock()
+GATING_CHECK_INTERVAL = 300  # 5 minutes
 
 # --------------------------------------------------------------------------- #
 #                               Logging                                       #
@@ -100,6 +109,56 @@ def get_conf(key, default=None) -> Any:
     if not v and default is None:
         raise ValueError(f"{key} not set.\nYou must set env var: {key} in .env")
     return v or default
+
+# --------------------------------------------------------------------------- #
+#                          Model Gating Functions                             #
+# --------------------------------------------------------------------------- #
+def check_model_gated(model_id: str) -> Optional[bool]:
+    """Check if a model is gated on Hugging Face."""
+    try:
+        url = f"https://huggingface.co/api/models/{model_id}"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code == 200:
+            model_info = response.json()
+            return model_info.get("gated", False)
+        else:
+            return None  # Model not found or other error
+    except Exception as e:
+        logger.trace(f"Error checking gating status for {model_id}: {e}")
+        return None
+
+async def check_and_update_gating_status(model_id: str) -> Optional[bool]:
+    """Check and update the gating status of a model with caching."""
+    async with MODEL_GATING_LOCK:
+        current_time = time.time()
+        
+        # Check if we have a recent status
+        if model_id in MODEL_GATING_STATUS:
+            is_gated, last_checked = MODEL_GATING_STATUS[model_id]
+            if current_time - last_checked < GATING_CHECK_INTERVAL:
+                return is_gated
+        
+        # Check gating status
+        new_gating_status = await asyncio.to_thread(check_model_gated, model_id)
+        
+        # If we got a valid response, update the cache
+        if new_gating_status is not None:
+            MODEL_GATING_STATUS[model_id] = (new_gating_status, current_time)
+            logger.trace(f"Updated gating status for {model_id}: is_gated={new_gating_status}")
+            return new_gating_status
+        
+        # If check failed and we have a previous value, use it
+        if model_id in MODEL_GATING_STATUS:
+            is_gated, _ = MODEL_GATING_STATUS[model_id]
+            logger.trace(f"Gating check failed for {model_id}, using previous value: is_gated={is_gated}")
+            # Update the timestamp to prevent repeated failed checks
+            MODEL_GATING_STATUS[model_id] = (is_gated, current_time)
+            return is_gated
+        
+        # No previous value and check failed
+        return None
+
 
 # --------------------------------------------------------------------------- #
 #                               Subtensor                                     #
@@ -447,13 +506,35 @@ async def run(challenges, miners, timeout=240, retries=0, backoff=1 )-> List[Res
     if isinstance(miners, dict):  mmap = miners
     elif isinstance(miners, list) and all(hasattr(m, "uid") for m in miners):  mmap = {m.uid: m for m in miners}
     else: mmap = await miners(miners)
+    
     logger.trace("Running challenges: %s on miners: %s", [chal.prompt[:30] for chal in challenges], list(mmap.keys()))
     response = []
+    
     async def proc(miner, chal):
+        # Check gating status before querying
+        if miner.model:
+            is_gated = await check_and_update_gating_status(miner.model)
+            
+            # If we don't know the status (None) or it's gated (True), return zero score
+            if is_gated is None:
+                logger.trace(f"Miner {miner.uid} - unknown gating status for model {miner.model}, returning zero score")
+                resp = Response(response=None, latency_seconds=0, attempts=0, model=miner.model, 
+                               error="Unknown model gating status", success=False)
+                ev = Evaluation(env=chal.env, score=0.0, extra={"error": "Unknown model gating status", "gated_check_failed": True})
+                return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
+            elif is_gated:
+                logger.trace(f"Miner {miner.uid} - model {miner.model} is gated, returning zero score")
+                resp = Response(response=None, latency_seconds=0, attempts=0, model=miner.model, 
+                               error="Model is gated", success=False)
+                ev = Evaluation(env=chal.env, score=0.0, extra={"error": "Model is gated", "gated": True})
+                return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
+        
+        # Normal processing for non-gated models
         resp = await query(chal.prompt, miner.model, miner.slug, timeout, retries, backoff)
         try: ev = await chal.evaluate(resp)
         except Exception as e: ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
         return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
+    
     tasks = [ asyncio.create_task(proc(m, chal)) for m in mmap.values() if m.model for chal in challenges]  
     total = len(tasks); completed = 0
     for task in asyncio.as_completed(tasks): 
@@ -584,6 +665,7 @@ def runner():
     coldkey = get_conf("BT_WALLET_COLD", "default")
     hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
+    
     async def _run():
         subtensor = None
         envs = { name: cls() for name, cls in ENVS.items() }
