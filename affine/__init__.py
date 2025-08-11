@@ -894,8 +894,23 @@ async def get_weights(tail=TAIL):
             dom[a] += 1
     logger.info("Computed dominance counts.")
 
-    # select best
-    best = max(prev, key=lambda hk: (dom[hk], -prev[hk].miner.block))
+    # select best non-gated model, fallback to any if none available
+    non_gated_candidates = []
+    for hk in prev:
+        miner = prev[hk].miner
+        if miner.model:
+            is_gated = await check_model_gated(miner.model)
+            if is_gated is False:  # Only add if explicitly non-gated
+                non_gated_candidates.append(hk)
+    
+    # Select best from non-gated models, or fallback to all models
+    if non_gated_candidates:
+        best = max(non_gated_candidates, key=lambda hk: (dom[hk], -prev[hk].miner.block))
+        logger.info(f"Selected non-gated model for weights")
+    else:
+        logger.warning("No non-gated models found, selecting from all available models")
+        best = max(prev, key=lambda hk: (dom[hk], -prev[hk].miner.block))
+    
     best_uid = meta.hotkeys.index(best)
 
     # print summary
