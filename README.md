@@ -1,6 +1,8 @@
 # Affine
 
-We will mine reasoning for the world.
+Mine open reasoning.
+
+[Affine Discord]([https://example.com](https://discord.com/invite/3T9X4Yn23e))
 
 ## Introduction
 
