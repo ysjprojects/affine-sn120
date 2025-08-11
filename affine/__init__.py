@@ -70,8 +70,23 @@ CACHE = Gauge( "cache", "cache", registry=REGISTRY)
 
 # Model gating check cache
 MODEL_GATING_CACHE = {}  # {model_id: (is_gated, last_checked)}
-GATING_LOCK = asyncio.Lock()
+# Replace global loop-bound lock with per-event-loop lazy locks to avoid cross-loop errors
+_GATING_LOCKS: Dict[int, asyncio.Lock] = {}
 GATING_TTL = 300  # 5 minutes
+
+def _get_gating_lock() -> asyncio.Lock:
+    """Return an asyncio.Lock bound to the current running loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Fallback if called when no loop is running yet
+        loop = asyncio.get_event_loop()
+    key = id(loop)
+    lock = _GATING_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _GATING_LOCKS[key] = lock
+    return lock
 
 # --------------------------------------------------------------------------- #
 #                               Logging                                       #
@@ -109,7 +124,7 @@ def get_conf(key, default=None) -> Any:
 
 async def check_model_gated(model_id: str) -> Optional[bool]:
     """Check if model is gated, with caching."""
-    async with GATING_LOCK:
+    async with _get_gating_lock():
         now = time.time()
         if model_id in MODEL_GATING_CACHE:
             is_gated, ts = MODEL_GATING_CACHE[model_id]
@@ -427,20 +442,32 @@ async def prune(tail: int):
 #                               QUERY                                         #
 # --------------------------------------------------------------------------- #
 # Lazy-initialised semaphore and shared HTTP client
-_HTTP_SEM: asyncio.Semaphore | None = None
-_CLIENT: aiohttp.ClientSession | None = None
+_HTTP_SEMS: Dict[int, asyncio.Semaphore] = {}
+_CLIENTS: Dict[int, aiohttp.ClientSession] = {}
 
 async def _get_sem() -> asyncio.Semaphore:
-    global _HTTP_SEM
-    if _HTTP_SEM is None:
-        _HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
-    return _HTTP_SEM
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    key = id(loop)
+    sem = _HTTP_SEMS.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+        _HTTP_SEMS[key] = sem
+    return sem
 
 async def _get_client() -> aiohttp.ClientSession:
-    global _CLIENT
-    if _CLIENT is None or _CLIENT.closed:
-        _CLIENT = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-    return _CLIENT
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    key = id(loop)
+    client = _CLIENTS.get(key)
+    if client is None or client.closed:
+        client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+        _CLIENTS[key] = client
+    return client
 
 TERMINAL = {400, 404, 410}
 async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> Response:
