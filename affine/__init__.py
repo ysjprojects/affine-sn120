@@ -909,6 +909,10 @@ async def get_weights(tail=TAIL):
 
     logger.info("Collected results.")
 
+    if not prev:
+        logger.warning("No results collected; defaulting to uid 0")
+        return 0, meta.hotkeys[0]
+
     # compute accuracy & maxenv
     acc = { hk: {e: float(ema[hk][e]) for e in ENVS} for hk in meta.hotkeys }
     max_acc = {}
@@ -917,55 +921,55 @@ async def get_weights(tail=TAIL):
         MAXENV.labels(env=e).set(max_acc[e])
     logger.info("Computed accuracy & updated MAXENV.")
 
-    # compute ranks with dense tie handling
+    # eligible miners: require per-env N >= 0.9 * max samples for that env
+    required = {e: int(0.9 * max((cnt[hk][e] for hk in prev), default=0)) for e in ENVS}
+    eligible = {hk for hk in prev if all(cnt[hk][e] >= required[e] for e in ENVS)}
+
+    # compute ranks with dense tie handling among eligible only
     ranks = {}
     for e in ENVS:
-        uniq = sorted({acc[h][e] for h in meta.hotkeys}, reverse=True)
+        uniq = sorted({acc[h][e] for h in eligible}, reverse=True) if eligible else []
         rank_of = {v: i+1 for i, v in enumerate(uniq)}
-        ranks[e] = {h: rank_of[acc[h][e]] for h in meta.hotkeys}
-    logger.info("Computed ranks.")
+        ranks[e] = {h: rank_of.get(acc[h][e], 0) for h in prev}
+    logger.info("Computed ranks (eligible only).")
 
-    # pairwise dominance
+    # pairwise dominance among eligible
     dom = defaultdict(int)
-    for a, b in itertools.permutations(meta.hotkeys, 2):
+    for a, b in itertools.permutations(eligible, 2):
         if all(ranks[e][a] <= ranks[e][b] for e in ENVS) \
         and any(ranks[e][a] < ranks[e][b] for e in ENVS):
             dom[a] += 1
-    logger.info("Computed dominance counts.")
+    logger.info("Computed dominance counts (eligible only).")
 
-    # select best non-gated model, fallback to any if none available
-    non_gated_candidates = []
-    for hk in prev:
+    # select best from eligible non-gated; fallback to eligible any; then to all
+    pool = list(eligible) if eligible else list(prev.keys())
+    non_gated = []
+    for hk in pool:
         miner = prev[hk].miner
         if miner.model:
             is_gated = await check_model_gated(miner.model)
-            if is_gated is False:  # Only add if explicitly non-gated
-                non_gated_candidates.append(hk)
-    
-    # Select best from non-gated models, or fallback to all models
-    if non_gated_candidates:
-        best = max(non_gated_candidates, key=lambda hk: (dom[hk], -prev[hk].miner.block))
-        logger.info(f"Selected non-gated model for weights")
-    else:
-        logger.warning("No non-gated models found, selecting from all available models")
-        best = max(prev, key=lambda hk: (dom[hk], -prev[hk].miner.block))
-    
+            if is_gated is False:
+                non_gated.append(hk)
+    cand = non_gated if non_gated else pool
+    best = max(cand, key=lambda hk: (dom.get(hk, 0), -prev[hk].miner.block)) if cand else next(iter(prev))
     best_uid = meta.hotkeys.index(best)
 
-    # print summary
+    # print summary: eligible ranked first, ineligible at bottom with rank 0
     hdr = ["UID","Model","Rev"] \
         + [f"{e}Acc" for e in ENVS] \
         + [f"{e}Rnk" for e in ENVS] \
         + [f"{e}N"   for e in ENVS] \
         + ["Dom","Wgt"]
-    rows = sorted([
-        [m.uid, m.model, m.revision[:5]]
-        + [f"{100*acc[hk][e]:.2f}" for e in ENVS]
-        + [ranks[e][hk]     for e in ENVS]
-        + [cnt[hk][e]       for e in ENVS]
-        + [dom[hk], 1 if hk==best else 0]
-        for hk, m in ((hk, prev[hk].miner) for hk in prev)
-    ], key=lambda r: r[-2], reverse=True)
+    def _row(hk):
+        m = prev[hk].miner
+        return [m.uid, m.model, m.revision[:5]] \
+            + [f"{100*acc[hk][e]:.2f}" for e in ENVS] \
+            + [ranks[e].get(hk, 0) for e in ENVS] \
+            + [cnt[hk][e] for e in ENVS] \
+            + [dom.get(hk, 0), 1 if hk==best else 0]
+    ranked_rows = sorted([_row(hk) for hk in eligible], key=lambda r: r[-2], reverse=True)
+    unranked_rows = sorted([_row(hk) for hk in prev if hk not in eligible], key=lambda r: r[-3:], reverse=True)
+    rows = ranked_rows + unranked_rows
     print("Validator Summary:\n" + tabulate(rows, hdr, tablefmt="plain"))
 
     # update Prometheus
@@ -975,7 +979,7 @@ async def get_weights(tail=TAIL):
             a = acc[hk][e]
             if a > 0:
                 SCORE.labels(uid=uid, env=e).set(a)
-                RANK.labels(uid=uid, env=e).set(ranks[e][hk])
+                RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
 
     return best_uid, best
 
