@@ -7,14 +7,17 @@ from __future__ import annotations
 import os
 import re
 import sys
+import math
 import json
 import time
 import click
+import socket
 import random
 import hashlib
 import aiohttp
 import asyncio
 import logging
+import requests
 import textwrap
 import traceback
 import itertools
@@ -28,20 +31,18 @@ from tqdm.asyncio import tqdm
 from tabulate import tabulate
 from dotenv import load_dotenv
 from typing import AsyncIterator
+from urllib.parse import urlparse
 from huggingface_hub import HfApi
 from botocore.config import Config
 from collections import defaultdict
 from abc import ABC, abstractmethod
+from pydantic import root_validator
+from aiohttp import ClientConnectorError
 from aiobotocore.session import get_session
 from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence, Literal, TypeVar, Awaitable
-from pydantic import root_validator
-from aiohttp import ClientConnectorError
-import socket
-from urllib.parse import urlparse
-import requests
 
 __version__ = "0.0.0"
 
@@ -160,8 +161,14 @@ async def get_subtensor():
     if SUBTENSOR == None:
         logger.trace("Making Bittensor connection...")
         SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_ENDPOINT', default='finney') )
-        await SUBTENSOR.initialize()
-        logger.trace("Connected")
+        try:
+            await SUBTENSOR.initialize()
+            logger.trace("Connected")
+        except Exception as e:
+            logger.warning(f"Failed to initialize subtensor: {e}, falling back to {'wss://lite.sub.latent.to:443'}")
+            SUBTENSOR = bt.async_subtensor( get_conf('SUBTENSOR_FALLBACK', default="wss://lite.sub.latent.to:443") )
+            await SUBTENSOR.initialize()
+            logger.trace("Connected to fallback")
     return SUBTENSOR
 
 # --------------------------------------------------------------------------- #
@@ -411,23 +418,48 @@ async def dataset(
             except Exception:
                 pass
     bar.close()
+    
+    
+# --------------------------------------------------------------------------- #
+async def sign_results( wallet, results ):
+    try:
+        signer_url = get_conf('SIGNER_URL', default='http://signer:8080')
+        timeout = aiohttp.ClientTimeout(connect=2, total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            payloads = [str(r.challenge) for r in results]
+            resp = await session.post(f"{signer_url}/sign", json={"payloads": payloads})
+            if resp.status == 200:
+                data = await resp.json()
+                sigs = data.get("signatures") or []
+                hotkey = data.get("hotkey")
+                for r, s in zip(results, sigs):
+                    r.hotkey = hotkey
+                    r.signature = s
+    except Exception as e:
+        logger.info(f"sink: signer unavailable, using local signing: {type(e).__name__}: {e}")
+        hotkey = wallet.hotkey.ss58_address
+        for r in results: 
+            r.sign(wallet)
+    finally:
+        return hotkey, results
 
 # ── Minimal sink / misc helpers (optional) ──────────────────────────────────
 async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
     if not results: return
     if block is None:
         sub = await get_subtensor(); block = await sub.get_current_block()
-    key = f"{RESULT_PREFIX}{_w(block):09d}-{wallet.hotkey.ss58_address}.json"
-    new = [r.sign(wallet) or r.model_dump(mode="json") for r in results]
+    hotkey, signed = await sign_results( wallet, results )
+    key = f"{RESULT_PREFIX}{_w(block):09d}-{hotkey}.json"
+    dumped = [ r.model_dump(mode="json") for r in signed ]
     async with get_client_ctx() as c:
         try:
             r = await c.get_object(Bucket=FOLDER, Key=key)
-            merged = json.loads(await r["Body"].read()) + new
+            merged = json.loads(await r["Body"].read()) + dumped
         except c.exceptions.NoSuchKey:
-            merged = new
+            merged = dumped
         await c.put_object(Bucket=FOLDER, Key=key, Body=_dumps(merged),
                            ContentType="application/json")
-    if len(merged) == len(new):              # shard was new
+    if len(merged) == len(dumped):              # shard was new
         await _update_index(key)
 
 async def prune(tail: int):
@@ -614,6 +646,9 @@ async def miners(
             data = json.loads(data)
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
             chute = await get_chute(chute_id)
+            if not chute: None
+            gated = await check_model_gated(model)
+            if gated: return None
             chutes_name, slug, chutes_revision = chute.get('name'), chute.get("slug"), chute.get("revision")
             if model != chutes_name or (uid != 0 and chutes_name.split('/')[1].lower()[:6] != 'affine'): return None
             if chutes_revision == None or miner_revision == chutes_revision:
@@ -627,7 +662,7 @@ async def miners(
         except: pass
     results = await asyncio.gather(*(fetch(uid) for uid in uids))
     output = {uid: m for uid, m in zip(uids, results) if m is not None}
-
+    # Remove duplicates.
     if output:
         best_by_model: Dict[str, Tuple[int, int]] = {}
         for uid, m in output.items():
@@ -639,7 +674,6 @@ async def miners(
                 best_by_model[m.model] = (blk, uid)
         selected_uids = {uid for _, uid in best_by_model.values()}
         output = {uid: m for uid, m in output.items() if uid in selected_uids}
-
     return output
 
 
@@ -707,6 +741,7 @@ def runner():
 # --------------------------------------------------------------------------- #
 #                               Validator                                     #
 # --------------------------------------------------------------------------- #
+    
 async def _set_weights_with_confirmation(
     wallet: "bt.wallet",
     netuid: int,
@@ -752,7 +787,9 @@ def signer(host: str, port: int):
     """Start lightweight HTTP signer service."""
     async def _run():
         from aiohttp import web
-
+        coldkey = get_conf("BT_WALLET_COLD", "default")
+        hotkey = get_conf("BT_WALLET_HOT", "default")
+        wallet = bt.wallet(name=coldkey, hotkey=hotkey)
         @web.middleware
         async def access_log(request: "web.Request", handler):
             start = time.monotonic()
@@ -767,6 +804,23 @@ def signer(host: str, port: int):
 
         async def health(_request: "web.Request"):
             return web.json_response({"ok": True})
+    
+        async def sign_handler(request: "web.Request"):
+            try:
+                payload = await request.json()
+                data = payload.get("payloads") or payload.get("data") or []
+                if isinstance(data, str):
+                    data = [data]
+                sigs = [(wallet.hotkey.sign(data=d)).hex() for d in data]
+                return web.json_response({
+                    "success": True,
+                    "signatures": sigs,
+                    "hotkey": wallet.hotkey.ss58_address
+                })
+            except Exception as e:
+                logger.error(f"[signer] /sign error: {e}")
+                return web.json_response({"success": False, "error": str(e)}, status=500)
+
 
         async def set_weights_handler(request: "web.Request"):
             try:
@@ -776,9 +830,6 @@ def signer(host: str, port: int):
                 uids = payload.get('uids') or []
                 weights = payload.get('weights') or []
                 wait_for_inclusion = bool(payload.get('wait_for_inclusion', False))
-                coldkey = get_conf("BT_WALLET_COLD", "default")
-                hotkey = get_conf("BT_WALLET_HOT", "default")
-                wallet = bt.wallet(name=coldkey, hotkey=hotkey)
                 ok = await _set_weights_with_confirmation(
                     wallet,
                     netuid,
@@ -799,6 +850,7 @@ def signer(host: str, port: int):
         app.add_routes([
             web.get('/healthz', health),
             web.post('/set_weights', set_weights_handler),
+            web.post('/sign', sign_handler),
         ])
         runner = web.AppRunner(app)
         await runner.setup()
@@ -873,108 +925,166 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
     
 TAIL= 10_000
 ALPHA = 0.9
+EPS_FLOOR = 0.01   # absolute epsilon floor (1 percentage point)
+Z = 1.645          # one-sided ~95% margin; set 0 to disable stats cushion
 async def get_weights(tail=TAIL):
+    """
+    Select the best miner over the last `tail` blocks using ε-Pareto dominance with copy resistance.
+    """
+    # --- fetch + prune --------------------------------------------------------
     st = await get_subtensor()
     blk = await st.get_current_block()
-    logger.info(f'Pruning {tail} blocks from {blk-tail} to {blk}')
+    logger.info(f"Pruning {tail} blocks from {blk - tail} to {blk}")
     await prune(tail=tail)
 
     meta = await st.metagraph(NETUID)
-    cnt  = {hk: defaultdict(int) for hk in meta.hotkeys}
-    succ = {hk: defaultdict(int) for hk in meta.hotkeys}
-    ema  = {hk: defaultdict(float) for hk in meta.hotkeys}
-    prev = {}
+    BASE_HK = meta.hotkeys[0]
 
-    logger.info(f'Loading data from {blk-tail} to {blk}')
+    # Tallies for all known hotkeys (so metrics update is safe even if some have no data)
+    cnt   = {hk: defaultdict(int)   for hk in meta.hotkeys}  # per-env counts
+    succ  = {hk: defaultdict(int)   for hk in meta.hotkeys}  # per-env correct
+    prev  = {}                                                # last sample per hk
+    v_id  = {}                                                # current version id per hk -> (model, revision)
+    first_block = {}                                          # timestamp: earliest block for current version
+
+    # --- ingest ---------------------------------------------------------------
+    logger.info(f"Loading data from {blk - tail} to {blk}")
     async for c in dataset(tail=tail):
         NRESULTS.inc()
         hk, env = c.miner.hotkey, c.challenge.env.name
-        name = c.miner.model.split('/',1)[1].lower()
-        BASE_HK = meta.hotkeys[0]
-        if hk not in cnt or (hk != BASE_HK and not name.startswith('affine')):
+
+        # keep the base hk; otherwise require model family
+        try:
+            name = c.miner.model.split("/", 1)[1].lower()
+        except Exception:
+            name = str(c.miner.model).lower()
+        if hk not in cnt or (hk != BASE_HK and not name.startswith("affine")):
             continue
 
-        # reset if block/model/revision changed
-        if hk in prev:
-            p = prev[hk].miner
-            if (p.block!=c.miner.block or p.model!=c.miner.model
-             or p.revision!=c.miner.revision):
-                succ[hk][env] = 0; ema[hk][env] = 0.0
+        cur_vid = (c.miner.model, c.miner.revision)
 
+        # On version change, reset ALL env streams for this miner and timestamp to current block
+        if v_id.get(hk) != cur_vid:
+            v_id[hk] = cur_vid
+            first_block[hk] = c.miner.block
+            for e in ENVS:
+                cnt[hk][e] = 0
+                succ[hk][e] = 0
+
+        # accumulate for this env
         prev[hk] = c
-        cnt[hk][env] += 1
-        succ[hk][env] += c.evaluation.score
-        score = float(c.evaluation.score)
-        ema[hk][env] = score if cnt[hk][env] == 1 else (ALPHA*ema[hk][env] + (1-ALPHA)*score)
+        cnt[hk][env]  += 1
+        # assume score is 0/1 or numeric in [0,1]; cast to float then to int if needed
+        succ[hk][env] += float(c.evaluation.score)
 
     logger.info("Collected results.")
 
     if not prev:
         logger.warning("No results collected; defaulting to uid 0")
-        return 0, meta.hotkeys[0]
+        return 0, BASE_HK
 
-    # compute accuracy & maxenv
-    acc = { hk: {e: float(ema[hk][e]) for e in ENVS} for hk in meta.hotkeys }
-    max_acc = {}
+    # --- accuracy + MAXENV ----------------------------------------------------
+    acc = {
+        hk: {e: (succ[hk][e] / cnt[hk][e] if cnt[hk][e] else 0.0) for e in ENVS}
+        for hk in meta.hotkeys
+    }
+
+    active_hks = list(prev.keys())
     for e in ENVS:
-        max_acc[e] = max(acc[hk][e] for hk in meta.hotkeys)
-        MAXENV.labels(env=e).set(max_acc[e])
+        max_e = max((acc[hk][e] for hk in active_hks), default=0.0)
+        MAXENV.labels(env=e).set(max_e)
     logger.info("Computed accuracy & updated MAXENV.")
 
-    # eligible miners: require per-env N >= 0.9 * max samples for that env
-    required = {e: int(0.9 * max((cnt[hk][e] for hk in prev), default=0)) for e in ENVS}
-    eligible = {hk for hk in prev if all(cnt[hk][e] >= required[e] for e in ENVS)}
+    # --- eligibility: require near-max samples per env ------------------------
+    required = {
+        e: int(0.9 * max((cnt[hk][e] for hk in active_hks), default=0))
+        for e in ENVS
+    }
+    eligible = {hk for hk in active_hks if all(cnt[hk][e] >= required[e] for e in ENVS)}
 
-    # compute ranks with dense tie handling among eligible only
-    ranks = {}
-    for e in ENVS:
-        uniq = sorted({acc[h][e] for h in eligible}, reverse=True) if eligible else []
-        rank_of = {v: i+1 for i, v in enumerate(uniq)}
-        ranks[e] = {h: rank_of.get(acc[h][e], 0) for h in prev}
-    logger.info("Computed ranks (eligible only).")
+    # --- ranks (for reporting only) -------------------------------------------
+    ranks = {e: {} for e in ENVS}
+    if eligible:
+        for e in ENVS:
+            uniq = sorted({acc[h][e] for h in eligible}, reverse=True)
+            rank_of = {v: i + 1 for i, v in enumerate(uniq)}
+            for h in active_hks:
+                ranks[e][h] = rank_of.get(acc[h][e], 0)
 
-    # pairwise dominance among eligible
+    # --- ε-Pareto dominance with block-based tiebreak -------------------------
+    def eps_threshold(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
+        """ε = max(EPS_FLOOR, Z * SE_diff). Uses binomial SE; guards against n=0."""
+        if Z <= 0:
+            return EPS_FLOOR
+        var = (a_i * (1 - a_i)) / max(n_i, 1) + (a_j * (1 - a_j)) / max(n_j, 1)
+        return max(EPS_FLOOR, Z * math.sqrt(var))
+
+    def dominates(a: str, b: str) -> bool:
+        """Return True iff a ε-dominates b; break full ε-ties by earlier first_block."""
+        not_worse_all = True
+        better_any = False
+        tie_all = True
+        for e in ENVS:
+            ai, aj = acc[a][e], acc[b][e]
+            ni, nj = cnt[a][e], cnt[b][e]
+            thr = eps_threshold(ai, ni, aj, nj)
+
+            if ai < aj - thr:
+                not_worse_all = False
+            if ai >= aj + thr:
+                better_any = True
+            if abs(ai - aj) > thr:
+                tie_all = False
+
+        if not_worse_all and better_any:
+            return True
+        if tie_all and first_block.get(a, float("inf")) < first_block.get(b, float("inf")):
+            return True
+        return False
+
     dom = defaultdict(int)
-    for a, b in itertools.permutations(eligible, 2):
-        if all(ranks[e][a] <= ranks[e][b] for e in ENVS) \
-        and any(ranks[e][a] < ranks[e][b] for e in ENVS):
+    pool_for_dom = eligible if eligible else set(active_hks)
+    for a, b in itertools.permutations(pool_for_dom, 2):
+        if dominates(a, b):
             dom[a] += 1
-    logger.info("Computed dominance counts (eligible only).")
+    logger.info("Computed ε-dominance counts.")
 
-    # select best from eligible non-gated; fallback to eligible any; then to all
-    pool = list(eligible) if eligible else list(prev.keys())
-    non_gated = []
-    for hk in pool:
-        miner = prev[hk].miner
-        if miner.model:
-            is_gated = await check_model_gated(miner.model)
-            if is_gated is False:
-                non_gated.append(hk)
-    cand = non_gated if non_gated else pool
-    best = max(cand, key=lambda hk: (dom.get(hk, 0), -prev[hk].miner.block)) if cand else next(iter(prev))
+    # --- choose winner: tie-break by earliest block ---
+    def ts(hk: str) -> int:
+        # block is our timestamp; default to last seen block for safety
+        return int(first_block.get(hk, prev[hk].miner.block))
+
+    best = max(pool_for_dom, key=lambda hk: (dom.get(hk, 0), -ts(hk))) if pool_for_dom else active_hks[0]
     best_uid = meta.hotkeys.index(best)
 
-    # print summary: eligible ranked first, ineligible at bottom with rank 0
-    hdr = ["UID","Model","Rev"] \
-        + [f"{e}Acc" for e in ENVS] \
-        + [f"{e}Rnk" for e in ENVS] \
-        + [f"{e}N"   for e in ENVS] \
-        + ["Dom","Wgt"]
-    def _row(hk):
+    # --- summary printout -----------------------------------------------------
+    hdr = (
+        ["UID", "Model", "Rev"]
+        + [f"{e}Acc" for e in ENVS]
+        + [f"{e}Rnk" for e in ENVS]
+        + [f"{e}N"   for e in ENVS]
+        + ["Dom", "Wgt"]
+    )
+
+    def row(hk: str):
         m = prev[hk].miner
-        return [m.uid, m.model, m.revision[:5]] \
-            + [f"{100*acc[hk][e]:.2f}" for e in ENVS] \
-            + [ranks[e].get(hk, 0) for e in ENVS] \
-            + [cnt[hk][e] for e in ENVS] \
-            + [dom.get(hk, 0), 1 if hk==best else 0]
-    ranked_rows = sorted([_row(hk) for hk in eligible], key=lambda r: r[-2], reverse=True)
-    unranked_rows = sorted([_row(hk) for hk in prev if hk not in eligible], key=lambda r: r[-3:], reverse=True)
+        return [
+            m.uid, m.model, str(m.revision)[:5],
+            *[f"{100 * acc[hk][e]:.2f}" for e in ENVS],
+            *[ranks[e].get(hk, 0) for e in ENVS],
+            *[cnt[hk][e] for e in ENVS],
+            dom.get(hk, 0),
+            1 if hk == best else 0,
+        ]
+
+    ranked_rows   = sorted((row(hk) for hk in eligible), key=lambda r: r[-2], reverse=True)
+    unranked_rows = sorted((row(hk) for hk in active_hks if hk not in eligible), key=lambda r: r[-3:], reverse=True)
     rows = ranked_rows + unranked_rows
     print("Validator Summary:\n" + tabulate(rows, hdr, tablefmt="plain"))
 
-    # update Prometheus
+    # --- Prometheus updates ---------------------------------------------------
     for uid, hk in enumerate(meta.hotkeys):
-        WEIGHT.labels(uid=uid).set(1 if hk==best else 0)
+        WEIGHT.labels(uid=uid).set(1 if hk == best else 0)
         for e in ENVS:
             a = acc[hk][e]
             if a > 0:
@@ -982,7 +1092,6 @@ async def get_weights(tail=TAIL):
                 RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
 
     return best_uid, best
-
 
         
 @cli.command("validate")

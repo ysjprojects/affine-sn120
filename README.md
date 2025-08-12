@@ -40,6 +40,13 @@ cp .env.example .env
 docker-compose down && docker-compose pull && docker-compose up -d && docker-compose logs -f
 ```
 
+Run the validator using the local override (build local image) + base compose
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml down --remove-orphans
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build --remove-orphans
+docker compose -f docker-compose.yml -f docker-compose.local.yml logs -f
+```
+
 Run the validator locally
 ```bash
 # Start the validator with debug.
