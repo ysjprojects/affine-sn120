@@ -627,6 +627,19 @@ async def miners(
         except: pass
     results = await asyncio.gather(*(fetch(uid) for uid in uids))
     output = {uid: m for uid, m in zip(uids, results) if m is not None}
+
+    if output:
+        best_by_model: Dict[str, Tuple[int, int]] = {}
+        for uid, m in output.items():
+            if not m.model:
+                continue
+            blk = m.block if isinstance(m.block, int) else (int(m.block) if m.block is not None else (2**63 - 1))
+            prev = best_by_model.get(m.model)
+            if prev is None or blk < prev[0]:
+                best_by_model[m.model] = (blk, uid)
+        selected_uids = {uid for _, uid in best_by_model.values()}
+        output = {uid: m for uid, m in output.items() if uid in selected_uids}
+
     return output
 
 
@@ -869,6 +882,7 @@ async def get_weights(tail=TAIL):
     meta = await st.metagraph(NETUID)
     cnt  = {hk: defaultdict(int) for hk in meta.hotkeys}
     succ = {hk: defaultdict(int) for hk in meta.hotkeys}
+    ema  = {hk: defaultdict(float) for hk in meta.hotkeys}
     prev = {}
 
     logger.info(f'Loading data from {blk-tail} to {blk}')
@@ -885,20 +899,18 @@ async def get_weights(tail=TAIL):
             p = prev[hk].miner
             if (p.block!=c.miner.block or p.model!=c.miner.model
              or p.revision!=c.miner.revision):
-                succ[hk][env] = 0
+                succ[hk][env] = 0; ema[hk][env] = 0.0
 
         prev[hk] = c
         cnt[hk][env] += 1
         succ[hk][env] += c.evaluation.score
+        score = float(c.evaluation.score)
+        ema[hk][env] = score if cnt[hk][env] == 1 else (ALPHA*ema[hk][env] + (1-ALPHA)*score)
 
     logger.info("Collected results.")
 
     # compute accuracy & maxenv
-    acc = {
-        hk: {e: (float(succ[hk][e])/cnt[hk][e] if cnt[hk][e] else 0)
-             for e in ENVS}
-        for hk in meta.hotkeys
-    }
+    acc = { hk: {e: float(ema[hk][e]) for e in ENVS} for hk in meta.hotkeys }
     max_acc = {}
     for e in ENVS:
         max_acc[e] = max(acc[hk][e] for hk in meta.hotkeys)
