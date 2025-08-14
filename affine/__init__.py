@@ -123,32 +123,28 @@ def get_conf(key, default=None) -> Any:
         raise ValueError(f"{key} not set.\nYou must set env var: {key} in .env")
     return v or default
 
-async def check_model_gated(model_id: str) -> Optional[bool]:
-    """Check if model is gated, with caching."""
+async def check_model_gated(model_id: str, revision: Optional[str] = None) -> Optional[bool]:
     async with _get_gating_lock():
         now = time.time()
-        if model_id in MODEL_GATING_CACHE:
-            is_gated, ts = MODEL_GATING_CACHE[model_id]
-            if now - ts < GATING_TTL:
-                return is_gated
-        
-        # Check HF API
+        cached = MODEL_GATING_CACHE.get(model_id)
+        if cached and now - cached[1] < GATING_TTL:
+            return cached[0]
         try:
-            r = await asyncio.to_thread(
-                requests.get, f"https://huggingface.co/api/models/{model_id}", timeout=5
-            )
+            r = await asyncio.to_thread(requests.get, f"https://huggingface.co/api/models/{model_id}", timeout=5)
             if r.status_code == 200:
                 is_gated = r.json().get("gated", False)
+                if revision:
+                    try:
+                        ok = await asyncio.to_thread(lambda: bool(HfApi(token=os.getenv("HF_TOKEN")).repo_info(repo_id=model_id, revision=revision, repo_type="model")))
+                        if not ok: is_gated = True
+                    except: is_gated = True
                 MODEL_GATING_CACHE[model_id] = (is_gated, now)
                 return is_gated
         except Exception as e:
             logger.trace(f"Gate check failed for {model_id}: {e}")
-        
-        # Use cached value if available
-        if model_id in MODEL_GATING_CACHE:
-            is_gated, _ = MODEL_GATING_CACHE[model_id]
-            MODEL_GATING_CACHE[model_id] = (is_gated, now)  # Update timestamp
-            return is_gated
+        if cached:
+            MODEL_GATING_CACHE[model_id] = (cached[0], now)
+            return cached[0]
         return None
 
 
@@ -548,7 +544,7 @@ async def run(challenges, miners, timeout=240, retries=0, backoff=1 )-> List[Res
     async def proc(miner, chal):
         # Check gating status before querying
         if miner.model:
-            is_gated = await check_model_gated(miner.model)
+            is_gated = await check_model_gated(miner.model, miner.revision)
             if is_gated is None or is_gated:
                 err = "Unknown model gating status" if is_gated is None else "Model is gated"
                 logger.trace(f"Miner {miner.uid} - {err} for model {miner.model}")
@@ -867,11 +863,11 @@ def signer(host: str, port: int):
 
     asyncio.run(_run())
 
-async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
+async def retry_set_weights( wallet: bt.Wallet, uids: List[int], weights: List[float], retry: int = 10 ):
     # Delegate to signer; fallback to shared helper only if signer is unreachable
     signer_url = get_conf('SIGNER_URL', default='http://signer:8080')
     try:
-        logger.info(f"Calling signer at {signer_url} for set_weights uid={best_uid}")
+        logger.info(f"Calling signer at {signer_url} for set_weights uids={uids}")
         parsed = urlparse(signer_url)
         try:
             infos = socket.getaddrinfo(parsed.hostname, parsed.port or 80, proto=socket.IPPROTO_TCP)
@@ -886,8 +882,8 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
                 f"{signer_url}/set_weights",
                 json={
                     "netuid": NETUID,
-                    "weights": [1.0],
-                    "uids": [best_uid],
+                    "weights": weights,
+                    "uids": uids,
                     "wait_for_inclusion": False,
                 },
             )
@@ -909,7 +905,7 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
     except ClientConnectorError as e:
         logger.info(f"Signer not reachable ({type(e).__name__}: {e}); falling back to local set_weights once")
         ok = await _set_weights_with_confirmation(
-            wallet, NETUID, [best_uid], [1.0], False,
+            wallet, NETUID, uids, weights, False,
             retries=int(os.getenv("SIGNER_RETRIES", "10")),
             delay_s=float(os.getenv("SIGNER_RETRY_DELAY", "2")),
             log_prefix="[validator-fallback]",
@@ -1090,8 +1086,13 @@ async def get_weights(tail=TAIL):
             if a > 0:
                 SCORE.labels(uid=uid, env=e).set(a)
                 RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
-
-    return best_uid, best
+    # Build not-one-hot weights directly from dominance (share 0.001 among eligibles, rest to winner)
+    eligible_uids = [meta.hotkeys.index(hk) for hk in eligible]
+    dom_map = {meta.hotkeys.index(hk): dom.get(hk, 0) for hk in eligible}
+    uids = [u for u in eligible_uids if u != best_uid] + [best_uid]
+    s = sum(dom_map.get(u, 0) for u in uids[:-1]); base = 0.001 if uids[:-1] else 0.0
+    weights = [(base * dom_map.get(u, 0) / s if s else (base / max(1, len(uids)-1))) for u in uids[:-1]] + [1.0 - base]
+    return uids, weights
 
         
 @cli.command("validate")
@@ -1116,11 +1117,11 @@ def validate():
                     continue
                 
                 # ---------------- Set weights. ------------------------
-                winner_uid, _ = await get_weights()
+                uids, weights = await get_weights()
         
                 # ---------------- Set weights. ------------------------
                 logger.info("Setting weights ...")
-                await retry_set_weights( wallet, winner_uid, retry = 3)
+                await retry_set_weights( wallet, uids=uids, weights=weights, retry = 3)
                 subtensor = await get_subtensor()
                 SETBLOCK = await subtensor.get_current_block()
                 LASTSET.set_function(lambda: SETBLOCK - LAST)
