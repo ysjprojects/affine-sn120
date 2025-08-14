@@ -1086,11 +1086,11 @@ async def get_weights(tail=TAIL):
             if a > 0:
                 SCORE.labels(uid=uid, env=e).set(a)
                 RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
-    # Build not-one-hot weights directly from dominance (share 0.001 among eligibles, rest to winner)
+    # Build not-one-hot weights directly from dominance (share 0.004 among eligibles, rest to winner)
     eligible_uids = [meta.hotkeys.index(hk) for hk in eligible]
     dom_map = {meta.hotkeys.index(hk): dom.get(hk, 0) for hk in eligible}
     uids = [u for u in eligible_uids if u != best_uid] + [best_uid]
-    s = sum(dom_map.get(u, 0) for u in uids[:-1]); base = 0.001 if uids[:-1] else 0.0
+    s = sum(dom_map.get(u, 0) for u in uids[:-1]); base = 0.004 if uids[:-1] else 0.0
     weights = [(base * dom_map.get(u, 0) / s if s else (base / max(1, len(uids)-1))) for u in uids[:-1]] + [1.0 - base]
     return uids, weights
 
