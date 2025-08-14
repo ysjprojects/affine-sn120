@@ -137,7 +137,8 @@ async def check_model_gated(model_id: str, revision: Optional[str] = None) -> Op
                     try:
                         ok = await asyncio.to_thread(lambda: bool(HfApi(token=os.getenv("HF_TOKEN")).repo_info(repo_id=model_id, revision=revision, repo_type="model")))
                         if not ok: is_gated = True
-                    except: is_gated = True
+                    except:
+                        pass
                 MODEL_GATING_CACHE[model_id] = (is_gated, now)
                 return is_gated
         except Exception as e:
@@ -545,8 +546,8 @@ async def run(challenges, miners, timeout=240, retries=0, backoff=1 )-> List[Res
         # Check gating status before querying
         if miner.model:
             is_gated = await check_model_gated(miner.model, miner.revision)
-            if is_gated is None or is_gated:
-                err = "Unknown model gating status" if is_gated is None else "Model is gated"
+            if is_gated is True:
+                err = "Model is gated"
                 logger.trace(f"Miner {miner.uid} - {err} for model {miner.model}")
                 resp = Response(response=None, latency_seconds=0, attempts=0, model=miner.model, error=err, success=False)
                 ev = Evaluation(env=chal.env, score=0.0, extra={"error": err, "gated": is_gated})
