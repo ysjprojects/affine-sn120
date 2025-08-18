@@ -52,6 +52,14 @@ class ProgramExecutor:
 
     @staticmethod
     def _strip_fences(text: str) -> str:
+        python_blocks = re.findall(r'```python\s*\n(.*?)```', text, re.DOTALL)
+        if python_blocks:
+            return python_blocks[-1].strip()
+        
+        code_blocks = re.findall(r'```(?:\w*)\s*\n(.*?)```', text, re.DOTALL)
+        if code_blocks:
+            return code_blocks[-1].strip()
+        
         m = _FENCE_RE.search(text)
         return (m.group(1) if m else text).strip()
 
@@ -133,8 +141,12 @@ class ProgramExecutor:
 
         # Feed stdin then close
         if proc.stdin:
-            proc.stdin.write(stdin_data)
-            proc.stdin.close()
+            try:
+                proc.stdin.write(stdin_data)
+                proc.stdin.close()
+            except BrokenPipeError:
+                # Process terminated early, stdin pipe is broken
+                pass
 
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ)
