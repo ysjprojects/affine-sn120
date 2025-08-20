@@ -22,6 +22,7 @@ import textwrap
 import traceback
 import itertools
 from .utils import *
+from math import comb
 import datetime as dt
 from tqdm import tqdm
 import bittensor as bt
@@ -920,14 +921,40 @@ async def retry_set_weights( wallet: bt.Wallet, uids: List[int], weights: List[f
         logger.warning(f"Signer call timed out: {e}. Not falling back to local because validator has no wallet.")
         return
     
-TAIL= 10_000
+# --- Scoring hyperparameters --------------------------------------------------
+TAIL = 10_000
 ALPHA = 0.9
-EPS_FLOOR = 0.01   # absolute epsilon floor (1 percentage point)
-Z = 1.645          # one-sided ~95% margin; set 0 to disable stats cushion
-async def get_weights(tail=TAIL):
+
+# Tuned ε-margins:
+#  - 'not-worse' uses a smaller Z to ease dominance when sample sizes are large.
+#  - 'better_any' uses a tiny fixed margin so small but consistent edges can win size-1 subsets.
+EPS_FLOOR   = 0.002    # 0.20 percentage points floor for "not worse" tolerance
+Z_NOT_WORSE = 0.84     # one-sided ~80% cushion for "not worse" (was 1.645)
+EPS_WIN     = 0.0015   # 0.15 percentage points to claim "better on at least one env"
+Z_WIN       = 0.0      # keep "better" threshold floor-based (set >0 to scale with n)
+
+async def get_weights(tail: int = TAIL, scale: float = 1.0):
     """
-    Select the best miner over the last `tail` blocks using ε-Pareto dominance with copy resistance.
+    Compute miner weights using ε-Pareto dominance and combinatoric subset winners.
+
+    Pipeline
+      1) Ingest last `tail` blocks → per-miner per-env accuracy.
+      2) Determine eligibility (>=90% of per-env max count).
+      3) Global ε-dominance (all envs) for canonical 'best' (for tie breaks / summaries).
+      4) Combinatoric scoring:
+           - For every non-empty subset S of ENVS, pick the ε-Pareto winner on S.
+           - Award K_|S| where K_1 = scale, K_s = C(N, s-1)*K_{s-1}.
+         Fallback if no dominance edges on S: highest mean accuracy on S, then earliest version.
+      5) Normalize scores over eligibles to produce weights. Metrics + summary emitted.
+
+    Returns:
+      (uids, weights): list of eligible UIDs (best last) and their weights (sum to 1).
     """
+    import math, itertools
+    from math import comb
+    from collections import defaultdict
+    from tabulate import tabulate
+
     # --- fetch + prune --------------------------------------------------------
     st = await get_subtensor()
     blk = await st.get_current_block()
@@ -936,13 +963,14 @@ async def get_weights(tail=TAIL):
 
     meta = await st.metagraph(NETUID)
     BASE_HK = meta.hotkeys[0]
+    N_envs = len(ENVS)
 
     # Tallies for all known hotkeys (so metrics update is safe even if some have no data)
     cnt   = {hk: defaultdict(int)   for hk in meta.hotkeys}  # per-env counts
-    succ  = {hk: defaultdict(int)   for hk in meta.hotkeys}  # per-env correct
+    succ  = {hk: defaultdict(int)   for hk in meta.hotkeys}  # per-env correct (0/1 or [0,1])
     prev  = {}                                                # last sample per hk
-    v_id  = {}                                                # current version id per hk -> (model, revision)
-    first_block = {}                                          # timestamp: earliest block for current version
+    v_id  = {}                                                # (model, revision) per hk
+    first_block = {}                                          # earliest block for current version
 
     # --- ingest ---------------------------------------------------------------
     logger.info(f"Loading data from {blk - tail} to {blk}")
@@ -960,7 +988,7 @@ async def get_weights(tail=TAIL):
 
         cur_vid = (c.miner.model, c.miner.revision)
 
-        # On version change, reset ALL env streams for this miner and timestamp to current block
+        # On version change, reset ALL env streams and timestamp to current block
         if v_id.get(hk) != cur_vid:
             v_id[hk] = cur_vid
             first_block[hk] = c.miner.block
@@ -968,10 +996,9 @@ async def get_weights(tail=TAIL):
                 cnt[hk][e] = 0
                 succ[hk][e] = 0
 
-        # accumulate for this env
+        # accumulate
         prev[hk] = c
         cnt[hk][env]  += 1
-        # assume score is 0/1 or numeric in [0,1]; cast to float then to int if needed
         succ[hk][env] += float(c.evaluation.score)
 
     logger.info("Collected results.")
@@ -1008,29 +1035,45 @@ async def get_weights(tail=TAIL):
             for h in active_hks:
                 ranks[e][h] = rank_of.get(acc[h][e], 0)
 
-    # --- ε-Pareto dominance with block-based tiebreak -------------------------
-    def eps_threshold(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
-        """ε = max(EPS_FLOOR, Z * SE_diff). Uses binomial SE; guards against n=0."""
-        if Z <= 0:
+    # --- ε-Pareto dominance helpers ------------------------------------------
+    def thr_not_worse(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
+        """Tolerance for 'not worse' on an env: max(EPS_FLOOR, Z * SE_diff)."""
+        if Z_NOT_WORSE <= 0:
             return EPS_FLOOR
         var = (a_i * (1 - a_i)) / max(n_i, 1) + (a_j * (1 - a_j)) / max(n_j, 1)
-        return max(EPS_FLOOR, Z * math.sqrt(var))
+        return max(EPS_FLOOR, Z_NOT_WORSE * math.sqrt(var))
 
-    def dominates(a: str, b: str) -> bool:
-        """Return True iff a ε-dominates b; break full ε-ties by earlier first_block."""
+    def thr_better(a_i: float, n_i: int, a_j: float, n_j: int, nw: float) -> float:
+        """
+        Margin to claim 'better on at least one env'. Kept ≤ 'not worse' tolerance.
+        Floor-based by default; set Z_WIN>0 to scale with SE_diff.
+        """
+        if Z_WIN > 0:
+            var = (a_i * (1 - a_i)) / max(n_i, 1) + (a_j * (1 - a_j)) / max(n_j, 1)
+            t = max(EPS_WIN, Z_WIN * math.sqrt(var))
+        else:
+            t = EPS_WIN
+        return min(t, nw)
+
+    def dominates_on(a: str, b: str, subset) -> bool:
+        """
+        True iff 'a' is not-worse than 'b' on every env in `subset` (within thr_not_worse),
+        and strictly better on at least one env by thr_better. Full ε-ties break by earlier start.
+        """
         not_worse_all = True
-        better_any = False
-        tie_all = True
-        for e in ENVS:
+        better_any    = False
+        tie_all       = True
+        for e in subset:
             ai, aj = acc[a][e], acc[b][e]
             ni, nj = cnt[a][e], cnt[b][e]
-            thr = eps_threshold(ai, ni, aj, nj)
+            nw  = thr_not_worse(ai, ni, aj, nj)
+            bet = thr_better(ai, ni, aj, nj, nw)
 
-            if ai < aj - thr:
+            if ai < aj - nw:
                 not_worse_all = False
-            if ai >= aj + thr:
+            if ai >= aj + bet:
                 better_any = True
-            if abs(ai - aj) > thr:
+            if abs(ai - aj) > nw:
                 tie_all = False
 
         if not_worse_all and better_any:
@@ -1039,20 +1082,98 @@ async def get_weights(tail=TAIL):
             return True
         return False
 
-    dom = defaultdict(int)
+    # Global dominance (full ENVS) for summary + canonical "best"
+    dom_full = defaultdict(int)
     pool_for_dom = eligible if eligible else set(active_hks)
     for a, b in itertools.permutations(pool_for_dom, 2):
-        if dominates(a, b):
-            dom[a] += 1
-    logger.info("Computed ε-dominance counts.")
+        if dominates_on(a, b, ENVS):
+            dom_full[a] += 1
+    logger.info("Computed ε-dominance counts (full env set).")
 
-    # --- choose winner: tie-break by earliest block ---
     def ts(hk: str) -> int:
-        # block is our timestamp; default to last seen block for safety
+        """Block-number timestamp; default to last seen block."""
         return int(first_block.get(hk, prev[hk].miner.block))
 
-    best = max(pool_for_dom, key=lambda hk: (dom.get(hk, 0), -ts(hk))) if pool_for_dom else active_hks[0]
+    best = max(pool_for_dom, key=lambda hk: (dom_full.get(hk, 0), -ts(hk))) if pool_for_dom else active_hks[0]
     best_uid = meta.hotkeys.index(best)
+
+    # --- combinatoric scoring over all non-empty env subsets ------------------
+    def layer_weights(N: int, kappa: float):
+        """Per-subset weights K_s: K_1=kappa; K_s=C(N,s-1)*K_{s-1} for s>=2."""
+        K = {1: kappa}
+        for s in range(2, N + 1):
+            K[s] = K[s - 1] * comb(N, s - 1)
+        return K
+
+    def subset_winner(env_subset):
+        """
+        Winner on env_subset via ε-Pareto. If no dominance edges, fall back to:
+          1) highest mean accuracy on the subset,
+          2) earliest version start block.
+        """
+        dom_local = defaultdict(int)
+        for x, y in itertools.permutations(pool_for_dom, 2):
+            if dominates_on(x, y, env_subset):
+                dom_local[x] += 1
+
+        def mean_acc(hk: str) -> float:
+            return sum(acc[hk][e] for e in env_subset) / len(env_subset)
+
+        return max(pool_for_dom, key=lambda hk: (dom_local.get(hk, 0), mean_acc(hk), -ts(hk)))
+
+    # Calculate combinatoric scores for all miners (not just eligible)
+    K = layer_weights(N_envs, scale)
+    score = defaultdict(float)
+
+    # Award K_s to each subset winner
+    for s in range(1, N_envs + 1):
+        for env_subset in itertools.combinations(ENVS, s):
+            w = subset_winner(env_subset)
+            score[w] += K[s]
+
+    # If no eligible miners exist, fall back to the canonical best with weight 1.0.
+    if not eligible:
+        logger.warning("No eligible miners; assigning weight 1.0 to canonical best.")
+        for uid, hk in enumerate(meta.hotkeys):
+            WEIGHT.labels(uid=uid).set(1.0 if hk == best else 0.0)
+            for e in ENVS:
+                a = acc[hk][e]
+                if a > 0:
+                    SCORE.labels(uid=uid, env=e).set(a)
+                    RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
+
+        hdr = (
+            ["UID", "Model", "Rev"]
+            + [f"{e}Acc" for e in ENVS]
+            + [f"{e}Rnk" for e in ENVS]
+            + [f"{e}N"   for e in ENVS]
+            + ["Dom", "Pts", "Elig", "Wgt"]
+        )
+        def row(hk: str):
+            m = prev[hk].miner
+            w = 1.0 if hk == best else 0.0
+            model_name = str(m.model)[:50]
+            return [
+                m.uid, model_name, str(m.revision)[:5],
+                *[f"{100 * acc[hk][e]:.2f}" for e in ENVS],
+                *[ranks[e].get(hk, 0) for e in ENVS],
+                *[cnt[hk][e] for e in ENVS],
+                dom_full.get(hk, 0),
+                f"{score.get(hk, 0.0):.2f}",
+                "Y" if hk in eligible else "N",
+                f"{w:.4f}",
+            ]
+        rows = sorted((row(hk) for hk in active_hks), key=lambda r: (r[-3], r[0]), reverse=True)
+        print("Validator Summary:\n" + tabulate(rows, hdr, tablefmt="plain"))
+        return [best_uid], [1.0]
+
+    # Eligible path: normalize scores to weights over the eligible pool only
+    total_points = sum(score[hk] for hk in eligible)
+    if total_points <= 0:
+        logger.warning("Combinatoric scoring returned zero total; falling back to canonical best.")
+        weight_by_hk = {hk: (1.0 if hk == best else 0.0) for hk in eligible}
+    else:
+        weight_by_hk = {hk: (score[hk] / total_points) for hk in eligible}
 
     # --- summary printout -----------------------------------------------------
     hdr = (
@@ -1060,40 +1181,42 @@ async def get_weights(tail=TAIL):
         + [f"{e}Acc" for e in ENVS]
         + [f"{e}Rnk" for e in ENVS]
         + [f"{e}N"   for e in ENVS]
-        + ["Dom", "Wgt"]
+        + ["Dom", "Pts", "Elig", "Wgt"]
     )
-
     def row(hk: str):
         m = prev[hk].miner
+        w = weight_by_hk.get(hk, 0.0)
+        model_name = str(m.model)[:50]
         return [
-            m.uid, m.model, str(m.revision)[:5],
+            m.uid, model_name, str(m.revision)[:5],
             *[f"{100 * acc[hk][e]:.2f}" for e in ENVS],
             *[ranks[e].get(hk, 0) for e in ENVS],
             *[cnt[hk][e] for e in ENVS],
-            dom.get(hk, 0),
-            1 if hk == best else 0,
+            dom_full.get(hk, 0),
+            f"{score.get(hk, 0.0):.2f}",
+            "Y" if hk in eligible else "N",
+            f"{w:.4f}",
         ]
-
-    ranked_rows   = sorted((row(hk) for hk in eligible), key=lambda r: r[-2], reverse=True)
-    unranked_rows = sorted((row(hk) for hk in active_hks if hk not in eligible), key=lambda r: r[-3:], reverse=True)
+    ranked_rows   = sorted((row(hk) for hk in eligible), key=lambda r: float(r[-3]), reverse=True)
+    unranked_rows = sorted((row(hk) for hk in active_hks if hk not in eligible), key=lambda r: float(r[-3]), reverse=True)
     rows = ranked_rows + unranked_rows
     print("Validator Summary:\n" + tabulate(rows, hdr, tablefmt="plain"))
 
     # --- Prometheus updates ---------------------------------------------------
     for uid, hk in enumerate(meta.hotkeys):
-        WEIGHT.labels(uid=uid).set(1 if hk == best else 0)
+        WEIGHT.labels(uid=uid).set(weight_by_hk.get(hk, 0.0))
         for e in ENVS:
             a = acc[hk][e]
             if a > 0:
                 SCORE.labels(uid=uid, env=e).set(a)
                 RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
-    # Build not-one-hot weights directly from dominance (share 0.004 among eligibles, rest to winner)
+
+    # --- Return weights in a stable shape (best last, as before) -------------
     eligible_uids = [meta.hotkeys.index(hk) for hk in eligible]
-    dom_map = {meta.hotkeys.index(hk): dom.get(hk, 0) for hk in eligible}
     uids = [u for u in eligible_uids if u != best_uid] + [best_uid]
-    s = sum(dom_map.get(u, 0) for u in uids[:-1]); base = 0.004 if uids[:-1] else 0.0
-    weights = [(base * dom_map.get(u, 0) / s if s else (base / max(1, len(uids)-1))) for u in uids[:-1]] + [1.0 - base]
+    weights = [weight_by_hk.get(meta.hotkeys[u], 0.0) for u in uids]
     return uids, weights
+
 
         
 @cli.command("validate")

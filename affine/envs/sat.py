@@ -7,7 +7,7 @@ class SAT(af.BaseEnv):
     n: int
     k: int
     m: int
-    def __init__(self, n=7, k=5, m=None):
+    def __init__(self, n=15, k=10, m=None):
         super().__init__(n=n, k=k, m=m or int(4.26 * n))
         
     async def generate(self):
