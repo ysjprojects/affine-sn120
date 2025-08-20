@@ -50,7 +50,7 @@ class DED(af.BaseEnv):
     # ----------------------------- Env API -------------------------------- #
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating new coding challenge")
-        sample = await dataset.get()
+        sample = await dataset().get()
         if sample is None:
             raise RuntimeError("Failed to fetch dataset row")
 

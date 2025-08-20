@@ -70,6 +70,7 @@ dataset = af.singleton('rl-python', lambda: af.utils.BufferedDataset(
     buffer_size=5,
     max_batch=5,
 ))
+
 class ABD(af.BaseEnv):
     __version__: str = "0.0.0"
     def __init__(self):
@@ -118,7 +119,7 @@ class ABD(af.BaseEnv):
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating a new challenge.")
         while True:
-            sample = await dataset.get()
+            sample = await dataset().get()
             program     = sample.get("program")
             example_in  = sample.get("inputs", "")
             example_out = sample.get("output", "")
