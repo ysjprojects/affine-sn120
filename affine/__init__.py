@@ -920,7 +920,7 @@ async def retry_set_weights( wallet: bt.Wallet, uids: List[int], weights: List[f
         return
     
 # --- Scoring hyperparameters --------------------------------------------------
-TAIL = 10_000
+TAIL = 20_000
 ALPHA = 0.9
 
 # Tuned ε-margins:
@@ -990,10 +990,11 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
                 cnt[hk][e] = 0
                 succ[hk][e] = 0
 
-        # accumulate
+        # accumulate on successes.
         prev[hk] = c
-        cnt[hk][env]  += 1
-        succ[hk][env] += float(c.evaluation.score)
+        if c.response.success:
+            cnt[hk][env]  += 1
+            succ[hk][env] += float(c.evaluation.score)
 
     logger.info("Collected results.")
 
@@ -1263,7 +1264,7 @@ def validate():
     async def main():
         await asyncio.gather(
             _run(),
-            watchdog(timeout = (60 * 10))
+            watchdog(timeout = (60 * 20))
         )
     asyncio.run(main())
     
