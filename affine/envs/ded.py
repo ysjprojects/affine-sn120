@@ -34,22 +34,23 @@ def _normalize(text: str) -> str:
 # --------------------------------------------------------------------------- #
 #                              Affine Env                                     #
 # --------------------------------------------------------------------------- #
+dataset = af.singleton('rl-python', lambda: af.utils.BufferedDataset(
+    dataset_name="satpalsr/rl-python",
+    total_size=20_000,
+    buffer_size=5,
+    max_batch=5,
+))
+
 class DED(af.BaseEnv):
     __version__: str = "0.0.0"
     def __init__(self):
         super().__init__()
         self._executor = af.utils.ProgramExecutor()
-        self._data = af.utils.BufferedDataset(
-            dataset_name="satpalsr/rl-python",
-            total_size=20_000,
-            buffer_size=5,
-            max_batch=5,
-        )
 
     # ----------------------------- Env API -------------------------------- #
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating new coding challenge")
-        sample = await self._data.get()
+        sample = await dataset.get()
         if sample is None:
             raise RuntimeError("Failed to fetch dataset row")
 

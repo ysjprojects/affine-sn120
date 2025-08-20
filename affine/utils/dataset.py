@@ -17,7 +17,7 @@ class BufferedDataset:
         split: str = "train",
         config: str = "default",
         max_retries: int = 5,
-        initial_backoff: float = 1.0,
+        initial_backoff: float = 10.0,
         backoff_factor: float = 2.0,
         max_backoff: float = 30.0
     ):

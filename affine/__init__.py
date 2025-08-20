@@ -44,7 +44,6 @@ from huggingface_hub import snapshot_download
 from bittensor.core.errors import MetadataError
 from pydantic import BaseModel, Field, validator, ValidationError
 from typing import Any, Dict, List, Optional, Union, Tuple, Sequence, Literal, TypeVar, Awaitable
-
 __version__ = "0.0.0"
 
 # --------------------------------------------------------------------------- #
@@ -53,6 +52,14 @@ __version__ = "0.0.0"
 NETUID = 120
 TRACE  = 5
 logging.addLevelName(TRACE, "TRACE")
+_SINGLETON_CACHE = {}
+def singleton(key:str, factory):
+    """Create a singleton factory function that creates an object only once."""
+    def get_instance():
+        if key not in _SINGLETON_CACHE:
+            _SINGLETON_CACHE[key] = factory()
+        return _SINGLETON_CACHE[key]
+    return get_instance
 
 # --------------------------------------------------------------------------- #
 #                       Prometheus                         #
@@ -210,11 +217,8 @@ class Challenge(BaseModel):
         return values
     @validator("env", pre=True)
     def _parse_env(cls, v):
-        from .envs.sat import SAT
-        from .envs.abd import ABD
-        from .envs.ded import DED
-        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
-        return ENVS[v]() if isinstance(v, str) else v
+        from .envs import ENVS as _ENVS
+        return _ENVS[v]() if isinstance(v, str) else v
     class Config:
         arbitrary_types_allowed = True
         json_encoders = {BaseEnv: lambda v: v.name}
@@ -232,11 +236,8 @@ class Evaluation(BaseModel):
     extra: Dict[str, Any] = Field(default_factory=dict)
     @validator("env", pre=True)
     def _parse_env(cls, v):
-        from .envs.sat import SAT
-        from .envs.abd import ABD
-        from .envs.ded import DED
-        ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
-        return ENVS[v]() if isinstance(v, str) else v
+        from .envs import ENVS as _ENVS
+        return _ENVS[v]() if isinstance(v, str) else v
     class Config:
         arbitrary_types_allowed = True
         json_encoders = {BaseEnv: lambda v: v.name}
@@ -286,11 +287,8 @@ class Result(BaseModel):
     def __repr__(self): return f"<Result {self.miner.uid=} {self.challenge.env.name=} score={self.evaluation.score:.4f}>"
     __str__ = __repr__
 
-# Real import.    
-from .envs.sat import SAT
-from .envs.abd import ABD
-from .envs.ded import DED
-ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
+# Central env registry
+from .envs import ENVS
 
 # --------------------------------------------------------------------------- #
 #                   S3 helpers                                                #
@@ -933,7 +931,7 @@ Z_NOT_WORSE = 0.84     # one-sided ~80% cushion for "not worse" (was 1.645)
 EPS_WIN     = 0.0015   # 0.15 percentage points to claim "better on at least one env"
 Z_WIN       = 0.0      # keep "better" threshold floor-based (set >0 to scale with n)
 
-async def get_weights(tail: int = TAIL, scale: float = 1.0):
+async def get_weights(tail: int = TAIL, scale: float = 1):
     """
     Compute miner weights using ε-Pareto dominance and combinatoric subset winners.
 
@@ -950,10 +948,6 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
     Returns:
       (uids, weights): list of eligible UIDs (best last) and their weights (sum to 1).
     """
-    import math, itertools
-    from math import comb
-    from collections import defaultdict
-    from tabulate import tabulate
 
     # --- fetch + prune --------------------------------------------------------
     st = await get_subtensor()
@@ -1026,15 +1020,6 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
     }
     eligible = {hk for hk in active_hks if all(cnt[hk][e] >= required[e] for e in ENVS)}
 
-    # --- ranks (for reporting only) -------------------------------------------
-    ranks = {e: {} for e in ENVS}
-    if eligible:
-        for e in ENVS:
-            uniq = sorted({acc[h][e] for h in eligible}, reverse=True)
-            rank_of = {v: i + 1 for i, v in enumerate(uniq)}
-            for h in active_hks:
-                ranks[e][h] = rank_of.get(acc[h][e], 0)
-
     # --- ε-Pareto dominance helpers ------------------------------------------
     def thr_not_worse(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
         """Tolerance for 'not worse' on an env: max(EPS_FLOOR, Z * SE_diff)."""
@@ -1102,7 +1087,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
         """Per-subset weights K_s: K_1=kappa; K_s=C(N,s-1)*K_{s-1} for s>=2."""
         K = {1: kappa}
         for s in range(2, N + 1):
-            K[s] = K[s - 1] * comb(N, s - 1)
+            K[s] = kappa * (2**s)
         return K
 
     def subset_winner(env_subset):
@@ -1124,12 +1109,19 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
     # Calculate combinatoric scores for all miners (not just eligible)
     K = layer_weights(N_envs, scale)
     score = defaultdict(float)
+    layer_points = {hk: defaultdict(float) for hk in active_hks}
+
+    # --- Find single-env winners for highlighting ----------------------------
+    env_winners = {}
+    for e in ENVS:
+        env_winners[e] = subset_winner((e,))
 
     # Award K_s to each subset winner
     for s in range(1, N_envs + 1):
         for env_subset in itertools.combinations(ENVS, s):
             w = subset_winner(env_subset)
             score[w] += K[s]
+            layer_points[w][s] += K[s]
 
     # If no eligible miners exist, fall back to the canonical best with weight 1.0.
     if not eligible:
@@ -1140,25 +1132,28 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
                 a = acc[hk][e]
                 if a > 0:
                     SCORE.labels(uid=uid, env=e).set(a)
-                    RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
 
         hdr = (
             ["UID", "Model", "Rev"]
-            + [f"{e}Acc" for e in ENVS]
-            + [f"{e}Rnk" for e in ENVS]
-            + [f"{e}N"   for e in ENVS]
-            + ["Dom", "Pts", "Elig", "Wgt"]
+            + [f"{e}" for e in ENVS]
+            + [f"L{s}" for s in range(1, N_envs + 1)]
+            + ["Pts", "Elig", "Wgt"]
         )
         def row(hk: str):
             m = prev[hk].miner
             w = 1.0 if hk == best else 0.0
             model_name = str(m.model)[:50]
+            env_cols = []
+            for e in ENVS:
+                base = f"{100 * acc[hk][e]:.2f}/{cnt[hk][e]}"
+                if hk == env_winners.get(e):
+                    env_cols.append(f"*{base}*")
+                else:
+                    env_cols.append(base)
             return [
                 m.uid, model_name, str(m.revision)[:5],
-                *[f"{100 * acc[hk][e]:.2f}" for e in ENVS],
-                *[ranks[e].get(hk, 0) for e in ENVS],
-                *[cnt[hk][e] for e in ENVS],
-                dom_full.get(hk, 0),
+                *env_cols,
+                *[f"{layer_points[hk][s]:.1f}" for s in range(1, N_envs + 1)],
                 f"{score.get(hk, 0.0):.2f}",
                 "Y" if hk in eligible else "N",
                 f"{w:.4f}",
@@ -1178,21 +1173,25 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
     # --- summary printout -----------------------------------------------------
     hdr = (
         ["UID", "Model", "Rev"]
-        + [f"{e}Acc" for e in ENVS]
-        + [f"{e}Rnk" for e in ENVS]
-        + [f"{e}N"   for e in ENVS]
-        + ["Dom", "Pts", "Elig", "Wgt"]
+        + [f"{e}" for e in ENVS]
+        + [f"L{s}" for s in range(1, N_envs + 1)]
+        + ["Pts", "Elig", "Wgt"]
     )
     def row(hk: str):
         m = prev[hk].miner
         w = weight_by_hk.get(hk, 0.0)
         model_name = str(m.model)[:50]
+        env_cols = []
+        for e in ENVS:
+            base = f"{100 * acc[hk][e]:.2f}/{cnt[hk][e]}"
+            if hk == env_winners.get(e):
+                env_cols.append(f"*{base}*")
+            else:
+                env_cols.append(base)
         return [
-            m.uid, model_name, str(m.revision)[:5],
-            *[f"{100 * acc[hk][e]:.2f}" for e in ENVS],
-            *[ranks[e].get(hk, 0) for e in ENVS],
-            *[cnt[hk][e] for e in ENVS],
-            dom_full.get(hk, 0),
+            m.uid, model_name[:30], str(m.revision)[:5],
+            *env_cols,
+            *[f"{layer_points[hk][s]:.1f}" for s in range(1, N_envs + 1)],
             f"{score.get(hk, 0.0):.2f}",
             "Y" if hk in eligible else "N",
             f"{w:.4f}",
@@ -1209,7 +1208,6 @@ async def get_weights(tail: int = TAIL, scale: float = 1.0):
             a = acc[hk][e]
             if a > 0:
                 SCORE.labels(uid=uid, env=e).set(a)
-                RANK.labels(uid=uid, env=e).set(ranks[e].get(hk, 0))
 
     # --- Return weights in a stable shape (best last, as before) -------------
     eligible_uids = [meta.hotkeys.index(hk) for hk in eligible]

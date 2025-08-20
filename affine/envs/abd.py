@@ -64,17 +64,17 @@ Format your response with <INPUT> </INPUT> tags like this:
 
 Please generate a valid input:"""
 
+dataset = af.singleton('rl-python', lambda: af.utils.BufferedDataset(
+    dataset_name="satpalsr/rl-python",
+    total_size=20_000,
+    buffer_size=5,
+    max_batch=5,
+))
 class ABD(af.BaseEnv):
     __version__: str = "0.0.0"
     def __init__(self):
         super().__init__()
         self._executor = af.utils.ProgramExecutor()
-        self._data = af.utils.BufferedDataset(
-            dataset_name="satpalsr/rl-python",
-            total_size=20_000,
-            buffer_size=5,
-            max_batch=5,
-        )
         
     async def _create_challenge(
         self, program: str, example_in: str, example_out: str
@@ -118,7 +118,7 @@ class ABD(af.BaseEnv):
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating a new challenge.")
         while True:
-            sample = await self._data.get()
+            sample = await dataset.get()
             program     = sample.get("program")
             example_in  = sample.get("inputs", "")
             example_out = sample.get("output", "")
