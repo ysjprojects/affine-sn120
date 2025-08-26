@@ -708,9 +708,8 @@ def runner():
         subtensor = None
         envs = [cls() for cls in ENVS.values()]
 
-        MAX_USES, BACKOFF_SECS = 10, 10
+        MAX_USES = 10
         chal_cache = {}     # env -> (chal, uses)
-        backoff    = {}     # uid -> next allowed time
         i_env = 0
 
         async def next_chal():
@@ -724,11 +723,10 @@ def runner():
 
         async def schedule(miner, inflight):
             uid = int(miner.uid)
-            now = time.monotonic()
-            if uid in inflight or backoff.get(uid, 0) > now:
+            if uid in inflight:
                 return
             chal = await next_chal()
-            logger.debug(f'New challenge: {chal.env} for miner: {miner}')
+            logger.debug(f'New challenge: {chal.env} for miner: {miner.uid}')
             inflight[uid] = asyncio.create_task(run(chal, miner, timeout=180))
 
         last_sync = 0
@@ -749,7 +747,6 @@ def runner():
 
                 # seed one task per miner
                 for m in miners_map.values():
-                    logger.debug(f'Done, new schedule {m.uid} ...')
                     await schedule(m, inflight)
 
                 while len(results) < 100 and inflight:
@@ -760,17 +757,10 @@ def runner():
                         inflight.pop(uid, None)
                         try:
                             res = await t
-                            if isinstance(res, list):
-                                res = res[0]
-                            ok = res and getattr(res, "success", False) and getattr(res, "response", None) and getattr(res.response, "response", "")
-                            if ok:
-                                results.extend(res if isinstance(res, list) else [res])
-                            else:
-                                backoff[uid] = time.monotonic() + BACKOFF_SECS
+                            results.extend(res)
                         except Exception:
-                            backoff[uid] = time.monotonic() + BACKOFF_SECS
+                            pass
                         if miner:  # try to reschedule this miner
-                            logger.debug(f'Done, new schedule {miner.uid}...')
                             await schedule(miner, inflight)
 
                 blk = await subtensor.get_current_block()
