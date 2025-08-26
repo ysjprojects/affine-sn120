@@ -728,13 +728,20 @@ def runner():
             if uid in inflight or backoff.get(uid, 0) > now:
                 return
             chal = await next_chal()
+            logger.debug(f'New challenge: {chal.env} for miner: {miner}')
             inflight[uid] = asyncio.create_task(run(chal, miner, timeout=180))
 
+        last_sync = 0
         while True:
             try:
+                now = time.monotonic()
                 if subtensor is None: subtensor = await get_subtensor()
-                meta = await subtensor.metagraph(NETUID)
-                miners_map = await miners(meta=meta)
+                
+                # Only sync miners and metagraph every 10 minutes (600 seconds) or first time
+                if now - last_sync >= 600 or last_sync == 0:
+                    meta = await subtensor.metagraph(NETUID)
+                    miners_map = await miners(meta=meta)
+                    last_sync = now
                 if not miners_map:
                     await asyncio.sleep(1); continue
 
@@ -742,6 +749,7 @@ def runner():
 
                 # seed one task per miner
                 for m in miners_map.values():
+                    logger.debug(f'Done, new schedule {m} ...')
                     await schedule(m, inflight)
 
                 while len(results) < 100 and inflight:
@@ -762,9 +770,11 @@ def runner():
                         except Exception:
                             backoff[uid] = time.monotonic() + BACKOFF_SECS
                         if miner:  # try to reschedule this miner
+                            logger.debug(f'Done, new schedule {miner}...')
                             await schedule(miner, inflight)
 
                 blk = await subtensor.get_current_block()
+                logger.debug(f'Sink {len(results)} results.')
                 await sink(wallet=wallet, block=blk, results=results)
                 break
 
