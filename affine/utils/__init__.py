@@ -1,2 +1,2 @@
 from .executor import ProgramExecutor
-from .dataset import BufferedDataset
+from .dataset import R2BufferedDataset

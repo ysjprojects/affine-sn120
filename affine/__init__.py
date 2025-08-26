@@ -733,6 +733,7 @@ def runner():
         while True:
             try:
                 now = time.monotonic()
+                HEARTBEAT = now
                 if subtensor is None: subtensor = await get_subtensor()
                 
                 # Only sync miners and metagraph every 10 minutes (600 seconds) or first time
@@ -779,110 +780,6 @@ def runner():
         await asyncio.gather(_run(), watchdog(timeout=600))
 
     asyncio.run(main())
-
-
-
-# @cli.command("runner")
-# def runner():    
-#     coldkey = get_conf("BT_WALLET_COLD", "default")
-#     hotkey  = get_conf("BT_WALLET_HOT",  "default")
-#     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
-
-#     async def _run():
-#         subtensor = None
-#         envs = {name: cls() for name, cls in ENVS.items()}
-
-#         while True:
-#             global HEARTBEAT
-#             try:
-#                 if subtensor is None: subtensor = await get_subtensor()
-#                 meta = await subtensor.metagraph(NETUID)
-#                 HEARTBEAT = time.monotonic()
-
-#                 miners_map = await miners(meta=meta)
-#                 if not miners_map:
-#                     await asyncio.sleep(1)
-#                     continue
-
-#                 # ── Probabilistic selection with cool-off ─────────────────────
-#                 import random
-#                 DECAY, BOOST, MIN_W, MAX_W = 0.5, 0.05, 0.05, 1.0
-
-#                 def m_id(m):  # robust id for dict keys
-#                     return getattr(m, "key", getattr(m, "uid", id(m)))
-
-#                 weights = {m_id(m): 1.0 for m in miners_map.values()}
-
-#                 def pick_miner():
-#                     ms = list(miners_map.values())
-#                     ws = [max(MIN_W, min(MAX_W, weights[m_id(m)])) for m in ms]
-#                     # random.choices guarantees proportional selection
-#                     return random.choices(ms, weights=ws, k=1)[0]
-
-#                 async def do_one(chal, m):
-#                     try:
-#                         res = await run(chal, m, timeout=180)
-#                         return m_id(m), res, None
-#                     except Exception as e:
-#                         return m_id(m), None, e
-#                 # ──────────────────────────────────────────────────────────────
-
-#                 async def next_task():
-#                     while True:
-#                         for e in envs.values():
-#                             chal = await e.generate()
-#                             mnr  = pick_miner()
-#                             yield do_one(chal, mnr)
-
-#                 next_task_gen = next_task()
-
-#                 inflight: set[asyncio.Task] = set()
-#                 async def top_up():
-#                     while len(inflight) < len(miners_map) * 2:
-#                         inflight.add(asyncio.create_task(await next_task_gen.__anext__()))
-
-#                 all_results = []
-#                 await top_up()
-#                 logger.info(f"Started with {len(inflight)} inflight tasks")
-                
-#                 while len(all_results) <= 100:
-#                     done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
-#                     for t in done:
-#                         try:
-#                             mid, res, err = await t
-#                             if err or not res or not res.success or res.response.response == "" or res.response.response == None:
-#                                 # Cool-off this miner on timeout/null
-#                                 weights[mid] = max(MIN_W, weights.get(mid, 1.0) * DECAY)
-#                                 logger.warning(f"Miner {mid} cooled to {weights[mid]:.2f} (err={bool(err)}, empty={not bool(res)})")
-#                             else:
-#                                 all_results.extend(res)
-#                                 # Gentle recovery toward 1.0 on success
-#                                 weights[mid] = min(MAX_W, weights.get(mid, 1.0) + BOOST)
-#                                 logger.error(f"New results: {len(res)}, total: {len(all_results)}/100 (miner {mid} weight={weights[mid]:.2f})")
-#                         except Exception as e:
-#                             logger.error(f"Task failed (unwrapped): {e}")
-#                     await top_up()
-#                     logger.info(f"Progress: {len(all_results)}/100 results, {len(inflight)} inflight tasks")
-
-#                 # Sink and restart.
-#                 blk  = await subtensor.get_current_block()
-#                 await sink(wallet=wallet, block=blk, results=all_results)
-#                 break
-
-#             except asyncio.CancelledError:
-#                 break
-#             except Exception as e:
-#                 traceback.print_exc()
-#                 logger.info(f"Error in runner loop: {e}. Continuing ...")
-#                 subtensor = None
-#                 await asyncio.sleep(5)
-
-#     async def main():
-#         await asyncio.gather(_run(), watchdog(timeout=60 * 10))
-
-#     asyncio.run(main())
-
-    
     
 
 # --------------------------------------------------------------------------- #
