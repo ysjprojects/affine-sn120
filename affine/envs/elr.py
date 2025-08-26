@@ -2,7 +2,7 @@ import re
 import affine as af
 from typing import Any, Dict, List, Tuple, Optional
 
-dataset = af.singleton('rl-python', lambda: af.utils.R2BufferedDataset(
+dataset = af.singleton('euler', lambda: af.utils.R2BufferedDataset(
         dataset_name="satpalsr/rl-python",
         buffer_size=5,
         max_batch=5,
