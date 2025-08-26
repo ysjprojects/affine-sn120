@@ -749,7 +749,7 @@ def runner():
 
                 # seed one task per miner
                 for m in miners_map.values():
-                    logger.debug(f'Done, new schedule {m} ...')
+                    logger.debug(f'Done, new schedule {m.uid} ...')
                     await schedule(m, inflight)
 
                 while len(results) < 100 and inflight:
@@ -770,7 +770,7 @@ def runner():
                         except Exception:
                             backoff[uid] = time.monotonic() + BACKOFF_SECS
                         if miner:  # try to reschedule this miner
-                            logger.debug(f'Done, new schedule {miner}...')
+                            logger.debug(f'Done, new schedule {miner.uid}...')
                             await schedule(miner, inflight)
 
                 blk = await subtensor.get_current_block()

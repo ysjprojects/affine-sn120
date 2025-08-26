@@ -7,7 +7,7 @@ from typing import Dict, Type
 from . import sat as _sat
 from . import abd as _abd
 from . import ded as _ded
-from . import elr as _elr
+# from . import elr as _elr
 
 __all__ = []
 
@@ -31,7 +31,7 @@ def _register_from_module(mod) -> None:
                 __all__.append(attr.__name__)
 
 # Register built-ins
-for _m in (_sat, _abd, _ded, _elr):
+for _m in (_sat, _abd, _ded):
     _register_from_module(_m)
 
 # Auto-discover any other env modules in this package
