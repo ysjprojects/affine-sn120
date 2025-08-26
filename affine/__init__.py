@@ -481,7 +481,7 @@ async def _get_sem() -> asyncio.Semaphore:
     key = id(loop)
     sem = _HTTP_SEMS.get(key)
     if sem is None:
-        sem = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+        sem = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "100")))
         _HTTP_SEMS[key] = sem
     return sem
 
@@ -701,36 +701,68 @@ async def watchdog(timeout: int = 300):
 @cli.command("runner")
 def runner():    
     coldkey = get_conf("BT_WALLET_COLD", "default")
-    hotkey  = get_conf("BT_WALLET_HOT", "default")
+    hotkey  = get_conf("BT_WALLET_HOT",  "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)
-    
     async def _run():
         subtensor = None
-        envs = { name: cls() for name, cls in ENVS.items() }
+        envs = {name: cls() for name, cls in ENVS.items()}
+
         while True:
             global HEARTBEAT
             try:
                 if subtensor is None: subtensor = await get_subtensor()
-                meta = await subtensor.metagraph( NETUID )
-                blk = await subtensor.get_current_block()
+                meta = await subtensor.metagraph(NETUID)
                 HEARTBEAT = time.monotonic()
+
                 miners_map = await miners(meta=meta)
-                challenges = [await e.generate() for e in envs.values()]
-                results    = await run(challenges, miners_map, timeout=180)
-                await sink( wallet = wallet, block = blk, results = results )
-            except asyncio.CancelledError: break
+                if not miners_map:
+                    await asyncio.sleep(1)
+                    continue
+
+                async def next_task():
+                    while True:
+                        for e in envs.values():
+                            chal = await e.generate()
+                            for mnr in miners_map.values(): 
+                                yield run(chal, mnr, timeout=180)
+                next_task_gen = next_task()
+
+                inflight: set[asyncio.Task] = set()
+                async def top_up():
+                    while len(inflight) < len(miners_map.values()):
+                        inflight.add(asyncio.create_task(await next_task_gen.__anext__()))
+
+                all_results = []
+                await top_up()
+                while len(all_results) <= 100:
+                    done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        try:
+                            res = await t
+                            all_results.extend(res)
+                            logger.error(f"New results: {len(res)}, total: {len(all_results)}/100")
+                        except Exception as e:
+                            logger.error(f"Task failed: {e}")
+                    await top_up()
+
+                # Sink and restart.
+                blk  = await subtensor.get_current_block()
+                await sink(wallet=wallet, block=blk, results=all_results)
+                break
+
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 traceback.print_exc()
                 logger.info(f"Error in runner loop: {e}. Continuing ...")
-                subtensor = None  # Force reconnection on next iteration
-                await asyncio.sleep(10)  # Wait before retrying
-                continue
+                subtensor = None
+                await asyncio.sleep(5)
+
     async def main():
-        await asyncio.gather(
-            _run(),
-            watchdog(timeout = (60 * 10))
-        )
+        await asyncio.gather(_run(), watchdog(timeout=60 * 10))
+
     asyncio.run(main())
+
     
     
 
