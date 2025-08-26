@@ -481,7 +481,7 @@ async def _get_sem() -> asyncio.Semaphore:
     key = id(loop)
     sem = _HTTP_SEMS.get(key)
     if sem is None:
-        sem = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "100")))
+        sem = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "400")))
         _HTTP_SEMS[key] = sem
     return sem
 
@@ -493,9 +493,20 @@ async def _get_client() -> aiohttp.ClientSession:
     key = id(loop)
     client = _CLIENTS.get(key)
     if client is None or client.closed:
-        client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+        limit = int(os.getenv("AFFINE_HTTP_CONCURRENCY", "400"))  # raise this
+        conn = aiohttp.TCPConnector(
+            limit=limit,              # match or exceed your semaphore
+            limit_per_host=0,         # don’t artificially throttle per host
+            ttl_dns_cache=300,        # cache DNS results
+            enable_cleanup_closed=True
+        )
+        client = aiohttp.ClientSession(
+            connector=conn,
+            timeout=aiohttp.ClientTimeout(total=None)
+        )
         _CLIENTS[key] = client
     return client
+
 
 TERMINAL = {400, 404, 410}
 async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> Response:

@@ -17,6 +17,7 @@ class ELR(af.BaseEnv):
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating a new challenge.")
         sample = await dataset().get()
+        print (sample)
         prompt = f"""{sample['problem']}
 
 Provide your solution in blocks <Answer>...</Answer>

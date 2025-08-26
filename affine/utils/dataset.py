@@ -118,7 +118,7 @@ class R2BufferedDataset:
         self.max_batch      = max_batch
         self._rng           = random.Random(seed)
 
-        short_name          = dataset_name.split("/")[-1]
+        short_name          = dataset_name
         self._dataset_folder= f"affine/datasets/{short_name}/"
         self._index_key     = self._dataset_folder + "index.json"
 
