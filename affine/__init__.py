@@ -189,7 +189,7 @@ class Result(BaseModel):
     __str__ = __repr__
 
 from .envs import *
-from .dataset import *
+from .database import *
 from .chutes import *
 
 # --------------------------------------------------------------------------- #
