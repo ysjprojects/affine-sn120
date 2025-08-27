@@ -1134,7 +1134,7 @@ EPS_FLOOR   = 0.002    # 0.20 percentage points floor for "not worse" tolerance
 Z_NOT_WORSE = 0.84     # one-sided ~80% cushion for "not worse" (was 1.645)
 EPS_WIN     = 0.0015   # 0.15 percentage points to claim "better on at least one env"
 Z_WIN       = 0.0      # keep "better" threshold floor-based (set >0 to scale with n)
-ELIG        = 0.01 
+ELIG        = 0.0 
 
 async def get_weights(tail: int = TAIL, scale: float = 1):
     """
