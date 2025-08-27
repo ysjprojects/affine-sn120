@@ -721,10 +721,10 @@ def runner():
         envs = [cls() for cls in ENVS.values()]
 
         # ── config ───────────────────────────────────────────────────────────
-        MAX_USES       = 10
+        MAX_USES       = 30
         REFRESH_S      = 600     # metagraph/miners refresh cadence (s)
-        SINK_BATCH     = 100     # flush threshold
-        SINK_MAX_WAIT  = 15      # max seconds to hold partial batch
+        SINK_BATCH     = 300     # flush threshold
+        SINK_MAX_WAIT  = 60*5      # max seconds to hold partial batch
         BACKOFF0       = 5
         BACKOFF_CAP    = 300
 
