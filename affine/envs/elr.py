@@ -3,7 +3,7 @@ import affine as af
 from typing import Any, Dict, List, Tuple, Optional
 
 dataset = af.singleton('euler', lambda: af.utils.R2BufferedDataset(
-        dataset_name="satpalsr/rl-python",
+        dataset_name="alexandonian/project-euler",
         buffer_size=5,
         max_batch=5,
 ))
@@ -17,7 +17,6 @@ class ELR(af.BaseEnv):
     async def generate(self) -> af.Challenge:
         af.logger.trace("Generating a new challenge.")
         sample = await dataset().get()
-        print (sample)
         prompt = f"""{sample['problem']}
 
 Provide your solution in blocks <Answer>...</Answer>

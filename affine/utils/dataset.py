@@ -107,11 +107,6 @@ class R2BufferedDataset:
         buffer_size: int = 100,
         max_batch: int = 10,
         seed: Optional[int] = None,
-        *,
-        r2_folder_env: str = "R2_FOLDER",
-        r2_bucket_env: str = "R2_BUCKET_ID",
-        r2_access_env: str = "R2_WRITE_ACCESS_KEY_ID",
-        r2_secret_env: str = "R2_WRITE_SECRET_ACCESS_KEY",
     ):
         self.dataset_name   = dataset_name
         self.buffer_size    = buffer_size
@@ -122,11 +117,11 @@ class R2BufferedDataset:
         self._dataset_folder= f"affine/datasets/{short_name}/"
         self._index_key     = self._dataset_folder + "index.json"
 
-        self._folder        = os.getenv(r2_folder_env, "affine")
-        bucket_id           = os.getenv(r2_bucket_env, "")
-        endpoint            = f"https://{bucket_id}.r2.cloudflarestorage.com" if bucket_id else None
-        access_key          = os.getenv(r2_access_env, "")
-        secret_key          = os.getenv(r2_secret_env, "")
+        self._folder        = af.FOLDER
+        bucket_id           = af.BUCKET
+        endpoint            = af.ENDPOINT
+        access_key          = af.ACCESS
+        secret_key          = af.SECRET
 
         self._endpoint_url  = endpoint
         self._access_key    = access_key
