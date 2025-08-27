@@ -1220,10 +1220,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     logger.info("Computed accuracy & updated MAXENV.")
 
     # --- eligibility: require near-max samples per env ------------------------
-    required = {
-        e: int(ELIG * max((cnt[hk][e] for hk in active_hks), default=0))
-        for e in ENVS
-    }
+    required = { e: 1000 for e in ENVS }
     eligible = {hk for hk in active_hks if all(cnt[hk][e] >= required[e] for e in ENVS)}
 
     # --- ε-Pareto dominance helpers ------------------------------------------
