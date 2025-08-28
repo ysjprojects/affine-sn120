@@ -323,3 +323,53 @@ def upload_dataset_cmd(dataset_name: str, config: str, split: str):
         af.logger.info(f"Uploaded {idx} rows for {dataset_name} [{config}/{split}] to dataset_rows")
 
     _asyncio.run(_run())
+
+
+# --------------------------------------------------------------------------- #
+#                               Stats CLI                                     #
+# --------------------------------------------------------------------------- #
+@cli.command("stats")
+def stats_cmd():
+    """Show counts of samples per env and per miner (hotkey)."""
+    async def _run():
+        await _get_engine()
+        sm = _sm()
+        async with sm() as session:
+            # Per-env counts
+            stmt_env = (
+                select(
+                    affine_results.c.env_name.label("env_name"),
+                    func.count().label("n"),
+                )
+                .group_by(affine_results.c.env_name)
+                .order_by(func.count().desc())
+            )
+            res_env = await session.execute(stmt_env)
+            env_counts = [(m["env_name"], int(m["n"])) for m in res_env.mappings().all()]
+
+            # Per-miner counts
+            stmt_miner = (
+                select(
+                    affine_results.c.hotkey.label("hotkey"),
+                    func.count().label("n"),
+                )
+                .group_by(affine_results.c.hotkey)
+                .order_by(func.count().desc())
+            )
+            res_miner = await session.execute(stmt_miner)
+            miner_counts = [(m["hotkey"], int(m["n"])) for m in res_miner.mappings().all()]
+
+        if env_counts:
+            click.echo("Per‑env sample counts:")
+            click.echo(tabulate(env_counts, headers=["env_name", "count"], tablefmt="github"))
+            click.echo()
+        else:
+            click.echo("No data found for env counts.")
+
+        if miner_counts:
+            click.echo("Per‑miner sample counts:")
+            click.echo(tabulate(miner_counts, headers=["hotkey", "count"], tablefmt="github"))
+        else:
+            click.echo("No data found for miner counts.")
+
+    _asyncio.run(_run())
