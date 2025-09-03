@@ -32,7 +32,7 @@ def _register_from_module(mod) -> None:
                 __all__.append(attr.__name__)
 
 # Register built-ins
-for _m in (_sat, _abd, _ded, _hvm):
+for _m in (_sat, _abd, _ded, _hvm, _elr):
     _register_from_module(_m)
 
 # Auto-discover any other env modules in this package
