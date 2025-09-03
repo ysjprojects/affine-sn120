@@ -7,7 +7,7 @@ from typing import Dict, Type
 from . import sat as _sat
 from . import abd as _abd
 from . import ded as _ded
-# from . import elr as _elr
+from . import elr as _elr
 from . import hvm as _hvm
 
 __all__ = []
