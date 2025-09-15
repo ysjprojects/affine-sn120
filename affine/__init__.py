@@ -1131,10 +1131,10 @@ ALPHA = 0.9
 #  - 'not-worse' uses a smaller Z to ease dominance when sample sizes are large.
 #  - 'better_any' uses a tiny fixed margin so small but consistent edges can win size-1 subsets.
 EPS_FLOOR   = 0.002    # 0.20 percentage points floor for "not worse" tolerance
-Z_NOT_WORSE = 0.84     # one-sided ~80% cushion for "not worse" (was 1.645)
-EPS_WIN     = 0.008   # 0.15 percentage points to claim "better on at least one env"
-Z_WIN       = 0.0      # keep "better" threshold floor-based (set >0 to scale with n)
-ELIG        = 0.01 
+Z_NOT_WORSE = 1.28    # one-sided ~80% cushion for "not worse" (was 1.645)
+EPS_WIN     = 0.004   # 0.15 percentage points to claim "better on at least one env"
+Z_WIN       = 0.5      # keep "better" threshold floor-based (set >0 to scale with n)
+ELIG        = 0.03 
 
 async def get_weights(tail: int = TAIL, scale: float = 1):
     """
@@ -1147,7 +1147,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
       4) Combinatoric scoring:
            - For every non-empty subset S of ENVS, pick the ε-Pareto winner on S.
            - Award K_|S| where K_1 = scale, K_s = C(N, s-1)*K_{s-1}.
-         Fallback if no dominance edges on S: highest mean accuracy on S, then earliest version.
+         Fallback if no dominance edges on S: earliest version (earlier block wins).
       5) Normalize scores over eligibles to produce weights. Metrics + summary emitted.
 
     Returns:
@@ -1299,8 +1299,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     def subset_winner(env_subset):
         """
         Winner on env_subset via ε-Pareto. If no dominance edges, fall back to:
-          1) highest mean accuracy on the subset,
-          2) earliest version start block.
+          earliest version start block (earlier block wins).
         """
         dom_local = defaultdict(int)
         for x, y in itertools.permutations(pool_for_dom, 2):
