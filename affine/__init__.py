@@ -444,7 +444,10 @@ async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
     if not results: return
     if block is None:
         sub = await get_subtensor(); block = await sub.get_current_block()
-    hotkey, signed = await sign_results( wallet, results )
+    valid = [r for r in results if getattr(r.response, "success", False)]
+    if not valid:
+        return
+    hotkey, signed = await sign_results( wallet, valid )
     key = f"{RESULT_PREFIX}{_w(block):09d}-{hotkey}.json"
     dumped = [ r.model_dump(mode="json") for r in signed ]
     async with get_client_ctx() as c:
