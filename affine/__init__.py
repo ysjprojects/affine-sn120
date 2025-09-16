@@ -645,6 +645,7 @@ async def miners(
             async with meta_sem:
                 chute = await get_chute(chute_id)
             if not chute: return None
+            if not chute.get("hot", False): return None
             gated = await check_model_gated(model)
             if gated is None or gated is True: return None
             chutes_name, slug, chutes_revision = chute.get('name'), chute.get("slug"), chute.get("revision")
@@ -854,6 +855,8 @@ def runner():
             try:
                 while True:
                     now = time.monotonic()
+                    global HEARTBEAT
+                    HEARTBEAT = now
                     # heartbeat + ensure subtensor
                     _ = await ensure_subtensor()
                     # periodic refresh
