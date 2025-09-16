@@ -691,15 +691,18 @@ def cli(verbose):
 # --------------------------------------------------------------------------- #
 #                               Watchdog                                      #
 # --------------------------------------------------------------------------- #
-HEARTBEAT = time.monotonic()
-async def watchdog(timeout: int = 300):
-    global HEARTBEAT
+HEARTBEAT = None
+
+async def watchdog(timeout: int = 600, sleep_div: float = 6.0):
+    sleep = timeout / sleep_div
+    while HEARTBEAT is None:
+        await asyncio.sleep(sleep)
     while True:
-        await asyncio.sleep(timeout // 3)
         elapsed = time.monotonic() - HEARTBEAT
         if elapsed > timeout:
             logging.error(f"[WATCHDOG] Process stalled {elapsed:.0f}s — exiting process.")
             os._exit(1)
+        await asyncio.sleep(sleep)
             
 # --------------------------------------------------------------------------- #
 #                               Runner                                        #
@@ -852,14 +855,13 @@ def runner():
                     break
 
         async def main_loop():
+            global HEARTBEAT
             nonlocal last_status_log, requests_since_last_log
             inflight = {}
             sink_task = asyncio.create_task(sink_worker())
             try:
                 while True:
-                    now = time.monotonic()
-                    global HEARTBEAT
-                    HEARTBEAT = now
+                    HEARTBEAT = now = time.monotonic()
                     # heartbeat + ensure subtensor
                     _ = await ensure_subtensor()
                     # periodic refresh
@@ -887,7 +889,7 @@ def runner():
                         continue
 
                     done, _ = await asyncio.wait(inflight.values(), return_when=asyncio.FIRST_COMPLETED)
-                    now = time.monotonic()
+                    HEARTBEAT = now = time.monotonic()
                     for t in done:
                         uid = next((u for u, tk in list(inflight.items()) if tk is t), None)
                         miner = miners_map.get(uid)
@@ -1437,6 +1439,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
         
 @cli.command("validate")
 def validate():
+    global HEARTBEAT
     coldkey = get_conf("BT_WALLET_COLD", "default")
     hotkey  = get_conf("BT_WALLET_HOT", "default")
     wallet  = bt.wallet(name=coldkey, hotkey=hotkey)    
@@ -1447,7 +1450,6 @@ def validate():
         while True:
             try:
                 # ---------------- Wait for set weights. -----------------
-                global HEARTBEAT
                 HEARTBEAT = time.monotonic()
                 if subtensor is None: subtensor = await get_subtensor()
                 BLOCK = await subtensor.get_current_block()
