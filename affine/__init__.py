@@ -81,7 +81,7 @@ CACHE = Gauge( "cache", "cache", registry=REGISTRY)
 MODEL_GATING_CACHE = {}  # {model_id: (is_gated, last_checked)}
 # Replace global loop-bound lock with per-event-loop lazy locks to avoid cross-loop errors
 _GATING_LOCKS: Dict[int, asyncio.Lock] = {}
-GATING_TTL = 300  # 5 minutes
+GATING_TTL = 3600  # 60 min
 
 def _get_gating_lock() -> asyncio.Lock:
     """Return an asyncio.Lock bound to the current running loop."""
@@ -553,17 +553,6 @@ async def run(challenges, miners, timeout=240, retries=0, backoff=1 )-> List[Res
     response = []
     
     async def proc(miner, chal):
-        # Check gating status before querying
-        if miner.model:
-            is_gated = await check_model_gated(miner.model, miner.revision)
-            if is_gated is True:
-                err = "Model is gated"
-                logger.trace(f"Miner {miner.uid} - {err} for model {miner.model}")
-                resp = Response(response=None, latency_seconds=0, attempts=0, model=miner.model, error=err, success=False)
-                ev = Evaluation(env=chal.env, score=0.0, extra={"error": err, "gated": is_gated})
-                return Result(miner=miner, challenge=chal, response=resp, evaluation=ev)
-        
-        # Normal processing for non-gated models
         resp = await query(chal.prompt, miner.model, miner.slug, timeout, retries, backoff)
         try: ev = await chal.evaluate(resp)
         except Exception as e: ev = Evaluation(env=chal.env, score=0.0, extra={"error": str(e), "evaluation_failed": True})
@@ -595,16 +584,16 @@ async def get_chute(chutes_id: str) -> Dict[str, Any]:
     url = f"https://api.chutes.ai/chutes/{chutes_id}"
     token = os.getenv("CHUTES_API_KEY", "")
     headers = {"Authorization": token}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as r:
-            text = await r.text(errors="ignore")
-            if r.status != 200:
-                return None
-            info = await r.json()
-            for k in ('readme','cords','tagline','instances'):
-                info.pop(k, None)
-            info.get('image', {}).pop('readme', None)
-            return info
+    sess = await _get_client()
+    async with sess.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as r:
+        text = await r.text(errors="ignore")
+        if r.status != 200:
+            return None
+        info = await r.json()
+        for k in ('readme','cords','tagline','instances'):
+            info.pop(k, None)
+        info.get('image', {}).pop('readme', None)
+        return info
         
 async def get_chute_code(identifier: str) -> Optional[str]:
     url = f"https://api.chutes.ai/chutes/code/{identifier}"
@@ -643,6 +632,7 @@ async def miners(
     commits = await sub.get_all_revealed_commitments(netuid)
     if uids is None:uids = list(range(len(meta.hotkeys)))
     elif isinstance(uids, int): uids = [uids]    
+    meta_sem = asyncio.Semaphore(int(os.getenv("AFFINE_META_CONCURRENCY", "64")))
     async def fetch(uid: int):
         try:
             hotkey = meta.hotkeys[ uid ]
@@ -652,10 +642,11 @@ async def miners(
             block = 0 if uid == 0 else block
             data = json.loads(data)
             model, miner_revision, chute_id = data.get("model"), data.get("revision"), data.get("chute_id")
-            chute = await get_chute(chute_id)
-            if not chute: None
+            async with meta_sem:
+                chute = await get_chute(chute_id)
+            if not chute: return None
             gated = await check_model_gated(model)
-            if gated: return None
+            if gated is None or gated is True: return None
             chutes_name, slug, chutes_revision = chute.get('name'), chute.get("slug"), chute.get("revision")
             if model != chutes_name or (uid != 0 and chutes_name.split('/')[1].lower()[:6] != 'affine'): return None
             if chutes_revision == None or miner_revision == chutes_revision:
@@ -1126,14 +1117,10 @@ async def retry_set_weights( wallet: bt.Wallet, uids: List[int], weights: List[f
 # --- Scoring hyperparameters --------------------------------------------------
 TAIL = 20_000
 ALPHA = 0.9
-
-# Tuned ε-margins:
-#  - 'not-worse' uses a smaller Z to ease dominance when sample sizes are large.
-#  - 'better_any' uses a tiny fixed margin so small but consistent edges can win size-1 subsets.
-EPS_FLOOR   = 0.002    # 0.20 percentage points floor for "not worse" tolerance
-Z_NOT_WORSE = 1.28    # one-sided ~80% cushion for "not worse" (was 1.645)
-EPS_WIN     = 0.004   # 0.15 percentage points to claim "better on at least one env"
-Z_WIN       = 0.5      # keep "better" threshold floor-based (set >0 to scale with n)
+EPS_FLOOR   = 0.005
+Z_NOT_WORSE = 1.28
+EPS_WIN     = 0.008
+Z_WIN       = 0.5
 ELIG        = 0.03 
 
 async def get_weights(tail: int = TAIL, scale: float = 1):
@@ -1171,6 +1158,16 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     v_id  = {}                                                # (model, revision) per hk
     first_block = {}                                          # earliest block for current version
 
+    # Pre-seed earliest commit block per miner from on-chain commitments
+    try:
+        commits = await st.get_all_revealed_commitments(NETUID)
+        for uid, hk in enumerate(meta.hotkeys):
+            if hk in commits:
+                blk, _ = commits[hk][-1]
+                first_block[hk] = 0 if uid == 0 else int(blk)
+    except Exception:
+        pass
+
     # --- ingest ---------------------------------------------------------------
     logger.info(f"Loading data from {blk - tail} to {blk}")
     async for c in dataset(tail=tail):
@@ -1194,6 +1191,14 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
             for e in ENVS:
                 cnt[hk][e] = 0
                 succ[hk][e] = 0
+        else:
+            # Keep earliest commit block for the active version
+            try:
+                fb = int(first_block.get(hk, c.miner.block)) if first_block.get(hk) is not None else int(c.miner.block)
+                cb = int(c.miner.block) if c.miner.block is not None else fb
+                first_block[hk] = fb if fb <= cb else cb
+            except Exception:
+                pass
 
         # accumulate on successes.
         prev[hk] = c
@@ -1205,7 +1210,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
 
     if not prev:
         logger.warning("No results collected; defaulting to uid 0")
-        return 0, BASE_HK
+        return [0], [1.0]
 
     # --- accuracy + MAXENV ----------------------------------------------------
     acc = {
@@ -1219,19 +1224,22 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
         MAXENV.labels(env=e).set(max_e)
     logger.info("Computed accuracy & updated MAXENV.")
 
-    # --- eligibility: require near-max samples per env ------------------------
-    required = {
-        e: 10 + int(ELIG * max((cnt[hk][e] for hk in active_hks), default=0))
-        for e in ENVS
-    }
+    # --- eligibility: ------------------------
+    required = {}
+    for e in ENVS:
+        max_cnt = max((cnt[hk][e] for hk in active_hks), default=0)
+        max_cnt = min(max_cnt, 2000)
+        required[e] = 10 + int(ELIG * max_cnt)
     eligible = {hk for hk in active_hks if all(cnt[hk][e] >= required[e] for e in ENVS)}
 
     # --- ε-Pareto dominance helpers ------------------------------------------
     def thr_not_worse(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
-        """Tolerance for 'not worse' on an env: max(EPS_FLOOR, Z * SE_diff)."""
+        """Tolerance for 'not worse' on an env: max(EPS_FLOOR, Z * SE_diff) with capped n to blunt volume advantage."""
         if Z_NOT_WORSE <= 0:
             return EPS_FLOOR
-        var = (a_i * (1 - a_i)) / max(n_i, 1) + (a_j * (1 - a_j)) / max(n_j, 1)
+        n_i_eff = min(int(n_i), 1000)
+        n_j_eff = min(int(n_j), 1000)
+        var = (a_i * (1 - a_i)) / max(n_i_eff, 1) + (a_j * (1 - a_j)) / max(n_j_eff, 1)
         return max(EPS_FLOOR, Z_NOT_WORSE * math.sqrt(var))
 
     def thr_better(a_i: float, n_i: int, a_j: float, n_j: int, nw: float) -> float:
@@ -1240,7 +1248,9 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
         Floor-based by default; set Z_WIN>0 to scale with SE_diff.
         """
         if Z_WIN > 0:
-            var = (a_i * (1 - a_i)) / max(n_i, 1) + (a_j * (1 - a_j)) / max(n_j, 1)
+            n_i_eff = min(int(n_i), 1000)
+            n_j_eff = min(int(n_j), 1000)
+            var = (a_i * (1 - a_i)) / max(n_i_eff, 1) + (a_j * (1 - a_j)) / max(n_j_eff, 1)
             t = max(EPS_WIN, Z_WIN * math.sqrt(var))
         else:
             t = EPS_WIN
@@ -1282,8 +1292,8 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     logger.info("Computed ε-dominance counts (full env set).")
 
     def ts(hk: str) -> int:
-        """Block-number timestamp; default to last seen block."""
-        return int(first_block.get(hk, prev[hk].miner.block))
+        """Block-number timestamp; prefer earliest commit"""
+        return int(first_block[hk])
 
     best = max(pool_for_dom, key=lambda hk: (dom_full.get(hk, 0), -ts(hk))) if pool_for_dom else active_hks[0]
     best_uid = meta.hotkeys.index(best)
@@ -1306,10 +1316,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
             if dominates_on(x, y, env_subset):
                 dom_local[x] += 1
 
-        def mean_acc(hk: str) -> float:
-            return sum(acc[hk][e] for e in env_subset) / len(env_subset)
-
-        return max(pool_for_dom, key=lambda hk: (dom_local.get(hk, 0), mean_acc(hk), -ts(hk)))
+        return max(pool_for_dom, key=lambda hk: (dom_local.get(hk, 0), -ts(hk)))
 
     # Calculate combinatoric scores for all miners (not just eligible)
     K = layer_weights(N_envs, scale)
