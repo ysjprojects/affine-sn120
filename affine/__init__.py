@@ -1137,7 +1137,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
 
     Pipeline
       1) Ingest last `tail` blocks → per-miner per-env accuracy.
-      2) Determine eligibility (>=90% of per-env max count).
+      2) Determine eligibility (>=90% of per-env max count AND must be queryable).
       3) Global ε-dominance (all envs) for canonical 'best' (for tie breaks / summaries).
       4) Combinatoric scoring:
            - For every non-empty subset S of ENVS, pick the ε-Pareto winner on S.
@@ -1158,6 +1158,11 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
     meta = await st.metagraph(NETUID)
     BASE_HK = meta.hotkeys[0]
     N_envs = len(ENVS)
+    
+    # --- get currently queryable miners ---------------------------------------
+    queryable_miners = await miners(meta=meta)
+    queryable_hks = {m.hotkey for m in queryable_miners.values()}
+    logger.info(f"Found {len(queryable_hks)} queryable miners (hot, valid chute, not gated)")
 
     # Tallies for all known hotkeys (so metrics update is safe even if some have no data)
     cnt   = {hk: defaultdict(int)   for hk in meta.hotkeys}  # per-env counts
@@ -1232,13 +1237,16 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
         MAXENV.labels(env=e).set(max_e)
     logger.info("Computed accuracy & updated MAXENV.")
 
-    # --- eligibility: ------------------------
+    # --- eligibility: must be queryable AND meet sample requirements ---------
     required = {}
     for e in ENVS:
         max_cnt = max((cnt[hk][e] for hk in active_hks), default=0)
         max_cnt = min(max_cnt, 2000)
         required[e] = 10 + int(ELIG * max_cnt)
-    eligible = {hk for hk in active_hks if all(cnt[hk][e] >= required[e] for e in ENVS)}
+    # Only eligible if: 1) currently queryable, 2) meets sample requirements
+    eligible = {hk for hk in active_hks 
+                if hk in queryable_hks and all(cnt[hk][e] >= required[e] for e in ENVS)}
+    logger.info(f"Eligible miners: {len(eligible)} (from {len(active_hks)} active, {len(queryable_hks)} queryable)")
 
     # --- ε-Pareto dominance helpers ------------------------------------------
     def thr_not_worse(a_i: float, n_i: int, a_j: float, n_j: int) -> float:
@@ -1293,7 +1301,8 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
 
     # Global dominance (full ENVS) for summary + canonical "best"
     dom_full = defaultdict(int)
-    pool_for_dom = eligible if eligible else set(active_hks)
+    # Pool for dominance should be eligible miners, or queryable miners if no eligible ones
+    pool_for_dom = eligible if eligible else (queryable_hks & set(active_hks))
     for a, b in itertools.permutations(pool_for_dom, 2):
         if dominates_on(a, b, ENVS):
             dom_full[a] += 1
@@ -1301,9 +1310,11 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
 
     def ts(hk: str) -> int:
         """Block-number timestamp; prefer earliest commit"""
-        return int(first_block[hk])
+        return int(first_block[hk]) if hk in first_block else float('inf')
 
-    best = max(pool_for_dom, key=lambda hk: (dom_full.get(hk, 0), -ts(hk))) if pool_for_dom else active_hks[0]
+    # Best should be from queryable miners only
+    best_candidates = pool_for_dom if pool_for_dom else (queryable_hks if queryable_hks else active_hks[:1])
+    best = max(best_candidates, key=lambda hk: (dom_full.get(hk, 0), -ts(hk))) if best_candidates else active_hks[0]
     best_uid = meta.hotkeys.index(best)
 
     # --- combinatoric scoring over all non-empty env subsets ------------------
@@ -1343,11 +1354,11 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
             score[w] += K[s]
             layer_points[w][s] += K[s]
 
-    # If no eligible miners exist, fall back to the canonical best with weight 1.0.
+    # If no eligible miners exist, fall back to uid 0 with weight 1.0.
     if not eligible:
-        logger.warning("No eligible miners; assigning weight 1.0 to canonical best.")
+        logger.warning(f"No eligible miners (queryable={len(queryable_hks)}); assigning weight 1.0 to uid 0.")
         for uid, hk in enumerate(meta.hotkeys):
-            WEIGHT.labels(uid=uid).set(1.0 if hk == best else 0.0)
+            WEIGHT.labels(uid=uid).set(1.0 if uid == 0 else 0.0)
             for e in ENVS:
                 a = acc[hk][e]
                 if a > 0:
@@ -1380,7 +1391,7 @@ async def get_weights(tail: int = TAIL, scale: float = 1):
             ]
         rows = sorted((row(hk) for hk in active_hks), key=lambda r: (r[-3], r[0]), reverse=True)
         print("Validator Summary:\n" + tabulate(rows, hdr, tablefmt="plain"))
-        return [best_uid], [1.0]
+        return [0], [1.0]  # Always return uid 0 when no eligible miners
 
     # Eligible path: normalize scores to weights over the eligible pool only
     total_points = sum(score[hk] for hk in eligible)
