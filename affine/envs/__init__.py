@@ -8,7 +8,7 @@ from . import sat as _sat
 from . import abd as _abd
 from . import ded as _ded
 # from . import elr as _elr
-from . import hvm as _hvm
+# from . import hvm as _hvm
 
 __all__ = []
 
@@ -32,7 +32,7 @@ def _register_from_module(mod) -> None:
                 __all__.append(attr.__name__)
 
 # Register built-ins
-for _m in (_sat, _abd, _ded, _hvm):
+for _m in (_sat, _abd, _ded):
     _register_from_module(_m)
 
 def get_env(name: str):
